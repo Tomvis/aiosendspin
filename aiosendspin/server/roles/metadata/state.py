@@ -24,8 +24,12 @@ class Metadata:
     """Artwork URL of the current media."""
     year: int | None = None
     """Release year of the current media."""
-    track: int | None = None
-    """Track number of the current media."""
+    album_track: int | None = None
+    """Track number on the current media's album."""
+    queue_track: int | None = None
+    """1-based position of the current media within the active queue."""
+    total_tracks: int | None = None
+    """Total number of tracks in the current queue."""
     repeat: RepeatMode | None = None
     """Current repeat mode."""
     shuffle: bool | None = None
@@ -70,7 +74,9 @@ class Metadata:
             and self.album == other.album
             and self.artwork_url == other.artwork_url
             and self.year == other.year
-            and self.track == other.track
+            and self.album_track == other.album_track
+            and self.queue_track == other.queue_track
+            and self.total_tracks == other.total_tracks
             and self.track_duration == other.track_duration
             and self.playback_speed == other.playback_speed
             and self.repeat == other.repeat
@@ -119,8 +125,12 @@ class Metadata:
             metadata_update.artwork_url = self.artwork_url
         if last is None or last.year != self.year:
             metadata_update.year = self.year
-        if last is None or last.track != self.track:
-            metadata_update.track = self.track
+        if last is None or last.album_track != self.album_track:
+            metadata_update.album_track = self.album_track
+        if last is None or last.queue_track != self.queue_track:
+            metadata_update.queue_track = self.queue_track
+        if last is None or last.total_tracks != self.total_tracks:
+            metadata_update.total_tracks = self.total_tracks
         if last is None or last.repeat != self.repeat:
             metadata_update.repeat = self.repeat
         if last is None or last.shuffle != self.shuffle:
@@ -158,7 +168,9 @@ class Metadata:
         metadata_update.album = None
         metadata_update.artwork_url = None
         metadata_update.year = None
-        metadata_update.track = None
+        metadata_update.album_track = None
+        metadata_update.queue_track = None
+        metadata_update.total_tracks = None
         metadata_update.progress = None
         metadata_update.repeat = None
         metadata_update.shuffle = None
@@ -173,7 +185,9 @@ class Metadata:
         metadata_update.album = self.album
         metadata_update.artwork_url = self.artwork_url
         metadata_update.year = self.year
-        metadata_update.track = self.track
+        metadata_update.album_track = self.album_track
+        metadata_update.queue_track = self.queue_track
+        metadata_update.total_tracks = self.total_tracks
         metadata_update.repeat = self.repeat
         metadata_update.shuffle = self.shuffle
         # Build progress object if all progress fields are set

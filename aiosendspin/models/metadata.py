@@ -60,7 +60,9 @@ class SessionUpdateMetadata(DataClassORJSONMixin):
     album: str | None | UndefinedField = field(default_factory=undefined_field)
     artwork_url: str | None | UndefinedField = field(default_factory=undefined_field)
     year: int | None | UndefinedField = field(default_factory=undefined_field)
-    track: int | None | UndefinedField = field(default_factory=undefined_field)
+    album_track: int | None | UndefinedField = field(default_factory=undefined_field)
+    queue_track: int | None | UndefinedField = field(default_factory=undefined_field)
+    total_tracks: int | None | UndefinedField = field(default_factory=undefined_field)
     progress: Progress | None | UndefinedField = field(default_factory=undefined_field)
     """
     Playback progress information.
@@ -80,13 +82,29 @@ class SessionUpdateMetadata(DataClassORJSONMixin):
         ):
             raise ValueError(f"year must be between 1000 and 2040, got {self.year}")
 
-        # Validate track number is positive
+        # Validate album_track number is positive
         if (
-            not isinstance(self.track, UndefinedField)
-            and self.track is not None
-            and self.track <= 0
+            not isinstance(self.album_track, UndefinedField)
+            and self.album_track is not None
+            and self.album_track <= 0
         ):
-            raise ValueError(f"track must be positive, got {self.track}")
+            raise ValueError(f"album_track must be positive, got {self.album_track}")
+
+        # Validate queue_track number is positive
+        if (
+            not isinstance(self.queue_track, UndefinedField)
+            and self.queue_track is not None
+            and self.queue_track <= 0
+        ):
+            raise ValueError(f"queue_track must be positive, got {self.queue_track}")
+
+        # Validate total_tracks is positive
+        if (
+            not isinstance(self.total_tracks, UndefinedField)
+            and self.total_tracks is not None
+            and self.total_tracks <= 0
+        ):
+            raise ValueError(f"total_tracks must be positive, got {self.total_tracks}")
 
     class Config(BaseConfig):
         """Config for parsing json messages."""

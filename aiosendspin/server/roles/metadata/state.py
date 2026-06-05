@@ -30,8 +30,10 @@ class Metadata:
     """1-based position of the current media within the active queue."""
     total_tracks: int | None = None
     """Total number of tracks in the current queue."""
+    # Deprecated: use ControllerGroupRole.set_repeat. Still emitted for backwards compatibility.
     repeat: RepeatMode | None = None
     """Current repeat mode."""
+    # Deprecated: use ControllerGroupRole.set_shuffle. Still emitted for backwards compatibility.
     shuffle: bool | None = None
     """Whether shuffle is enabled."""
 

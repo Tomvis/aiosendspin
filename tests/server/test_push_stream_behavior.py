@@ -113,17 +113,37 @@ class _FakeConnection:
 
 
 class _DummyRole:
-    def __init__(self, requirements: AudioRequirements, *, static_delay_us: int = 0) -> None:
+    def __init__(
+        self,
+        requirements: AudioRequirements,
+        *,
+        static_delay_us: int = 0,
+        replay_from_pcm_cache: bool = False,
+        required_lead_time_us: int = DEFAULT_INITIAL_DELAY_US,
+        min_buffer_us: int = 0,
+    ) -> None:
         self._requirements = requirements
         self._static_delay_us = static_delay_us
+        self._replay_from_pcm_cache = replay_from_pcm_cache
+        self._required_lead_time_us = required_lead_time_us
+        self._min_buffer_us = min_buffer_us
         self.received: list[AudioChunk] = []
         self.started = 0
 
     def get_audio_requirements(self) -> AudioRequirements | None:
         return self._requirements
 
+    def replay_from_pcm_cache(self) -> bool:
+        return self._replay_from_pcm_cache
+
     def get_static_delay_us(self) -> int:
         return self._static_delay_us
+
+    def get_required_lead_time_us(self) -> int:
+        return self._required_lead_time_us
+
+    def get_min_buffer_us(self) -> int:
+        return self._min_buffer_us
 
     def get_join_delay_s(self) -> float:
         return 0.0
@@ -2430,6 +2450,117 @@ async def test_catchup_quantizer_does_not_share_live_cache(
     )
 
 
+async def test_replay_from_pcm_cache_overrides_established_resampler_skip() -> None:
+    """Late join with an established resampler at the role's shape.
+
+    A live role builds a resampler at 48k/16/2. When a second role joins with
+    that same target shape, the established-resampler guard normally skips PCM
+    replay (re-running the shared resampler would shift the live role's audio).
+    Analysis-only roles opt in via `replay_from_pcm_cache()` so they get the
+    buffered PCM immediately instead of waiting for the next live commit, which
+    may sit far ahead behind a producer buffer.
+
+    Asserts the flag is the only thing that flips the decision: same scenario,
+    replay=True is fed cached audio; replay=False is not.
+    """
+
+    class TransformerA:
+        pending_timestamp_us: int | None = None
+
+        @property
+        def frame_duration_us(self) -> int:
+            return 25_000
+
+        def process(self, pcm: bytes, _ts: int, _dur: int) -> list[tuple[bytes, int]]:
+            return [(pcm, 25_000)]
+
+        def flush(self) -> list[tuple[bytes, int]]:
+            return []
+
+        def get_header(self) -> bytes | None:
+            return None
+
+        def reset(self) -> None:
+            return
+
+    group = _DummyGroup(clients=[])
+    live_role = _DummyRole(
+        AudioRequirements(
+            sample_rate=48_000,
+            bit_depth=16,
+            channels=2,
+            transformer=TransformerA(),
+            channel_id=MAIN_CHANNEL,
+            frame_duration_us=25_000,
+        )
+    )
+    group.clients.append(_DummyClient([live_role]))
+
+    loop = asyncio.get_running_loop()
+    clock = ManualClock(now_us_value=0)
+    stream = PushStream(loop=loop, clock=clock, group=group)
+    stream.enable_pcm_cache_for_channel(MAIN_CHANNEL)
+
+    for _ in range(4):
+        stream.prepare_audio(
+            bytes(9600),  # 25ms @ 48kHz stereo f32
+            AudioFormat(sample_rate=48_000, bit_depth=32, channels=2, sample_type="float"),
+        )
+        await stream.commit_audio()
+        clock.advance_us(25_000)
+
+    # Force the guarded branch: pretend a non-passthrough resampler already
+    # exists at the joining role's target shape. Without the opt-out this
+    # short-circuits PCM replay.
+    stream._has_established_resampler_for = lambda *_a, **_k: True  # type: ignore[method-assign]  # noqa: SLF001
+
+    # Analysis-only joiner (no transformer => distinct TransformKey from the
+    # live role) that opts into PCM-cache replay.
+    viz_role = _DummyRole(
+        AudioRequirements(
+            sample_rate=48_000,
+            bit_depth=16,
+            channels=2,
+            channel_id=MAIN_CHANNEL,
+            frame_duration_us=25_000,
+        ),
+        replay_from_pcm_cache=True,
+    )
+    group.clients.append(_DummyClient([viz_role]))
+    stream.on_role_join(viz_role)
+
+    for _ in range(50):
+        if viz_role.received:
+            break
+        await asyncio.sleep(0.01)
+
+    assert viz_role.received, "replay_from_pcm_cache role should receive buffered PCM on late join"
+
+    # Control: same scenario, replay disabled => guard skips replay, no audio.
+    class TransformerB(TransformerA):
+        pass
+
+    plain_role = _DummyRole(
+        AudioRequirements(
+            sample_rate=48_000,
+            bit_depth=16,
+            channels=2,
+            transformer=TransformerB(),
+            channel_id=MAIN_CHANNEL,
+            frame_duration_us=25_000,
+        ),
+        replay_from_pcm_cache=False,
+    )
+    group.clients.append(_DummyClient([plain_role]))
+    stream.on_role_join(plain_role)
+
+    for _ in range(20):
+        await asyncio.sleep(0.01)
+
+    assert not plain_role.received, "replay-disabled role must not get historical replay"
+    assert plain_role.started >= 1, "replay-disabled role should still be started for live audio"
+
+
 def test_noop_resample_bypasses_graph_construction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2679,6 +2810,8 @@ _STATIC_DELAY_US = 5_000_000  # 5 s
 def _make_role(
     *,
     static_delay_us: int = 0,
+    required_lead_time_us: int = DEFAULT_INITIAL_DELAY_US,
+    min_buffer_us: int = 0,
     channel_id: UUID = MAIN_CHANNEL,
 ) -> _DummyRole:
     return _DummyRole(
@@ -2691,6 +2824,8 @@ def _make_role(
             frame_duration_us=25_000,
         ),
         static_delay_us=static_delay_us,
+        required_lead_time_us=required_lead_time_us,
+        min_buffer_us=min_buffer_us,
     )
 
 
@@ -2727,6 +2862,82 @@ async def test_mixed_delay_timeline_uses_largest_static_delay() -> None:
     play_start = await stream.commit_audio()
 
     assert play_start >= clock.now_us() + DEFAULT_INITIAL_DELAY_US + _STATIC_DELAY_US
+
+
+@pytest.mark.asyncio
+async def test_commit_audio_uses_reported_lead_time() -> None:
+    """A player reporting a low lead time starts ahead by exactly that lead."""
+    loop = asyncio.get_running_loop()
+    clock = ManualClock(now_us_value=1_000_000)
+    group = _DummyGroup(clients=[])
+    role = _make_role(required_lead_time_us=50_000, min_buffer_us=0, static_delay_us=0)
+    group.clients.append(_DummyClient([role]))
+
+    stream = PushStream(loop=loop, clock=clock, group=group)
+    fmt = AudioFormat(sample_rate=48000, bit_depth=16, channels=2)
+    stream.prepare_audio(bytes(4800), fmt)
+    play_start = await stream.commit_audio()
+
+    assert play_start == clock.now_us() + 50_000
+
+
+@pytest.mark.asyncio
+async def test_commit_audio_min_buffer_floors_send_ahead() -> None:
+    """Live streams: when min_buffer exceeds lead time, the floor follows min_buffer."""
+    loop = asyncio.get_running_loop()
+    clock = ManualClock(now_us_value=1_000_000)
+    group = _DummyGroup(clients=[])
+    role = _make_role(required_lead_time_us=50_000, min_buffer_us=2_000_000, static_delay_us=0)
+    group.clients.append(_DummyClient([role]))
+
+    stream = PushStream(loop=loop, clock=clock, group=group)
+    stream.set_live_source(is_live=True)
+    fmt = AudioFormat(sample_rate=48000, bit_depth=16, channels=2)
+    stream.prepare_audio(bytes(4800), fmt)
+    play_start = await stream.commit_audio()
+
+    assert play_start == clock.now_us() + 2_000_000
+
+
+@pytest.mark.asyncio
+async def test_buffered_source_skips_min_buffer_at_startup() -> None:
+    """Buffered streams anchor startup at required_lead + static, ignoring min_buffer."""
+    loop = asyncio.get_running_loop()
+    clock = ManualClock(now_us_value=1_000_000)
+    group = _DummyGroup(clients=[])
+    role = _make_role(required_lead_time_us=0, min_buffer_us=15_000_000, static_delay_us=0)
+    group.clients.append(_DummyClient([role]))
+
+    stream = PushStream(loop=loop, clock=clock, group=group)
+    stream.set_live_source(is_live=False)
+    fmt = AudioFormat(sample_rate=48000, bit_depth=16, channels=2)
+    stream.prepare_audio(bytes(4800), fmt)
+    play_start = await stream.commit_audio()
+
+    # Buffered: startup = lead(0) + static(0) = 0; min_buffer ignored upfront.
+    assert play_start == clock.now_us()
+
+
+@pytest.mark.asyncio
+async def test_send_ahead_uses_largest_member_budget() -> None:
+    """Live grouped players use a common floor: max(lead, min_buffer) + static across members."""
+    loop = asyncio.get_running_loop()
+    clock = ManualClock(now_us_value=1_000_000)
+    group = _DummyGroup(clients=[])
+    role_low = _make_role(required_lead_time_us=100_000, min_buffer_us=0, static_delay_us=0)
+    role_high = _make_role(
+        required_lead_time_us=0, min_buffer_us=1_500_000, static_delay_us=200_000
+    )
+    group.clients.extend([_DummyClient([role_low]), _DummyClient([role_high])])
+
+    stream = PushStream(loop=loop, clock=clock, group=group)
+    stream.set_live_source(is_live=True)
+    fmt = AudioFormat(sample_rate=48000, bit_depth=16, channels=2)
+    stream.prepare_audio(bytes(4800), fmt)
+    play_start = await stream.commit_audio()
+
+    # role_high dominates: max(0, 1_500_000) + 200_000 = 1_700_000.
+    assert play_start == clock.now_us() + 1_700_000
 
 
 @pytest.mark.asyncio

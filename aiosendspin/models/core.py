@@ -9,7 +9,7 @@ synchronization, stream lifecycle management, and role-based state updates and c
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass, field, fields, is_dataclass
 from typing import Annotated, Any, ClassVar, Literal
 
 from mashumaro.config import BaseConfig
@@ -45,6 +45,12 @@ from .visualizer import (
     ClientHelloVisualizerSupport,
     StreamRequestFormatVisualizer,
     StreamStartVisualizer,
+)
+from .visualizer_draft_r1 import (
+    ClientHelloVisualizerSupport as ClientHelloVisualizerSupportDraftR1,
+)
+from .visualizer_draft_r1 import (
+    StreamStartVisualizer as StreamStartVisualizerDraftR1,
 )
 
 logger = logging.getLogger(__name__)
@@ -118,15 +124,20 @@ class ClientHelloPayload(DataClassORJSONMixin):
     artwork_support: Annotated[ClientHelloArtworkSupport | None, Alias("artwork@v1_support")] = None
     """Artwork support configuration - only if artwork role is in supported_roles."""
     visualizer_support: Annotated[
-        ClientHelloVisualizerSupport | None, Alias("visualizer@_draft_r1_support")
+        ClientHelloVisualizerSupport | None, Alias("visualizer@v1_support")
     ] = None
-    """Visualizer support configuration - only if visualizer role is in supported_roles."""
+    """Visualizer support configuration - only if visualizer@v1 role is in supported_roles."""
+    visualizer_draft_r1_support: Annotated[
+        ClientHelloVisualizerSupportDraftR1 | None, Alias("visualizer@_draft_r1_support")
+    ] = None
+    """Visualizer support for clients on the legacy `visualizer@_draft_r1` wire."""
 
     # Static mapping: unversioned support key -> actual alias key.
     _SUPPORT_KEY_ALIASES: ClassVar[dict[str, str]] = {
         "player_support": "player@v1_support",
         "artwork_support": "artwork@v1_support",
-        "visualizer_support": "visualizer@_draft_r1_support",
+        "visualizer_support": "visualizer@v1_support",
+        "visualizer_draft_r1_support": "visualizer@_draft_r1_support",
     }
 
     @classmethod
@@ -174,15 +185,25 @@ class ClientHelloPayload(DataClassORJSONMixin):
         if not artwork_role_supported:
             self.artwork_support = None
 
-        # Validate visualizer role and support configuration
+        # Validate visualizer role and support configuration.
         visualizer_role_supported = Roles.VISUALIZER.value in self.supported_roles
         if visualizer_role_supported and self.visualizer_support is None:
             raise ValueError(
-                "visualizer@_draft_r1_support (visualizer_support alias) must be "
-                "provided when 'visualizer@_draft_r1' is in supported_roles"
+                "visualizer@v1_support (visualizer_support alias) must be "
+                "provided when 'visualizer@v1' is in supported_roles"
             )
         if not visualizer_role_supported:
             self.visualizer_support = None
+
+        # Validate legacy `visualizer@_draft_r1` support configuration.
+        visualizer_draft_supported = "visualizer@_draft_r1" in self.supported_roles
+        if visualizer_draft_supported and self.visualizer_draft_r1_support is None:
+            raise ValueError(
+                "visualizer@_draft_r1_support must be provided when "
+                "'visualizer@_draft_r1' is in supported_roles"
+            )
+        if not visualizer_draft_supported:
+            self.visualizer_draft_r1_support = None
 
     class Config(BaseConfig):
         """Config for parsing json messages."""
@@ -421,6 +442,42 @@ class ServerCommandMessage(ServerMessage):
     type: Literal["server/command"] = "server/command"
 
 
+# Shape carried by `StreamStartPayload.visualizer`. The field is typed `Any`
+# so mashumaro defers to the dispatch hooks below, but callers should annotate
+# against this alias for static checking.
+StreamStartVisualizerLike = StreamStartVisualizer | StreamStartVisualizerDraftR1 | None
+
+
+def _serialize_stream_start_visualizer(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, (StreamStartVisualizer, StreamStartVisualizerDraftR1)):
+        raise TypeError(
+            "StreamStartPayload.visualizer must be a StreamStartVisualizer, "
+            f"StreamStartVisualizerDraftR1, or None; got {type(value).__name__}"
+        )
+    return value.to_dict()
+
+
+def _deserialize_stream_start_visualizer(
+    value: Any,
+) -> StreamStartVisualizer | StreamStartVisualizerDraftR1 | None:
+    """Pick the visualizer wire schema by its discriminating field.
+
+    The v1 and draft schemas overlap on `types`/`spectrum` and share the
+    class name `StreamStartVisualizer`, so mashumaro's bare-union resolution
+    cannot tell them apart (it yields None / raises for a draft payload).
+    They are distinguished by the required `rate_max` (v1) vs `batch_max`
+    (draft); dispatch explicitly. The field is annotated `Any` so mashumaro
+    defers to these hooks instead of generating union codec.
+    """
+    if not isinstance(value, dict):
+        return None
+    if "batch_max" in value and "rate_max" not in value:
+        return StreamStartVisualizerDraftR1.from_dict(value)
+    return StreamStartVisualizer.from_dict(value)
+
+
 # Server -> Client: stream/start
 @dataclass
 class StreamStartPayload(DataClassORJSONMixin):
@@ -430,8 +487,22 @@ class StreamStartPayload(DataClassORJSONMixin):
     """Information about the player."""
     artwork: StreamStartArtwork | None = None
     """Artwork information (sent to clients with artwork role)."""
-    visualizer: StreamStartVisualizer | None = None
-    """Visualizer information (sent to clients with visualizer role)."""
+    # Typed `Any` (rather than `StreamStartVisualizerLike`) so mashumaro defers
+    # to the explicit serialize/deserialize hooks; the bare union cannot
+    # disambiguate the two same-named schemas. The serialize hook rejects
+    # anything other than the alias's members at runtime.
+    visualizer: Any = field(
+        default=None,
+        metadata={
+            "serialize": _serialize_stream_start_visualizer,
+            "deserialize": _deserialize_stream_start_visualizer,
+        },
+    )
+    """Visualizer information (sent to clients with visualizer role).
+
+    Carries the v1 schema by default; legacy clients on `visualizer@_draft_r1`
+    get the draft schema. Roles emit whichever matches their negotiated wire.
+    """
 
     class Config(BaseConfig):
         """Config for parsing json messages."""

@@ -32,6 +32,11 @@ if TYPE_CHECKING:
     from aiosendspin.server.group import SendspinGroup
 
 
+# Default startup lead time used when a role does not report its own. Matches the
+# push stream's no-roles fallback so default behavior is unchanged.
+DEFAULT_REQUIRED_LEAD_TIME_US = 250_000
+
+
 @dataclass(frozen=True)
 class BinaryHandling:
     """Policy for how binary messages should be handled by connection.
@@ -250,6 +255,20 @@ class Role(ABC):
         """
         return False
 
+    def replay_from_pcm_cache(self) -> bool:
+        """Whether late-join should replay cached PCM even when a live resampler exists.
+
+        Audio-playback roles skip historical replay when another live role
+        already drives a resampler at their target PCM shape, because
+        re-running that resampler would shift the live role's samples across
+        the hand-off. Analysis-only roles (e.g. visualizer) do not feed a
+        synchronized output, so the seam is inaudible; they override this to
+        True so a mid-stream join is fed the buffered PCM immediately instead
+        of waiting for the next live commit (which may sit far ahead of the
+        playhead behind a producer buffer).
+        """
+        return False
+
     def get_binary_handling(self, message_type: int) -> BinaryHandling | None:  # noqa: ARG002
         """Return handling policy for a binary message type, or None if not handled.
 
@@ -266,6 +285,14 @@ class Role(ABC):
 
     def get_static_delay_us(self) -> int:
         """Return transport delay in microseconds applied by this role (default: 0)."""
+        return 0
+
+    def get_required_lead_time_us(self) -> int:
+        """Return the startup lead time this role needs before the first audio chunk."""
+        return DEFAULT_REQUIRED_LEAD_TIME_US
+
+    def get_min_buffer_us(self) -> int:
+        """Return the minimum ongoing buffer duration this role wants during playback."""
         return 0
 
     def get_join_delay_s(self) -> float:

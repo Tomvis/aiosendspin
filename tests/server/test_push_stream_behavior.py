@@ -6,6 +6,7 @@ import asyncio
 import sys
 from collections import deque
 from dataclasses import dataclass
+from itertools import pairwise
 from typing import Any
 from unittest.mock import MagicMock
 from uuid import UUID
@@ -260,7 +261,26 @@ async def test_late_join_target_includes_player_static_delay() -> None:
 
     stream = PushStream(loop=loop, clock=clock, group=group)
 
-    assert stream.get_late_join_target_timestamp_us(role=role) == 6_100_000
+    # now + max(LATE_JOINER_MIN_LEAD_US=100ms, required_lead=250ms) + static_delay=5s
+    assert stream.get_late_join_target_timestamp_us(role=role) == 6_250_000
+
+
+@pytest.mark.asyncio
+async def test_late_join_target_uses_required_lead_time() -> None:
+    """Required lead time bumps the floor when it exceeds the static minimum."""
+    loop = asyncio.get_running_loop()
+    clock = ManualClock(now_us_value=1_000_000)
+    group = _DummyGroup(clients=[])
+    client, _ = _make_connected_player(loop, group, "p1", clock=clock)
+    role = client.role("player@v1")
+    assert role is not None
+    role.static_delay_ms = 5_000
+    role.required_lead_time_ms = 400  # > 100ms default floor
+
+    stream = PushStream(loop=loop, clock=clock, group=group)
+
+    # now + max(100ms, 400ms required_lead) + 5s static_delay
+    assert stream.get_late_join_target_timestamp_us(role=role) == 6_400_000
 
 
 @pytest.mark.asyncio
@@ -979,6 +999,248 @@ async def test_non_main_pcm_catchup_does_not_anchor_to_far_channel_tail() -> Non
             channels=2,
             transformer=TransformerB(),
             channel_id=channel_id,
+            frame_duration_us=25_000,
+        )
+    )
+    group.clients.append(_DummyClient([role2]))
+
+    stream.on_role_join(role2)
+    for _ in range(50):
+        if role2.received:
+            break
+        await asyncio.sleep(0)
+
+    assert role2.started == 1
+    assert role2.received
+    assert role2.received[0].timestamp_us - now_us < 500_000
+
+
+async def _setup_deep_buffer_catchup_join() -> tuple[PushStream, _DummyRole, int]:
+    """Build a deep-buffer main-channel catch-up join and return (stream, joiner, tail).
+
+    A live role drives an established 24-to-16-bit resampler, the PCM cache
+    spans near-now through a far-ahead tail, and the joiner has just joined
+    with its own TransformKey so its catch-up task is created but not yet run.
+    """
+
+    class TransformerA:
+        pending_timestamp_us: int | None = None
+
+        @property
+        def frame_duration_us(self) -> int:
+            return 25_000
+
+        def process(self, pcm: bytes, _ts: int, _dur: int) -> list[tuple[bytes, int]]:
+            return [(pcm, 25_000)]
+
+        def flush(self) -> list[tuple[bytes, int]]:
+            return []
+
+        def get_header(self) -> bytes | None:
+            return None
+
+        def reset(self) -> None:
+            return
+
+    class TransformerB(TransformerA):
+        pass
+
+    group = _DummyGroup(clients=[])
+    role1 = _DummyRole(
+        AudioRequirements(
+            sample_rate=48000,
+            bit_depth=16,
+            channels=2,
+            transformer=TransformerA(),
+            channel_id=MAIN_CHANNEL,
+            frame_duration_us=25_000,
+        )
+    )
+    group.clients.append(_DummyClient([role1]))
+
+    loop = asyncio.get_running_loop()
+    clock = ManualClock()
+    stream = PushStream(loop=loop, clock=clock, group=group)
+
+    stream.prepare_audio(
+        bytes(7200),  # 25ms @ 48kHz stereo 24-bit
+        AudioFormat(sample_rate=48000, bit_depth=24, channels=2),
+    )
+    await stream.commit_audio()
+
+    now_us = clock.now_us()
+    frame_duration_us = 25_000
+    chunk_count = 1240
+
+    pcm_chunks = deque[CachedPCMChunk]()
+    for i in range(chunk_count):
+        ts = now_us - 100_000 + i * frame_duration_us
+        pcm_chunks.append(
+            CachedPCMChunk(
+                timestamp_us=ts,
+                duration_us=frame_duration_us,
+                pcm_data=bytes(7200),
+                sample_rate=48000,
+                bit_depth=24,
+                channels=2,
+            )
+        )
+    tail_us = now_us - 100_000 + chunk_count * frame_duration_us
+    stream._pcm_chunk_cache[MAIN_CHANNEL.int] = pcm_chunks  # noqa: SLF001
+    stream._channel_timing[MAIN_CHANNEL] = tail_us  # noqa: SLF001
+    stream._channel_timing_residue[MAIN_CHANNEL] = 0  # noqa: SLF001
+
+    role2 = _DummyRole(
+        AudioRequirements(
+            sample_rate=48000,
+            bit_depth=16,
+            channels=2,
+            transformer=TransformerB(),
+            channel_id=MAIN_CHANNEL,
+            frame_duration_us=25_000,
+        )
+    )
+    group.clients.append(_DummyClient([role2]))
+
+    stream.on_role_join(role2)
+    return stream, role2, tail_us
+
+
+@pytest.mark.asyncio
+async def test_catchup_handoff_commit_race_does_not_overlap() -> None:
+    """A commit racing the catch-up hand-off must not deliver duplicate audio.
+
+    The commit caches its PCM, then yields so the catch-up task consumes it
+    through the shared encoder. The resumed commit must not feed the same
+    samples to that encoder again.
+    """
+    stream, role2, _tail_us = await _setup_deep_buffer_catchup_join()
+
+    # Commit immediately so the hand-off happens mid-commit.
+    stream.prepare_audio(
+        bytes(7200),
+        AudioFormat(sample_rate=48000, bit_depth=24, channels=2),
+    )
+    await stream.commit_audio()
+    for _ in range(50):
+        if role2.received:
+            break
+        await asyncio.sleep(0)
+
+    received = sorted(role2.received, key=lambda c: c.timestamp_us)
+    assert received
+    for prev, nxt in pairwise(received):
+        assert nxt.timestamp_us >= prev.timestamp_us + prev.duration_us
+
+
+@pytest.mark.asyncio
+async def test_catchup_handoff_delivers_contiguous_audio() -> None:
+    """Audio across the catch-up hand-off has no gaps through later commits."""
+    stream, role2, tail_us = await _setup_deep_buffer_catchup_join()
+
+    for _ in range(3):
+        stream.prepare_audio(
+            bytes(7200),
+            AudioFormat(sample_rate=48000, bit_depth=24, channels=2),
+        )
+        await stream.commit_audio()
+
+    received = sorted(role2.received, key=lambda c: c.timestamp_us)
+    assert received
+    for prev, nxt in pairwise(received):
+        assert nxt.timestamp_us == prev.timestamp_us + prev.duration_us
+    last = received[-1]
+    assert last.timestamp_us + last.duration_us == tail_us + 3 * 25_000
+
+
+@pytest.mark.asyncio
+async def test_main_join_with_established_resampler_backfills_near_now() -> None:
+    """Deeply-buffered main-channel join must backfill near now, not inherit the tail.
+
+    When a live role already drives a non-passthrough resampler at the joiner's
+    target shape and the channel tail sits far ahead (deep producer buffer), the
+    join must still replay buffered PCM from the playhead instead of skipping to
+    live audio that does not arrive until the tail.
+    """
+
+    class TransformerA:
+        pending_timestamp_us: int | None = None
+
+        @property
+        def frame_duration_us(self) -> int:
+            return 25_000
+
+        def process(self, pcm: bytes, _ts: int, _dur: int) -> list[tuple[bytes, int]]:
+            return [(pcm, 25_000)]
+
+        def flush(self) -> list[tuple[bytes, int]]:
+            return []
+
+        def get_header(self) -> bytes | None:
+            return None
+
+        def reset(self) -> None:
+            return
+
+    class TransformerB(TransformerA):
+        pass
+
+    group = _DummyGroup(clients=[])
+    role1 = _DummyRole(
+        AudioRequirements(
+            sample_rate=48000,
+            bit_depth=16,
+            channels=2,
+            transformer=TransformerA(),
+            channel_id=MAIN_CHANNEL,
+            frame_duration_us=25_000,
+        )
+    )
+    group.clients.append(_DummyClient([role1]))
+
+    loop = asyncio.get_running_loop()
+    clock = ManualClock()
+    stream = PushStream(loop=loop, clock=clock, group=group)
+
+    # Commit one 24-bit chunk so role1 establishes a non-passthrough resampler
+    # (source 24-bit to target 16-bit) at the joiner's target shape.
+    stream.prepare_audio(
+        bytes(7200),  # 25ms @ 48kHz stereo 24-bit
+        AudioFormat(sample_rate=48000, bit_depth=24, channels=2),
+    )
+    await stream.commit_audio()
+    role1_req = role1.get_audio_requirements()
+    assert role1_req is not None
+    assert stream._has_established_resampler_for(role1_req, MAIN_CHANNEL)  # noqa: SLF001
+
+    now_us = clock.now_us()
+    frame_duration_us = 25_000
+
+    # ~31s of cached 24-bit PCM spanning near-now into the future, channel tail
+    # parked 30s ahead to model a deep buffered source.
+    pcm_chunks = deque[CachedPCMChunk]()
+    for i in range(1240):
+        ts = now_us - 100_000 + i * frame_duration_us
+        pcm_chunks.append(
+            CachedPCMChunk(
+                timestamp_us=ts,
+                duration_us=frame_duration_us,
+                pcm_data=bytes(7200),
+                sample_rate=48000,
+                bit_depth=24,
+                channels=2,
+            )
+        )
+    stream._pcm_chunk_cache[MAIN_CHANNEL.int] = pcm_chunks  # noqa: SLF001
+    stream._channel_timing[MAIN_CHANNEL] = now_us + 30_000_000  # noqa: SLF001
+
+    role2 = _DummyRole(
+        AudioRequirements(
+            sample_rate=48000,
+            bit_depth=16,
+            channels=2,
+            transformer=TransformerB(),
+            channel_id=MAIN_CHANNEL,
             frame_duration_us=25_000,
         )
     )
@@ -2525,6 +2787,7 @@ async def test_replay_from_pcm_cache_overrides_established_resampler_skip() -> N
             frame_duration_us=25_000,
         ),
         replay_from_pcm_cache=True,
+        required_lead_time_us=100_000,
     )
     group.clients.append(_DummyClient([viz_role]))
     stream.on_role_join(viz_role)
@@ -2916,6 +3179,37 @@ async def test_buffered_source_skips_min_buffer_at_startup() -> None:
 
     # Buffered: startup = lead(0) + static(0) = 0; min_buffer ignored upfront.
     assert play_start == clock.now_us()
+
+
+@pytest.mark.asyncio
+async def test_explicit_play_start_us_overrides_stale_channel_timing() -> None:
+    """Explicit play_start_us is authoritative across mode switches."""
+    loop = asyncio.get_running_loop()
+    clock = ManualClock(now_us_value=1_000_000)
+    group = _DummyGroup(clients=[])
+    role = _make_role(required_lead_time_us=0, min_buffer_us=0, static_delay_us=0)
+    group.clients.append(_DummyClient([role]))
+
+    stream = PushStream(loop=loop, clock=clock, group=group)
+    fmt = AudioFormat(sample_rate=48000, bit_depth=16, channels=2)
+
+    # First commit anchors the channel at an explicit start far ahead of "now".
+    first_play_start_us = 10_000_000
+    stream.prepare_audio(bytes(4800), fmt)
+    returned_first = await stream.commit_audio(play_start_us=first_play_start_us)
+    assert returned_first == first_play_start_us
+
+    # Subsequent commit with a different play_start_us must overwrite the
+    # advanced channel timing, not be ignored because the channel already exists.
+    second_play_start_us = 20_000_000
+    stream.prepare_audio(bytes(4800), fmt)
+    returned_second = await stream.commit_audio(play_start_us=second_play_start_us)
+    assert returned_second == second_play_start_us
+
+    # The channel timing now reflects the second play_start_us plus its chunk
+    # duration (25ms @ 48kHz stereo s16 = 25_000us), not first + 2 * duration.
+    expected_after_advance = second_play_start_us + 25_000
+    assert stream._channel_timing[MAIN_CHANNEL] == expected_after_advance  # noqa: SLF001
 
 
 @pytest.mark.asyncio
@@ -3359,7 +3653,8 @@ async def test_catchup_drain_advances_encoder_pending_to_live_tip() -> None:
             transformer=joining_transformer,
             channel_id=MAIN_CHANNEL,
             frame_duration_us=25_000,
-        )
+        ),
+        required_lead_time_us=100_000,
     )
     group.clients.append(_DummyClient([role2]))
     stream.on_role_join(role2)
@@ -3457,7 +3752,8 @@ async def test_catchup_mid_pass_format_change_keeps_chunks_ordered() -> None:
             transformer=Transformer(),
             channel_id=MAIN_CHANNEL,
             frame_duration_us=25_000,
-        )
+        ),
+        required_lead_time_us=100_000,
     )
     group.clients.append(_DummyClient([role2]))
     stream.on_role_join(role2)

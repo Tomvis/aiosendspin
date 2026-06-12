@@ -1001,7 +1001,10 @@ class PushStream:
         """Return a safe minimum playback timestamp for late-join replay."""
         now_us = self._clock.now_us()
         delay_us = role.get_static_delay_us() if role is not None else 0
-        target_us = now_us + max(0, min_lead_us) + delay_us
+        effective_lead_us = max(0, min_lead_us)
+        if role is not None:
+            effective_lead_us = max(effective_lead_us, role.get_required_lead_time_us())
+        target_us = now_us + effective_lead_us + delay_us
         if align_to_channel_tail and channel_id is not None and channel_id in self._channel_timing:
             # For channels that currently have no other subscribers, anchor catch-up
             # to that channel's own live tail when it is near real time. If that tail
@@ -1180,12 +1183,12 @@ class PushStream:
         channel_play_start: dict[UUID, int] = {}
 
         if play_start_us is not None:
-            # Explicit timestamp mode: use provided timestamp directly.
+            # Explicit timestamp mode: caller-provided value is authoritative
+            # across mode switches, so overwrite any stale advanced timing.
             for channel_id in prepared:
                 channel_play_start[channel_id] = play_start_us
-                if channel_id not in self._channel_timing:
-                    self._channel_timing[channel_id] = play_start_us
-                    self._channel_timing_residue[channel_id] = 0
+                self._channel_timing[channel_id] = play_start_us
+                self._channel_timing_residue[channel_id] = 0
             return channel_play_start
 
         # Auto-calculate mode (existing behavior).
@@ -1962,15 +1965,15 @@ class PushStream:
                             self._ensure_role_started(role)
                         return
 
-                if not role.replay_from_pcm_cache() and self._has_established_resampler_for(
-                    req, channel_id
+                if (
+                    not role.replay_from_pcm_cache()
+                    and self._has_established_resampler_for(req, channel_id)
+                    and self._skip_replay_keeps_join_near_playhead(channel_id, role)
                 ):
-                    # Sharing a resampler key with a live role would shift this
-                    # role's audio across the hand-off; skip historical replay.
-                    # Analysis-only roles opt out: their catch-up uses isolated
-                    # resampler state and an inaudible seam, so replaying the
-                    # buffered PCM now beats waiting for a live commit that may
-                    # sit far ahead behind the producer buffer.
+                    # A live role drives this resampler shape, so replaying through it
+                    # would shift the live role's audio across the hand-off. Skip replay
+                    # only when live audio lands near the playhead, else fall through to
+                    # catch-up so the joiner is not stranded waiting at a far-ahead tail.
                     self._rebase_far_ahead_join_tail(channel_id, role)
                     if self._channel_timing:
                         self._ensure_role_started(role)
@@ -1978,9 +1981,11 @@ class PushStream:
 
                 self._catchup_state[cache_key] = "catching_up"
                 self._catchup_roles[cache_key] = {role}
-                self._catchup_tasks[cache_key] = create_task(
-                    self._start_catchup_encoding(role, req, channel_id, cache_key)
-                )
+                task = create_task(self._start_catchup_encoding(role, req, channel_id, cache_key))
+                # An eager task can finish inside create_task, after its own
+                # cleanup already removed the map entry. Don't re-add it.
+                if not task.done():
+                    self._catchup_tasks[cache_key] = task
                 return
 
             if self._channel_timing:
@@ -2106,15 +2111,33 @@ class PushStream:
         )
         self._channel_timing_residue[channel_id] = 0
 
+    def _skip_replay_keeps_join_near_playhead(self, channel_id: UUID, role: Role) -> bool:
+        """Whether skipping PCM replay still lands the joiner near the playhead.
+
+        True when the tail is within a normal buffer of now, or far ahead but
+        clampable. A far-ahead tail that cannot be clamped means the joiner must
+        replay instead of waiting for live audio at the tail.
+        """
+        tail_us = self._channel_timing.get(channel_id)
+        if tail_us is None:
+            return True
+        now_us = self._clock.now_us()
+        if tail_us <= now_us + self._role_send_ahead_us(role):
+            return True
+        return self._can_clamp_far_ahead_tail(channel_id, role)
+
+    def _can_clamp_far_ahead_tail(self, channel_id: UUID, role: Role) -> bool:
+        """Whether the tail can move, blocked by other roles or committed audio."""
+        return not (
+            self._channel_has_other_audio_roles(channel_id, role)
+            or channel_id in self._channels_with_committed_audio
+        )
+
     def _rebase_far_ahead_join_tail(self, channel_id: UUID, joining_role: Role) -> None:
         """Clamp far-ahead solo-channel timing so a rejoin can resume promptly."""
         if channel_id not in self._channel_timing:
             return
-        if self._channel_has_other_audio_roles(channel_id, joining_role):
-            return
-        if channel_id in self._channels_with_committed_audio:
-            # Do not rebase if the channel already has committed audio, as changing the timing
-            # will de-sync it from other clients.
+        if not self._can_clamp_far_ahead_tail(channel_id, joining_role):
             return
         now_us = self._clock.now_us()
         max_resume_start_us = now_us + self._role_send_ahead_us(joining_role)
@@ -2135,8 +2158,8 @@ class PushStream:
     ) -> list[CachedChunk]:
         """Resample PCM chunks to the target format and encode them sequentially.
 
-        Pass `resamplers`/`quantizers` to share state across calls (single resampler,
-        drainable via `_drain_catchup_resamplers`).
+        Pass `resamplers`/`quantizers` to share state across calls (single resampler
+        instance per key reused between batches).
         """
         tkey = self._build_transform_key(req, channel_id)
         cached: list[CachedChunk] = []
@@ -2322,29 +2345,6 @@ class PushStream:
             )
             for data, ts, dur in encoded_frames
         ]
-
-    def _drain_catchup_resamplers(
-        self,
-        resamplers: dict[_ResamplerKey, _ResamplerState],
-        quantizers: dict[_ResamplerKey, _ResamplerState],
-        encoder: AudioTransformer | None,
-        req: AudioRequirements,
-        channel_id: UUID,
-    ) -> list[CachedChunk]:
-        """Flush each catchup resampler's FIR tail and encode the drained PCM.
-
-        Without draining, the resampler's FIR holds samples past the catchup
-        tail, leaving a content gap before the first live chunk. Drain emits
-        those held samples on the live timeline so live picks up seamlessly.
-        """
-        cached: list[CachedChunk] = []
-        for resampler_state in resamplers.values():
-            cached.extend(
-                self._flush_resampler_to_chunks(
-                    resampler_state, quantizers, encoder, req, channel_id
-                )
-            )
-        return cached
 
     async def _start_catchup_encoding(  # noqa: PLR0915
         self,

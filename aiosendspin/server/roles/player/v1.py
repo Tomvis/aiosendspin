@@ -55,6 +55,9 @@ if TYPE_CHECKING:
     from aiosendspin.server.client import SendspinClient
 
 
+BUFFER_TRACKER_RESET_DELAY_S = 2.0
+
+
 @dataclass
 class PlayerPersistentState:
     """Persistent player state stored on the SendspinClient."""
@@ -233,11 +236,10 @@ class PlayerV1Role(Role):
                 return
             state.buffer_tracker.reset()
 
-        reset_after_s = 2.0
         if state.buffer_reset_handle is not None:
             state.buffer_reset_handle.cancel()
         state.buffer_reset_handle = self._client._server.loop.call_later(  # noqa: SLF001
-            reset_after_s, _maybe_reset
+            BUFFER_TRACKER_RESET_DELAY_S, _maybe_reset
         )
 
     def requires_initial_state(self) -> bool:
@@ -670,19 +672,22 @@ class PlayerV1Role(Role):
         if state.supported_commands is not None:
             self.state_supported_commands = state.supported_commands
 
-        if self.static_delay_ms != state.static_delay_ms:
+        if state.static_delay_ms is not None and self.static_delay_ms != state.static_delay_ms:
             self.static_delay_ms = state.static_delay_ms
             self._client._signal_event(  # noqa: SLF001
                 StaticDelayChangedEvent(static_delay_ms=state.static_delay_ms)
             )
 
-        if self.required_lead_time_ms != state.required_lead_time_ms:
+        if (
+            state.required_lead_time_ms is not None
+            and self.required_lead_time_ms != state.required_lead_time_ms
+        ):
             self.required_lead_time_ms = state.required_lead_time_ms
             self._client._signal_event(  # noqa: SLF001
                 RequiredLeadTimeChangedEvent(required_lead_time_ms=state.required_lead_time_ms)
             )
 
-        if self.min_buffer_ms != state.min_buffer_ms:
+        if state.min_buffer_ms is not None and self.min_buffer_ms != state.min_buffer_ms:
             self.min_buffer_ms = state.min_buffer_ms
             self._client._signal_event(  # noqa: SLF001
                 MinBufferChangedEvent(min_buffer_ms=state.min_buffer_ms)

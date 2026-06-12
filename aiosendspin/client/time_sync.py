@@ -10,9 +10,17 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-# Residual threshold as fraction of max_error for triggering adaptive forgetting.
+# Residual threshold as multiple of max_error for triggering adaptive forgetting.
 # When residual > CUTOFF * max_error, the filter applies forgetting to recover from outliers.
-ADAPTIVE_FORGETTING_CUTOFF = 0.75
+ADAPTIVE_FORGETTING_CUTOFF = 3.0
+
+# Scale factor applied to max_error before it is used as the measurement standard deviation.
+# Values < 1 indicate the round-trip half-delay overestimates true measurement noise.
+MAX_ERROR_SCALE = 0.5
+
+# SNR threshold for applying drift compensation in time conversions.
+# Drift is only used when drift^2 > threshold^2 * drift_covariance.
+DRIFT_SIGNIFICANCE_THRESHOLD_SQUARED = 2.0 * 2.0
 
 
 @dataclass(slots=True)
@@ -22,6 +30,7 @@ class TimeElement:
     last_update: int = 0
     offset: float = 0.0
     drift: float = 0.0
+    use_drift: bool = False
 
 
 class SendspinTimeFilter:
@@ -50,13 +59,20 @@ class SendspinTimeFilter:
     _drift_covariance: float = 0.0
 
     _process_variance: float
+    _drift_process_variance: float
     _forget_variance_factor: float
 
     _current_time_element: TimeElement
 
-    def __init__(self, process_std_dev: float = 0.01, forget_factor: float = 1.001) -> None:
+    def __init__(
+        self,
+        process_std_dev: float = 0.0,
+        forget_factor: float = 2.0,
+        drift_process_std_dev: float = 1e-11,
+    ) -> None:
         """Initialise the Kalman filter with noise and forgetting parameters."""
         self._process_variance = process_std_dev * process_std_dev
+        self._drift_process_variance = drift_process_std_dev * drift_process_std_dev
         self._forget_variance_factor = forget_factor * forget_factor
         self._current_time_element = TimeElement()
 
@@ -81,14 +97,14 @@ class SendspinTimeFilter:
             time_added: Client timestamp when this measurement was taken in
                 microseconds.
         """
-        if time_added == self._last_update:
-            # Skip duplicate timestamps to avoid division by zero in drift calculation
+        if time_added <= self._last_update:
+            # Skip non-monotonic timestamps to guard against backwards dt in predict
             return
 
         dt: float = float(time_added - self._last_update)
         self._last_update = time_added
 
-        update_std_dev: float = float(max_error)
+        update_std_dev: float = float(max_error) * MAX_ERROR_SCALE
         measurement_variance: float = update_std_dev * update_std_dev
 
         # Filter initialization: First measurement establishes offset baseline
@@ -135,8 +151,9 @@ class SendspinTimeFilter:
         # State transition matrix F = [1, dt; 0, 1]
         dt_squared: float = dt * dt
 
-        # Process noise only applied to offset (modeling clock jitter/wander)
-        drift_process_variance: float = 0.0  # Drift assumed stable
+        # Process noise for both offset and drift (full random walk model).
+        # Independent clock jitter (offset noise) and wander (drift noise).
+        drift_process_variance: float = dt * self._drift_process_variance
         new_drift_covariance: float = self._drift_covariance + drift_process_variance
 
         offset_drift_process_variance: float = 0.0
@@ -188,10 +205,17 @@ class SendspinTimeFilter:
         )
         self._offset_covariance = new_offset_covariance - offset_gain * new_offset_covariance
 
+        # SNR gate: only apply drift when statistically significant
+        use_drift: bool = (
+            self._drift * self._drift
+            > DRIFT_SIGNIFICANCE_THRESHOLD_SQUARED * self._drift_covariance
+        )
+
         self._current_time_element = TimeElement(
             last_update=self._last_update,
             offset=self._offset,
             drift=self._drift,
+            use_drift=use_drift,
         )
 
     def compute_server_time(self, client_time: int) -> int:
@@ -216,9 +240,11 @@ class SendspinTimeFilter:
         # offset(t) = offset_base + drift * (t - t_last_update)
 
         # Retrieve latest time transformation parameters
+        element = self._current_time_element
+        effective_drift = element.drift if element.use_drift else 0.0
 
-        dt = float(client_time - self._current_time_element.last_update)
-        offset = round(self._current_time_element.offset + self._current_time_element.drift * dt)
+        dt = float(client_time - element.last_update)
+        offset = round(element.offset + effective_drift * dt)
         return client_time + offset
 
     def compute_client_time(self, server_time: int) -> int:
@@ -242,19 +268,18 @@ class SendspinTimeFilter:
         # T_server = T_client + offset + drift * (T_client - T_last_update)
         # T_server = (1 + drift) * T_client + offset - drift * T_last_update
         # T_client = (T_server - offset + drift * T_last_update) / (1 + drift)
+        element = self._current_time_element
+        effective_drift = element.drift if element.use_drift else 0.0
 
         return round(
-            (
-                float(server_time)
-                - self._current_time_element.offset
-                + self._current_time_element.drift * self._current_time_element.last_update
-            )
-            / (1.0 + self._current_time_element.drift)
+            (float(server_time) - element.offset + effective_drift * element.last_update)
+            / (1.0 + effective_drift)
         )
 
     def reset(self) -> None:
         """Reset the filter state."""
         self._count = 0
+        self._last_update = 0
         self._offset = 0.0
         self._drift = 0.0
         self._offset_covariance = math.inf

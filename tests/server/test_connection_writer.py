@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import dataclass
 from typing import Any, Never
 from unittest.mock import AsyncMock, MagicMock
@@ -21,7 +22,12 @@ from aiosendspin.models.core import (
 from aiosendspin.models.player import StreamStartPlayer
 from aiosendspin.models.types import AudioCodec, BinaryMessageType
 from aiosendspin.server.clock import LoopClock, ManualClock
-from aiosendspin.server.connection import SendspinConnection, _BinaryData, _RoleQueueEntry
+from aiosendspin.server.connection import (
+    MAX_PENDING_MSG,
+    SendspinConnection,
+    _BinaryData,
+    _RoleQueueEntry,
+)
 from aiosendspin.server.roles.base import BinaryHandling
 from aiosendspin.server.roles.player.v1 import PlayerV1Role
 
@@ -438,6 +444,53 @@ async def test_role_stream_lifecycle_json_is_sent_before_older_binary() -> None:
 
 
 @pytest.mark.asyncio
+async def test_writer_rewrites_server_transmitted_at_send_time() -> None:
+    """`server/time` must carry the clock value at actual send, not at enqueue."""
+    loop = asyncio.get_running_loop()
+    clock = ManualClock(now_us_value=1_000_000)
+    server = _DummyServer(loop=loop, clock=clock)
+
+    sent_json: list[str] = []
+
+    async def _record_json(payload: str) -> None:
+        sent_json.append(payload)
+
+    wsock = MagicMock()
+    wsock.closed = False
+    wsock.send_str = AsyncMock(side_effect=_record_json)
+    wsock.send_bytes = AsyncMock()
+
+    conn = SendspinConnection(server, wsock_client=wsock)
+    await conn._setup_connection()  # noqa: SLF001
+
+    conn.send_message(
+        ServerTimeMessage(
+            payload=ServerTimePayload(
+                client_transmitted=11,
+                server_received=22,
+                server_transmitted=0,
+            )
+        )
+    )
+
+    # Simulate enqueue-to-send latency before the writer drains the queue.
+    clock.advance_us(750_000)
+
+    for _ in range(50):
+        if sent_json:
+            break
+        await asyncio.sleep(0)
+
+    assert len(sent_json) == 1
+    payload = json.loads(sent_json[0])["payload"]
+    assert payload["client_transmitted"] == 11
+    assert payload["server_received"] == 22
+    assert payload["server_transmitted"] == 1_750_000
+
+    await conn.disconnect(retry_connection=False)
+
+
+@pytest.mark.asyncio
 async def test_send_binary_disconnects_on_per_role_queue_overflow() -> None:
     """Per-role queue overflow should trigger disconnect."""
     loop = asyncio.get_running_loop()
@@ -466,6 +519,36 @@ async def test_send_binary_disconnects_on_per_role_queue_overflow() -> None:
     await asyncio.sleep(0)
 
     assert conn.disconnect.call_count == 1  # type: ignore[attr-defined]
+
+
+def test_priority_message_queue_cap_uses_own_length() -> None:
+    """Priority queue cap should ignore unrelated role-queue bytes in `_queue_size`."""
+    loop = asyncio.new_event_loop()
+    try:
+        server = _DummyServer(loop=loop, clock=LoopClock(loop))
+        wsock = MagicMock()
+        wsock.closed = False
+        conn = SendspinConnection(server, wsock_client=wsock)
+        conn.disconnect = AsyncMock()  # type: ignore[method-assign]
+
+        # Simulate saturated role queues: aggregate _queue_size above the priority cap
+        # without putting anything into _priority_messages itself.
+        conn._queue_size = MAX_PENDING_MSG * 2  # noqa: SLF001
+
+        conn.send_priority_message(
+            ServerTimeMessage(
+                payload=ServerTimePayload(
+                    client_transmitted=1,
+                    server_received=2,
+                    server_transmitted=0,
+                )
+            )
+        )
+
+        assert conn.disconnect.call_count == 0  # type: ignore[attr-defined]
+        assert len(conn._priority_messages) == 1  # noqa: SLF001
+    finally:
+        loop.close()
 
 
 def test_per_role_queue_limit_is_isolated_between_roles() -> None:

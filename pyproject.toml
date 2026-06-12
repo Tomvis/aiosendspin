@@ -24,7 +24,7 @@ description = "Async Python implementation of the Sendspin Protocol."
 license = { text = "Apache-2.0" }
 readme = "README.md"
 requires-python = ">=3.12"
-version = "6.0.1+trackfields"
+version = "6.0.5+trackfields"
 
 [project.optional-dependencies]
 server = [

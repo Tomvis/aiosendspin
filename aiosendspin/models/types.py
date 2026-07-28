@@ -52,6 +52,13 @@ def undefined_field() -> UndefinedField:
 # Enums
 
 
+class TrustLevel(Enum):
+    """Trust a client extends to a server, governing allowed management operations."""
+
+    NONE = "none"
+    USER = "user"
+
+
 class Roles(Enum):
     """Client roles with explicit versioning."""
 
@@ -120,21 +127,6 @@ class RepeatMode(Enum):
     ALL = "all"
 
 
-class ClientStateType(Enum):
-    """Enum for Client States."""
-
-    SYNCHRONIZED = "synchronized"
-    """Client is operational and synchronized with server timestamps."""
-    ERROR = "error"
-    """Client has a problem preventing normal operation."""
-    EXTERNAL_SOURCE = "external_source"
-    """Client is in use by an external system and cannot participate in Sendspin playback."""
-
-
-# DEPRECATED(before-spec-pr-50): Remove once all clients use client-level state
-PlayerStateType = ClientStateType
-
-
 class PlaybackStateType(Enum):
     """Enum for Playback States."""
 
@@ -175,6 +167,8 @@ class MediaCommand(Enum):
     SHUFFLE = "shuffle"
     UNSHUFFLE = "unshuffle"
     SWITCH = "switch"
+    SEEK = "seek"
+    SEEK_RELATIVE = "seek_relative"
 
 
 class PictureFormat(Enum):
@@ -201,8 +195,23 @@ class ConnectionReason(Enum):
 
     DISCOVERY = "discovery"
     """Server is connecting for general availability (e.g., initial discovery, reconnection)."""
+    PAIRING = "pairing"
+    """Server is performing a pairing handshake."""
     PLAYBACK = "playback"
     """Server needs client for active or upcoming playback."""
+    MANAGEMENT = "management"
+    """Server is opening a dedicated management session."""
+
+
+class Activity(Enum):
+    """A currently-active purpose on a connection, declared in server/activate."""
+
+    PLAYBACK = "playback"
+    """Active or upcoming playback."""
+    PAIRING = "pairing"
+    """A pairing exchange."""
+    MANAGEMENT = "management"
+    """A dedicated management session."""
 
 
 class GoodbyeReason(Enum):
@@ -216,6 +225,51 @@ class GoodbyeReason(Enum):
     """Client is restarting and will reconnect."""
     USER_REQUEST = "user_request"
     """User explicitly requested to disconnect from this server."""
+    UNAUTHORIZED = "unauthorized"
+    """Server requested an activity the client's trust level does not permit."""
+    PAIRING_REQUIRED = "pairing_required"
+    """Server requested playback but the client requires pairing first."""
+    CONCURRENT_ATTEMPT = "concurrent_attempt"
+    """Incoming connection rejected because another connection is already admitted."""
+    UNPAIRED = "unpaired"
+    """Client processed server/unpair from this server."""
+
+
+class PairMethod(Enum):
+    """A pairing method a client offers or a server selects."""
+
+    DYNAMIC_PIN = "dynamic_pin"
+    PAIRING_PSK = "pairing_psk"
+    STATIC_PIN = "static_pin"
+
+
+class PairAbortReason(Enum):
+    """Reason a pairing attempt was aborted."""
+
+    ATTEMPT_TIMEOUT = "attempt_timeout"
+    CONCURRENT_ATTEMPT = "concurrent_attempt"
+    LOCKED_OUT = "locked_out"
+    METHOD_NOT_SUPPORTED = "method_not_supported"
+    PIN_LENGTH_UNACCEPTABLE = "pin_length_unacceptable"
+    PIN_MISMATCH = "pin_mismatch"
+    USER_CANCELLED = "user_cancelled"
+
+
+# The sender closes the connection after these abort reasons; every other reason keeps it open.
+CLOSING_ABORT_REASONS: frozenset[PairAbortReason] = frozenset(
+    {PairAbortReason.CONCURRENT_ATTEMPT, PairAbortReason.METHOD_NOT_SUPPORTED}
+)
+
+
+class ManagementResult(Enum):
+    """Result code carried by management/result."""
+
+    OK = "ok"
+    PERMISSION_DENIED = "permission_denied"
+    ALREADY_EXISTS = "already_exists"
+    INVALID = "invalid"
+    NOT_FOUND = "not_found"
+    STORAGE_EXHAUSTED = "storage_exhausted"
 
 
 # Role ID helpers for spec-compliant role negotiation

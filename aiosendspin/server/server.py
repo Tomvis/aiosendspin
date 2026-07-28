@@ -30,7 +30,11 @@ from zeroconf.asyncio import AsyncServiceBrowser, AsyncServiceInfo, AsyncZerocon
 
 from aiosendspin.clock import Clock, RawMonotonicClock
 from aiosendspin.models.core import ClientHelloPayload
-from aiosendspin.models.types import ConnectionReason, GoodbyeReason
+from aiosendspin.models.types import ConnectionReason
+from aiosendspin.noise.keys import Identity
+from aiosendspin.noise.pairing import PairingAbortError, PairingAttempt
+from aiosendspin.noise.pin import DEFAULT_MIN_PIN_DIGITS, MAX_PIN_DIGITS, MIN_PIN_DIGITS
+from aiosendspin.noise.trust_store import ServerPairingStore, TrustedUnpairedClient
 from aiosendspin.util import create_task, get_local_ip
 
 from .client import SendspinClient
@@ -114,25 +118,36 @@ class SendspinServer:
     def __init__(
         self,
         loop: asyncio.AbstractEventLoop,
-        server_id: str,
+        identity: Identity,
         server_name: str,
         client_session: ClientSession | None = None,
         *,
+        pairing_store: ServerPairingStore,
+        allow_unencrypted: bool = False,
+        min_pin_length: int = DEFAULT_MIN_PIN_DIGITS,
         clock: Clock | None = None,
     ) -> None:
         """Initialize a Sendspin server instance."""
+        if not MIN_PIN_DIGITS <= min_pin_length <= MAX_PIN_DIGITS:
+            msg = f"min_pin_length must be in [{MIN_PIN_DIGITS}, {MAX_PIN_DIGITS}]"
+            raise ValueError(msg)
         self._loop = loop
-        self._id = server_id
+        self._identity = identity
+        self._id = identity.peer_id
         self._name = server_name
+        self._pairing_store = pairing_store
+        self._allow_unencrypted = allow_unencrypted
+        self._min_pin_length = min_pin_length
         self._clock: Clock = clock or RawMonotonicClock()
 
         self._clients: dict[str, SendspinClient] = {}
         self._event_cbs: list[Callable[[SendspinServer, SendspinEvent], None]] = []
-        # Server-wide toggle for the visualizer `pitch` feature. Pitch (YINFFT)
-        # is the heaviest per-frame visualizer computation; disable it to shed
-        # load on constrained hardware. Read by VisualizerV1Role when building
-        # its stream config.
-        self._visualizer_pitch_enabled: bool = True
+        # Server-wide toggle for the visualizer `pitch` feature. Off by default:
+        # `pitch` rides reserved binary type 21, so enabling it puts a
+        # spec-reserved type on the wire and is technically non-compliant. It is
+        # kept as an opt-in extension for constrained/experimental setups. Read by
+        # VisualizerV1Role when building its stream config.
+        self._visualizer_pitch_enabled: bool = False
 
         if client_session is None:
             self._client_session = ClientSession(loop=self._loop, timeout=ClientTimeout(total=30))
@@ -147,10 +162,14 @@ class SendspinServer:
         self._initial_connect_succeeded: set[str] = set()
         self._connection_options: dict[str, _ServerInitiatedConnectionOptions] = {}
         self._connection_reasons: dict[str, ConnectionReason] = {}  # url → reason
+        # Pairing intents handed to an already-running dial task, consumed on its next dial.
+        self._pending_pairing_attempts: dict[str, PairingAttempt] = {}
         self._client_urls: dict[str, str] = {}  # client_id → url
         self._external_stream_start_cbs: dict[str, ExternalStreamStartCallback] = {}
         self._external_registration_timeouts: dict[str, asyncio.Handle] = {}
         self._reclaim_timeouts: dict[str, asyncio.Handle] = {}
+        # Clients whose unregister a one-shot timer deferred to an in-flight reconnect.
+        self._deferred_unregister: set[str] = set()
         self._pending_connections = set()
 
         self._mdns_client_urls: dict[str, str] = {}
@@ -161,7 +180,7 @@ class SendspinServer:
         self._mdns_service: AsyncServiceInfo | None = None
         self._mdns_browser: AsyncServiceBrowser | None = None
 
-        logger.debug("SendspinServer initialized: id=%s, name=%s", server_id, server_name)
+        logger.debug("SendspinServer initialized: id=%s, name=%s", self._id, server_name)
 
     def _create_web_application(self) -> web.Application:
         app = web.Application()
@@ -184,9 +203,29 @@ class SendspinServer:
         return self._id
 
     @property
+    def identity(self) -> Identity:
+        """Return the server's static X25519 identity (its public key is the server_id)."""
+        return self._identity
+
+    @property
+    def pairing_store(self) -> ServerPairingStore:
+        """Return the trust store of long-term records the server holds for clients."""
+        return self._pairing_store
+
+    @property
+    def allow_unencrypted(self) -> bool:
+        """Whether transition mode is enabled (accepts legacy unencrypted clients)."""
+        return self._allow_unencrypted
+
+    @property
     def name(self) -> str:
         """Return the human-readable server name."""
         return self._name
+
+    @property
+    def min_pin_length(self) -> int:
+        """Server's operator-configured minimum dynamic-PIN length in digits."""
+        return self._min_pin_length
 
     @property
     def clients(self) -> list[SendspinClient]:
@@ -204,15 +243,17 @@ class SendspinServer:
 
     @property
     def visualizer_pitch_enabled(self) -> bool:
-        """Whether visualizer roles compute the `pitch` feature (default True)."""
+        """Whether visualizer roles compute the `pitch` feature (default False)."""
         return self._visualizer_pitch_enabled
 
     def set_visualizer_pitch_enabled(self, *, enabled: bool) -> None:
         """Enable or disable the visualizer `pitch` feature server-wide.
 
-        Pitch (YINFFT) is the heaviest per-frame visualizer computation.
-        Disabling sheds that cost on constrained hardware: live visualizer
-        roles drop `pitch` from their negotiated types and re-emit
+        Enabling is technically non-compliant: `pitch` uses reserved binary type
+        21, which the spec says must not be used. It stays available as an opt-in
+        extension. Pitch (YINFFT) is also the heaviest per-frame visualizer
+        computation, so leaving it off sheds that cost on constrained hardware.
+        Toggling drops/adds `pitch` on live roles' negotiated types and re-emits
         `stream/start`; new roles pick the setting up when they connect.
         """
         if enabled == self._visualizer_pitch_enabled:
@@ -277,20 +318,23 @@ class SendspinServer:
         """
         if timeout_s < 0:
             raise ValueError("timeout_s must be >= 0")
+        if hello.client_id is None:
+            raise ValueError("external player hello must include client_id")
+        client_id = hello.client_id
 
-        client = self.get_or_create_client(hello.client_id)
+        client = self.get_or_create_client(client_id)
         if client.is_connected:
             raise RuntimeError(
-                f"Cannot register external player {hello.client_id!r} while client is connected"
+                f"Cannot register external player {client_id!r} while client is connected"
             )
         client.preinitialize_client_from_hello(hello)
         self._fire_client_added_event_once(client)
-        self._external_stream_start_cbs[hello.client_id] = on_stream_start
-        self._cancel_reclaim_timeout(hello.client_id)
+        self._external_stream_start_cbs[client_id] = on_stream_start
+        self._cancel_reclaim_timeout(client_id)
         if timeout_s > 0:
-            self._schedule_external_registration_timeout(hello.client_id, timeout_s)
+            self._schedule_external_registration_timeout(client_id, timeout_s)
         else:
-            self._cancel_external_registration_timeout(hello.client_id)
+            self._cancel_external_registration_timeout(client_id)
         return client
 
     def _fire_client_added_event_once(self, client: SendspinClient) -> None:
@@ -344,7 +388,7 @@ class SendspinServer:
         conn = SendspinConnection(self, request=request)
         self._pending_connections.add(conn)
         try:
-            await conn._handle_client()  # noqa: SLF001
+            await conn.handle_client()
         finally:
             self._pending_connections.discard(conn)
 
@@ -359,6 +403,7 @@ class SendspinServer:
         connection_reason: ConnectionReason = ConnectionReason.DISCOVERY,
         retry_initial_connection: bool = False,
         retry_indefinitely: bool = False,
+        pairing_attempt: PairingAttempt | None = None,
     ) -> None:
         """Start a background connection attempt to a client URL.
 
@@ -368,11 +413,8 @@ class SendspinServer:
         from a configured hostname/IP, port, and path, then pass
         retry_initial_connection=True and retry_indefinitely=True.
 
-        Args:
-            url: Client WebSocket URL (e.g. "ws://192.168.1.2:8928/sendspin").
-            connection_reason: Reason reported in server/hello.
-            retry_initial_connection: Keep retrying if the first connection attempt fails.
-            retry_indefinitely: Keep retrying later disconnects with capped exponential backoff.
+        ``pairing_attempt`` carries an operator-initiated pairing intent for this dial;
+        when a dial task already exists it is queued for that task's next dial.
         """
         self._set_connection_options(
             url,
@@ -382,6 +424,8 @@ class SendspinServer:
         self._connection_reasons[url] = connection_reason
         prev_task = self._connection_tasks.get(url)
         if prev_task is not None:
+            if pairing_attempt is not None:
+                self._pending_pairing_attempts[url] = pairing_attempt
             if retry_event := self._retry_events.get(url):
                 retry_event.set()
             return
@@ -389,7 +433,7 @@ class SendspinServer:
         self._initial_connect_succeeded.discard(url)
         self._retry_events[url] = asyncio.Event()
         self._connection_tasks[url] = create_task(
-            self._handle_client_connection(url),
+            self._handle_client_connection(url, pairing_attempt=pairing_attempt),
             eager_start=False,
         )
 
@@ -400,6 +444,7 @@ class SendspinServer:
         connection_reason: ConnectionReason = ConnectionReason.DISCOVERY,
         retry_initial_connection: bool = False,
         retry_indefinitely: bool = False,
+        pairing_attempt: PairingAttempt | None = None,
     ) -> None:
         """Connect to a client and wait for the initial connection attempt.
 
@@ -424,17 +469,87 @@ class SendspinServer:
 
         prev_task = self._connection_tasks.get(url)
         if prev_task is not None:
+            if pairing_attempt is not None:
+                self._pending_pairing_attempts[url] = pairing_attempt
             if retry_event := self._retry_events.get(url):
                 retry_event.set()
         else:
             self._initial_connect_succeeded.discard(url)
             self._retry_events[url] = asyncio.Event()
             self._connection_tasks[url] = create_task(
-                self._handle_client_connection(url),
+                self._handle_client_connection(url, pairing_attempt=pairing_attempt),
                 eager_start=False,
             )
 
         await waiter
+
+    async def initiate_pairing(self, client_id: str, attempt: PairingAttempt) -> None:
+        """Run a pairing attempt on a connected client.
+
+        A pair abort raises and leaves the connection open (retry with another
+        ``initiate_pairing`` or drop out with ``end_pairing``); other failures disconnect.
+        """
+        connection = self._connection_for(client_id)
+        try:
+            await connection.initiate_pairing(attempt)
+        except PairingAbortError:
+            raise
+        except BaseException:
+            await connection.disconnect(retry_connection=False)
+            raise
+
+    async def end_pairing(self, client_id: str) -> None:
+        """End pairing on a connected client without finalizing.
+
+        No-op if not in pairing. Aborts any in-progress attempt with ``user_cancelled``, keeping
+        the connection alive.
+        If an attempt has already been finalized by the client, it completes as a success instead.
+        """
+        await self._connection_for(client_id).end_pairing()
+
+    def enable_management(self, client_id: str) -> SendspinConnection:
+        """Enable a management session on a connected client and return its connection."""
+        connection = self._connection_for(client_id)
+        connection.enable_management()
+        return connection
+
+    def disable_management(self, client_id: str) -> None:
+        """End a client's management session, leaving any playback on the connection intact."""
+        self._connection_for(client_id).disable_management()
+
+    async def unpair(self, client_id: str) -> None:
+        """Drop the pairing with a connected client: remove our record and tell it to drop its own.
+
+        Raises ``ValueError`` if the client is not currently connected.
+        """
+        connection = self._connection_for(client_id)
+        await self.pairing_store.remove_record(client_id)
+        connection.unpair()
+
+    async def trust_unpaired(self, client_id: str) -> None:
+        """Approve ``client_id`` for unpaired playback, re-activating it if connected."""
+        await self.pairing_store.add_trusted_unpaired(TrustedUnpairedClient(client_id=client_id))
+        await self._refresh_trusted_unpaired(client_id)
+
+    async def untrust_unpaired(self, client_id: str) -> None:
+        """Revoke ``client_id``'s unpaired-playback approval, re-activating it if connected."""
+        await self.pairing_store.remove_trusted_unpaired(client_id)
+        await self._refresh_trusted_unpaired(client_id)
+
+    async def _refresh_trusted_unpaired(self, client_id: str) -> None:
+        """Re-activate a connected client's roles after a trust change (no-op if offline)."""
+        client = self.get_client(client_id)
+        connection = client.connection if client is not None else None
+        if connection is not None:
+            await connection.refresh_trusted_unpaired()
+
+    def _connection_for(self, client_id: str) -> SendspinConnection:
+        """Return the connected client's connection, or raise if it is not connected."""
+        client = self.get_client(client_id)
+        connection = client.connection if client is not None else None
+        if connection is None:
+            raise ValueError(f"client {client_id} is not connected")
+        return connection
 
     def _set_connection_options(
         self,
@@ -481,6 +596,11 @@ class SendspinServer:
     def get_client_url(self, client_id: str) -> str | None:
         """Get the URL for a client (for reconnection)."""
         return self._client_urls.get(client_id)
+
+    def get_client_id_for_url(self, url: str) -> str | None:
+        """Return the unique ``client_id`` known at ``url``, or ``None`` if unknown/ambiguous."""
+        matches = [cid for cid, known_url in self._client_urls.items() if known_url == url]
+        return matches[0] if len(matches) == 1 else None
 
     def reclaim_client_for_playback(self, client_id: str, timeout_s: float = 30.0) -> bool:
         """Attempt to reconnect to a client for playback.
@@ -545,6 +665,18 @@ class SendspinServer:
         if handle is not None:
             handle.cancel()
 
+    def _cancel_all_timers(self) -> None:
+        """Disarm all pending registry timers."""
+        for handle in (
+            *self._external_registration_timeouts.values(),
+            *self._reclaim_timeouts.values(),
+        ):
+            handle.cancel()
+        self._external_registration_timeouts.clear()
+        self._reclaim_timeouts.clear()
+        for client in self._clients.values():
+            client._cancel_cleanup()  # noqa: SLF001
+
     def _schedule_external_registration_timeout(self, client_id: str, timeout_s: float) -> None:
         """Schedule full unregister if an externally registered client never connects."""
         self._cancel_external_registration_timeout(client_id)
@@ -576,8 +708,28 @@ class SendspinServer:
         client = self._clients.get(client_id)
         if client is not None and client.connection is not None:
             return
+        # A reconnect mid-handshake: defer removal until the task settles so a
+        # failed reconnect is still unregistered instead of lingering forever.
+        url = self._client_urls.get(client_id)
+        if url is not None and url in self._connection_tasks:
+            self._deferred_unregister.add(client_id)
+            return
+        self._deferred_unregister.discard(client_id)
         self.unregister_external_player(client_id)
         await self.remove_client(client_id)
+
+    async def _complete_deferred_unregister(
+        self, url: str, *, connection_succeeded: bool, cancelled: bool
+    ) -> None:
+        """Finish an unregister deferred while this URL's reconnect task was in flight."""
+        client_id = self.get_client_id_for_url(url)
+        if client_id is None or client_id not in self._deferred_unregister:
+            return
+        self._deferred_unregister.discard(client_id)
+        # A reconnect that attached (or a shutdown cancellation) is handled elsewhere.
+        if connection_succeeded or cancelled:
+            return
+        await self._full_unregister_disconnected_client(client_id)
 
     def _resolve_initial_connect_waiters(self, url: str, err: BaseException | None = None) -> None:
         """Resolve or fail waiters for an initial connection attempt."""
@@ -590,7 +742,9 @@ class SendspinServer:
             else:
                 waiter.set_exception(err)
 
-    async def _handle_client_connection(self, url: str) -> None:  # noqa: PLR0912, PLR0915
+    async def _handle_client_connection(  # noqa: PLR0912, PLR0915
+        self, url: str, *, pairing_attempt: PairingAttempt | None = None
+    ) -> None:
         """Handle a server-initiated WebSocket connection task."""
         backoff = 1.0
         first_connection_succeeded = False
@@ -609,19 +763,29 @@ class SendspinServer:
                             self._initial_connect_succeeded.add(url)
                             self._resolve_initial_connect_waiters(url)
                         connection_started_s = time.monotonic()
-                        conn = SendspinConnection(self, wsock_client=wsock, url=url)
-                        await conn._handle_client()  # noqa: SLF001
+                        if pairing_attempt is None:
+                            pairing_attempt = self._pending_pairing_attempts.pop(url, None)
+                        conn = SendspinConnection(
+                            self,
+                            wsock_client=wsock,
+                            url=url,
+                            expected_client_id=self.get_client_id_for_url(url),
+                            pairing_attempt=pairing_attempt,
+                        )
+                        pairing_attempt = None
+                        await conn.handle_client()
                         session_duration_s = time.monotonic() - connection_started_s
 
                     if session_duration_s >= STABLE_SERVER_INITIATED_SESSION_S:
                         backoff = 1.0
 
                     if not conn.should_retry_server_initiated_connection:
-                        if conn.goodbye_reason == GoodbyeReason.ANOTHER_SERVER:
-                            logger.debug(
-                                "Not reconnecting to %s after goodbye reason another_server",
-                                url,
-                            )
+                        reason = conn.goodbye_reason
+                        logger.debug(
+                            "Not reconnecting to %s (goodbye reason: %s)",
+                            url,
+                            reason.value if reason is not None else "none",
+                        )
                         break
 
                     if self._client_session.closed:
@@ -685,9 +849,16 @@ class SendspinServer:
         finally:
             self._connection_tasks.pop(url, None)
             self._retry_events.pop(url, None)
+            self._pending_pairing_attempts.pop(url, None)
             self._initial_connect_succeeded.discard(url)
             self._connection_options.pop(url, None)
             self._connection_reasons.pop(url, None)
+            current = asyncio.current_task()
+            await self._complete_deferred_unregister(
+                url,
+                connection_succeeded=first_connection_succeeded,
+                cancelled=current is not None and current.cancelling() > 0,
+            )
 
     async def start_server(
         self,
@@ -776,7 +947,8 @@ class SendspinServer:
         # Close pending incoming connections so their handlers can exit promptly.
         for conn in list(self._pending_connections):
             wsock = conn.websocket_connection
-            if wsock.closed:
+            # An incoming socket not past wsock.prepare() has nothing to close.
+            if wsock.closed or (isinstance(wsock, web.WebSocketResponse) and not wsock.prepared):
                 continue
             logger.debug("Closing pending client connection")
             try:
@@ -794,6 +966,9 @@ class SendspinServer:
             )
         if disconnect_tasks:
             await asyncio.gather(*disconnect_tasks, return_exceptions=True)
+
+        # Disarm timers after disconnect, which re-arms per-client cleanup.
+        self._cancel_all_timers()
 
         await self.stop_server()
         if self._owns_session and not self._client_session.closed:

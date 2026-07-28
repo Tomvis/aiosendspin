@@ -20,7 +20,9 @@ from aiosendspin.models.visualizer import (
     ClientHelloVisualizerSupport,
     StreamRequestFormatVisualizer,
 )
+from aiosendspin.noise.keys import Identity
 from aiosendspin.server.roles.base import AudioChunk
+from aiosendspin.server.roles.visualizer.packing import FLAG_DOWNBEAT
 from aiosendspin.server.roles.visualizer.v1 import VisualizerV1Role
 from aiosendspin.server.server import SendspinServer
 from tests.server.roles.visualizer.conftest import sine_pcm_16bit
@@ -206,6 +208,33 @@ def test_on_stream_start_not_resent_during_active_stream() -> None:
     role.on_stream_start()
 
     assert _stream_start_count(client) == 1
+
+
+def test_on_deactivate_ends_active_stream() -> None:
+    """on_deactivate emits stream/end while a visualizer stream is active."""
+    client = _make_client_stub()
+    role = VisualizerV1Role(client=client)
+    role.on_connect()
+    role.on_stream_start()
+    role.on_deactivate()
+
+    assert any(
+        isinstance(call.args[1], StreamEndMessage)
+        for call in client.send_role_message.call_args_list
+    )
+
+
+def test_on_deactivate_without_stream_sends_nothing() -> None:
+    """on_deactivate is a no-op when no visualizer stream was started."""
+    client = _make_client_stub()
+    role = VisualizerV1Role(client=client)
+    role.on_connect()
+    role.on_deactivate()
+
+    assert not any(
+        isinstance(call.args[1], StreamEndMessage)
+        for call in client.send_role_message.call_args_list
+    )
 
 
 def test_on_stream_clear_sends_clear_message() -> None:
@@ -409,6 +438,36 @@ def test_beats_drain_on_next_audio_chunk() -> None:
     assert beat_ts == [500_000, 1_500_000]
 
 
+def test_downbeat_flag_masked_when_not_tracking_downbeats() -> None:
+    """The downbeat bit must be 0 when the role does not track downbeats."""
+    client = _make_beat_client_stub()
+    role = VisualizerV1Role(client=client)
+    role.set_tracks_downbeats(tracks=False)
+    role.on_connect()
+    role.on_stream_start()
+    role.append_beats([BeatTiming(500_000, is_downbeat=True)])
+    role.on_audio_chunk(_audio_chunk(1_000_000))
+
+    calls = _beat_calls(client)
+    assert len(calls) == 1
+    assert calls[0].args[0][-1] & FLAG_DOWNBEAT == 0
+
+
+def test_downbeat_flag_set_when_tracking_downbeats() -> None:
+    """A downbeat sets the bit when the role tracks downbeats."""
+    client = _make_beat_client_stub()
+    role = VisualizerV1Role(client=client)
+    role.set_tracks_downbeats(tracks=True)
+    role.on_connect()
+    role.on_stream_start()
+    role.append_beats([BeatTiming(500_000, is_downbeat=True)])
+    role.on_audio_chunk(_audio_chunk(1_000_000))
+
+    calls = _beat_calls(client)
+    assert len(calls) == 1
+    assert calls[0].args[0][-1] & FLAG_DOWNBEAT == FLAG_DOWNBEAT
+
+
 def test_beats_interleave_with_periodic_frames_in_ts_order() -> None:
     """All wire timestamps stay non-decreasing across periodic + beat frames."""
     client = _make_beat_client_stub()
@@ -429,6 +488,7 @@ def test_beat_binary_layout() -> None:
     """`beat` binary: [17][ts:8][flags:1] = 10 bytes."""
     client = _make_beat_client_stub()
     role = VisualizerV1Role(client=client)
+    role.set_tracks_downbeats(tracks=True)  # so the downbeat bit is exposed
     role.on_connect()
     role.on_stream_start()
     role.append_beats(
@@ -655,6 +715,42 @@ def test_request_format_replaces_rate_max() -> None:
 
     assert role._stream_config is not None  # noqa: SLF001
     assert role._stream_config.rate_max == 15  # noqa: SLF001
+
+
+def test_request_format_with_no_active_stream_does_not_start_stream() -> None:
+    """The server MUST NOT start a stream in response to request-format when none is active."""
+    client = _make_client_stub()
+    role = VisualizerV1Role(client=client)
+    role.on_connect()  # no on_stream_start yet -> no active stream
+    client.send_role_message.reset_mock()
+
+    role.on_stream_request_format(
+        StreamRequestFormatPayload(visualizer=StreamRequestFormatVisualizer(rate_max=15))
+    )
+
+    starts = [
+        c
+        for c in client.send_role_message.call_args_list
+        if isinstance(c.args[1], StreamStartMessage)
+    ]
+    assert starts == []
+    assert role._stream_started is False  # noqa: SLF001
+
+
+def test_request_format_with_no_active_stream_is_remembered_for_next_stream() -> None:
+    """With no active stream, the request is remembered and applied to the next stream/start."""
+    client = _make_client_stub()
+    role = VisualizerV1Role(client=client)
+    role.on_connect()  # no on_stream_start yet -> no active stream
+
+    role.on_stream_request_format(
+        StreamRequestFormatPayload(visualizer=StreamRequestFormatVisualizer(rate_max=15))
+    )
+    role.on_stream_start()
+
+    cfg = _last_stream_start(client).payload.visualizer
+    assert cfg is not None
+    assert cfg.rate_max == 15
 
 
 def test_request_format_replaces_types() -> None:
@@ -1040,9 +1136,27 @@ def test_refresh_pitch_setting_noop_when_unchanged() -> None:
     assert _stream_start_count(client) == before
 
 
+async def test_visualizer_pitch_disabled_by_default() -> None:
+    """Pitch is off by default; emitting reserved type 21 is opt-in and non-spec."""
+    server = SendspinServer(
+        asyncio.get_running_loop(),
+        Identity.generate(),
+        "Srv",
+        MagicMock(),
+        pairing_store=MagicMock(),
+    )
+    assert server.visualizer_pitch_enabled is False
+
+
 async def test_server_set_pitch_enabled_fans_out_to_roles() -> None:
     """SendspinServer.set_visualizer_pitch_enabled refreshes every active role once."""
-    server = SendspinServer(asyncio.get_running_loop(), "srv", "Srv", MagicMock())
+    server = SendspinServer(
+        asyncio.get_running_loop(),
+        Identity.generate(),
+        "Srv",
+        MagicMock(),
+        pairing_store=MagicMock(),
+    )
     role = MagicMock()
     role.refresh_pitch_setting = MagicMock()
     other = MagicMock(spec=[])  # no refresh_pitch_setting attr → skipped
@@ -1050,13 +1164,12 @@ async def test_server_set_pitch_enabled_fans_out_to_roles() -> None:
     client.active_roles = [role, other]
     server._clients["c1"] = client  # noqa: SLF001
 
+    server.set_visualizer_pitch_enabled(enabled=True)
     assert server.visualizer_pitch_enabled is True
-    server.set_visualizer_pitch_enabled(enabled=False)
-    assert server.visualizer_pitch_enabled is False
     role.refresh_pitch_setting.assert_called_once()
 
     role.refresh_pitch_setting.reset_mock()
-    server.set_visualizer_pitch_enabled(enabled=False)  # idempotent
+    server.set_visualizer_pitch_enabled(enabled=True)  # idempotent
     role.refresh_pitch_setting.assert_not_called()
 
 

@@ -70,6 +70,26 @@ class ControllerRepeatEvent(ControllerEvent):
 
 
 @dataclass
+class ControllerSeekEvent(ControllerEvent):
+    """Absolute seek command received."""
+
+    position_ms: int
+    """Target absolute position in milliseconds."""
+
+
+@dataclass
+class ControllerSeekRelativeEvent(ControllerEvent):
+    """Relative seek command received.
+
+    The handler owns clamping the resulting position to the seekable range (the spec
+    requires it).
+    """
+
+    offset_ms: int
+    """Signed offset in milliseconds from the current position."""
+
+
+@dataclass
 class ControllerShuffleEvent(ControllerEvent):
     """Shuffle state change command received."""
 

@@ -30,6 +30,10 @@ class ControllerCommandPayload(DataClassORJSONMixin):
     """Volume range 0-100, only set if command is volume."""
     mute: bool | None = None
     """True to mute, false to unmute, only set if command is mute."""
+    position_ms: int | None = None
+    """Absolute playback position in ms, only set if command is seek."""
+    offset_ms: int | None = None
+    """Signed offset in ms from current position, only set if command is seek_relative."""
 
     def __post_init__(self) -> None:
         """Validate field values and command consistency."""
@@ -47,6 +51,28 @@ class ControllerCommandPayload(DataClassORJSONMixin):
         elif self.mute is not None:
             raise ValueError(f"Mute should not be provided for command '{self.command.value}'")
 
+        if self.command == MediaCommand.SEEK:
+            if self.position_ms is None:
+                raise ValueError("position_ms must be provided when command is 'seek'")
+            if self.position_ms < 0:
+                raise ValueError(f"position_ms must be non-negative, got {self.position_ms}")
+            if self.offset_ms is not None:
+                raise ValueError("offset_ms should not be provided for command 'seek'")
+        elif self.command == MediaCommand.SEEK_RELATIVE:
+            if self.offset_ms is None:
+                raise ValueError("offset_ms must be provided when command is 'seek_relative'")
+            if self.position_ms is not None:
+                raise ValueError("position_ms should not be provided for command 'seek_relative'")
+        else:
+            if self.position_ms is not None:
+                raise ValueError(
+                    f"position_ms should not be provided for command '{self.command.value}'"
+                )
+            if self.offset_ms is not None:
+                raise ValueError(
+                    f"offset_ms should not be provided for command '{self.command.value}'"
+                )
+
     class Config(BaseConfig):
         """Config for parsing json messages."""
 
@@ -61,7 +87,7 @@ class ControllerStatePayload(DataClassORJSONMixin):
     supported_commands: list[MediaCommand]
     """
     Subset of: play, pause, stop, next, previous, volume, mute, repeat_off, repeat_one,
-    repeat_all, shuffle, unshuffle, switch.
+    repeat_all, shuffle, unshuffle, switch, seek, seek_relative.
     """
     volume: int
     """Volume of the whole group, range 0-100."""
@@ -71,6 +97,8 @@ class ControllerStatePayload(DataClassORJSONMixin):
     """Repeat mode: 'off' = no repeat, 'one' = repeat current track, 'all' = repeat all."""
     shuffle: bool
     """Whether shuffle is enabled."""
+    seek_max_ms: int | None = None
+    """Max absolute position (ms) a 'seek' may target. Set only when 'seek' is supported."""
 
     def __post_init__(self) -> None:
         """Validate field values."""
@@ -85,3 +113,8 @@ class ControllerStatePayload(DataClassORJSONMixin):
         data.setdefault("repeat", RepeatMode.OFF.value)
         data.setdefault("shuffle", False)
         return data
+
+    class Config(BaseConfig):
+        """Config for serializing state messages."""
+
+        omit_none = True

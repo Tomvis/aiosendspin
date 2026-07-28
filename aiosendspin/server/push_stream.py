@@ -12,6 +12,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 from errno import EAGAIN
 from functools import lru_cache
+from itertools import islice
 from typing import TYPE_CHECKING, Literal, NamedTuple, Protocol, cast
 from uuid import UUID
 
@@ -201,7 +202,7 @@ def _encode_for_transform_key(
     output_ts: int,
     duration_us: int,
 ) -> list[tuple[bytes, int, int]]:
-    """Encode PCM for a single TransformKey. Thread-safe (no shared state)."""
+    """Encode PCM for a single TransformKey."""
     if transformer is None:
         return [(pcm_data, output_ts, duration_us)]
 
@@ -500,8 +501,7 @@ def _resample_pcm_standalone(  # noqa: PLR0915
     output_sample_count = 0
     for out_frame in out_frames:
         expected = resampler_state.target_av_frame_stride * out_frame.samples
-        pcm_bytes = bytes(out_frame.planes[0])[:expected]
-        out_pcm.extend(pcm_bytes)
+        out_pcm.extend(memoryview(out_frame.planes[0])[:expected])
         output_sample_count += out_frame.samples
 
     output_start_ts = resampler_state.pending_timestamp_us
@@ -553,8 +553,7 @@ def _flush_resampler(resampler_state: _ResamplerState) -> _ResampledPCM:
     output_sample_count = 0
     for out_frame in out_frames:
         expected = resampler_state.target_av_frame_stride * out_frame.samples
-        pcm_bytes = bytes(out_frame.planes[0])[:expected]
-        out_pcm.extend(pcm_bytes)
+        out_pcm.extend(memoryview(out_frame.planes[0])[:expected])
         output_sample_count += out_frame.samples
 
     if output_sample_count > 0:
@@ -727,7 +726,7 @@ class PushStream:
         # Inline resamplers for role-based audio delivery
         self._resamplers: dict[_ResamplerKey, _ResamplerState] = {}
         # Role-based chunk cache: TransformKey -> list of cached chunks
-        self._role_chunk_cache: defaultdict[TransformKey, list[CachedChunk]] = defaultdict(list)
+        self._role_chunk_cache: defaultdict[TransformKey, deque[CachedChunk]] = defaultdict(deque)
         # PCM chunk cache: channel_id.int -> deque of cached PCM chunks
         self._pcm_chunk_cache: dict[int, deque[CachedPCMChunk]] = {}
         # Channels with PCM caching enabled
@@ -823,19 +822,16 @@ class PushStream:
     def _role_send_ahead_us(self, role: Role) -> int:
         """Per-role send-ahead floor.
 
-        Live: max(required_lead, min_buffer) + static. The first chunk lands at
-        least required_lead ahead and the timeline never sits below min_buffer
-        ahead, since a realtime queue cannot grow after playback begins.
-
-        Buffered: required_lead + static. The queue grows naturally past
-        min_buffer once playback starts, so paying min_buffer upfront would only
-        add startup latency without buying jitter resilience.
+        Both cases floor at min_buffer + static. Buffered streams extend the lead
+        toward required_lead (it adds no latency once the queue grows past
+        min_buffer); live streams do not, since a realtime queue cannot grow after
+        playback begins and extra lead would only add latency.
         """
-        lead_us = role.get_required_lead_time_us()
+        min_buffer_us = role.get_min_buffer_us()
         static_us = role.get_static_delay_us()
         if self._is_live:
-            return max(lead_us, role.get_min_buffer_us()) + static_us
-        return lead_us + static_us
+            return min_buffer_us + static_us
+        return max(min_buffer_us, role.get_required_lead_time_us()) + static_us
 
     def _min_send_ahead_us(self) -> int:
         """Return the common send-ahead floor across active audio roles."""
@@ -1141,8 +1137,7 @@ class PushStream:
             if cached_any_pcm:
                 self._signal_pcm_cache_update()
                 if self._catchup_tasks:
-                    # Yield so any active catch-up task gets a chance to consume the new
-                    # PCM and finish before live encoding for its TransformKey resumes.
+                    # Yield so an active catch-up task can consume the new PCM before delivery.
                     await asyncio.sleep(0)
 
             # Role-based audio delivery via hooks
@@ -1591,7 +1586,7 @@ class PushStream:
         self._transform_last_input_end_us[tkey] = output_ts + duration_us
         return encoded
 
-    async def _transform_and_deliver(
+    async def _transform_and_deliver(  # noqa: PLR0915
         self,
         roles_by_pcm: dict[
             tuple[UUID, int, int, int], list[tuple[SendspinClient, Role, AudioRequirements]]
@@ -1602,7 +1597,7 @@ class PushStream:
     ) -> dict[TransformKey, list[CachedChunk]]:
         """Transform PCM, deliver live chunks to roles, and return cache results.
 
-        Encoding is parallelized across unique TransformKeys via a thread pool.
+        Encoding runs sequentially on the event loop, yielding every few keys.
         """
         # Collect unique encoding tasks: tkey -> (transformer, pcm_data, output_ts, duration_us)
         encode_tasks: dict[TransformKey, tuple[AudioTransformer | None, bytes, int, int]] = {}
@@ -1645,6 +1640,10 @@ class PushStream:
             for tkey, grouped in grouped_by_key.items():
                 roles_by_transform[tkey].extend(role for _client, role, _req in grouped)
                 if self._catchup_state.get(tkey) == "catching_up":
+                    continue
+                # Skip a chunk catch-up already replayed to avoid a duplicate at the seam.
+                key_cache = self._role_chunk_cache.get(tkey)
+                if key_cache and key_cache[-1].timestamp_us + key_cache[-1].duration_us > output_ts:
                     continue
                 if tkey in encode_tasks:
                     continue
@@ -1696,21 +1695,24 @@ class PushStream:
 
             # Deliver live chunks directly; connection layer enforces late-drop/backpressure.
             roles = roles_by_transform.get(tkey, [])
+            # Share one AudioChunk across roles so its packed frame is built once.
+            audio_chunks = [
+                AudioChunk(
+                    data=cached_chunk.payload,
+                    timestamp_us=cached_chunk.timestamp_us,
+                    duration_us=cached_chunk.duration_us,
+                    byte_count=cached_chunk.byte_count,
+                )
+                for cached_chunk in cached_for_key
+            ]
             for role in roles:
                 if role not in active_roles:
                     continue
                 self._ensure_role_started(role)
                 if role not in self._started_roles:
                     continue
-                for cached_chunk in cached_for_key:
-                    role.on_audio_chunk(
-                        AudioChunk(
-                            data=cached_chunk.payload,
-                            timestamp_us=cached_chunk.timestamp_us,
-                            duration_us=cached_chunk.duration_us,
-                            byte_count=cached_chunk.byte_count,
-                        )
-                    )
+                for audio_chunk in audio_chunks:
+                    role.on_audio_chunk(audio_chunk)
 
         return cache_results
 
@@ -1753,16 +1755,9 @@ class PushStream:
 
         for key in list(self._role_chunk_cache.keys()):
             chunks = self._role_chunk_cache[key]
-            prune_count = 0
-            for chunk in chunks:
-                if chunk.timestamp_us + chunk.duration_us > now_us:
-                    break
-                prune_count += 1
-
-            if prune_count:
-                self._role_chunk_cache[key] = chunks[prune_count:]
-
-            if not self._role_chunk_cache[key]:
+            while chunks and chunks[0].timestamp_us + chunks[0].duration_us <= now_us:
+                chunks.popleft()
+            if not chunks:
                 del self._role_chunk_cache[key]
 
         for channel_int in list(self._pcm_chunk_cache.keys()):
@@ -1939,7 +1934,7 @@ class PushStream:
 
         # Get cached chunks for this transformer from the role-based cache
         cache_key = self._build_transform_key(req, channel_id, role)
-        cached = self._role_chunk_cache.get(cache_key, [])
+        cached: deque[CachedChunk] = self._role_chunk_cache.get(cache_key, deque())
 
         if not cached:
             if cache_key in self._catchup_state:
@@ -2021,7 +2016,7 @@ class PushStream:
                 last_ts,
             )
 
-        self._send_cached_chunks_to_role(role, cached[start_index:], now_us)
+        self._send_cached_chunks_to_role(role, list(islice(cached, start_index, None)), now_us)
 
     def _other_roles_use_transform_key(self, cache_key: TransformKey, exclude_role: Role) -> bool:
         """Check if any other active pipeline role uses the same TransformKey."""
@@ -2458,6 +2453,31 @@ class PushStream:
                     self._role_chunk_cache[cache_key].extend(new_encoded)
                     last_encoded_end_us = new_encoded[-1].timestamp_us + new_encoded[-1].duration_us
 
+            # Drain PCM committed after the snapshot (a commit racing the hand-off) so it
+            # is replayed here, not dropped. The final empty check flows into the
+            # synchronous send/flip below with no await between, so a racing commit cannot
+            # slip a chunk past both this replay and the suppressed live delivery.
+            while True:
+                pending = [
+                    chunk
+                    for chunk in self._pcm_chunk_cache.get(channel_int, [])
+                    if chunk.timestamp_us >= last_source_end_us
+                ]
+                if not pending:
+                    break
+                last_source_end_us = pending[-1].timestamp_us + pending[-1].duration_us
+                drained = await self._encode_catchup_sequence(
+                    pending,
+                    encoder,
+                    req,
+                    channel_id,
+                    resamplers=catchup_resamplers,
+                    quantizers=catchup_quantizers,
+                )
+                if drained and self._catchup_state.get(cache_key) == "catching_up":
+                    self._role_chunk_cache[cache_key].extend(drained)
+                    last_encoded_end_us = drained[-1].timestamp_us + drained[-1].duration_us
+
             # Promote FIR-warmed catch-up state, skipping shared live keys.
             for rkey, rstate in catchup_resamplers.items():
                 if rkey not in established_resampler_keys:
@@ -2467,9 +2487,10 @@ class PushStream:
                     self._resamplers[qkey] = qstate
 
             now_us = self._clock.now_us()
-            encoded_cache = self._role_chunk_cache.get(cache_key, [])
+            encoded_cache: deque[CachedChunk] = self._role_chunk_cache.get(cache_key, deque())
+            chunks_to_send = list(encoded_cache)
             for r in self._catchup_roles.get(cache_key, {role}):
-                self._send_cached_chunks_to_role(r, encoded_cache, now_us)
+                self._send_cached_chunks_to_role(r, chunks_to_send, now_us)
 
             self._catchup_state[cache_key] = "live"
         finally:

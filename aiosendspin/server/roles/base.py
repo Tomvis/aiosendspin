@@ -12,8 +12,11 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass
+from functools import cached_property
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
+
+from aiosendspin.models import BinaryMessageType, pack_binary_header_raw
 
 if TYPE_CHECKING:
     from collections.abc import Coroutine
@@ -24,11 +27,11 @@ if TYPE_CHECKING:
         ClientStatePayload,
         StreamRequestFormatPayload,
     )
-    from aiosendspin.models.types import ClientStateType, ServerMessage
+    from aiosendspin.models.types import ServerMessage
     from aiosendspin.server.audio import AudioFormat, BufferTracker
     from aiosendspin.server.audio_transformers import AudioTransformer
     from aiosendspin.server.client import SendspinClient
-    from aiosendspin.server.events import GroupRoleEvent
+    from aiosendspin.server.events import ClientRoleEvent, GroupRoleEvent
     from aiosendspin.server.group import SendspinGroup
 
 
@@ -79,6 +82,12 @@ class AudioChunk:
 
     byte_count: int
     """Size of data (for buffer tracking)."""
+
+    @cached_property
+    def packed(self) -> bytes:
+        """Binary AUDIO_CHUNK frame, memoized so subscribers reuse one copy."""
+        header = pack_binary_header_raw(BinaryMessageType.AUDIO_CHUNK.value, self.timestamp_us)
+        return header + self.data
 
 
 class GroupRole(ABC):
@@ -345,6 +354,10 @@ class Role(ABC):
             return
         self._client.send_role_message(self.role_family, message)
 
+    def emit_client_event(self, event: ClientRoleEvent) -> None:
+        """Emit a role event on the owning client's event stream."""
+        self._client._signal_event(event)  # noqa: SLF001
+
     # --- Stream lifecycle hooks (optional) ---
 
     def on_stream_start(self) -> None:  # noqa: B027
@@ -377,6 +390,10 @@ class Role(ABC):
         from the corresponding GroupRole.
         """
 
+    def on_deactivate(self) -> None:
+        """Handle the role leaving active_roles while the client stays connected."""
+        self._unsubscribe_from_group_role()
+
     def _subscribe_to_group_role(self) -> None:
         """Subscribe to the corresponding GroupRole (call from on_connect)."""
         if group_role := self._client.group.group_role(self.role_family):
@@ -384,7 +401,7 @@ class Role(ABC):
             self._group_role = group_role
 
     def _unsubscribe_from_group_role(self) -> None:
-        """Unsubscribe from the GroupRole (call from on_disconnect)."""
+        """Unsubscribe from the GroupRole (call from on_disconnect / on_deactivate)."""
         if self._group_role:
             self._group_role.unsubscribe(self)
             self._group_role = None
@@ -400,17 +417,20 @@ class Role(ABC):
     def on_group_changed(self, group: object) -> None:  # noqa: ARG002
         """Handle group changes by re-subscribing to the new GroupRole."""
         self._unsubscribe_from_group_role()
-        self._subscribe_to_group_role()
+        # Subscribing fires on_member_join (a state push); defer to on_connect when
+        # there is no transport so the push lands on the live connection, not nowhere.
+        if self.has_connection():
+            self._subscribe_to_group_role()
 
-    def on_state_transition(
+    def on_availability_changed(
         self,
-        old_state: ClientStateType,  # noqa: ARG002
-        new_state: ClientStateType,  # noqa: ARG002
+        old_available: bool,  # noqa: ARG002, FBT001
+        new_available: bool,  # noqa: ARG002, FBT001
     ) -> Coroutine[Any, Any, None] | None:
-        """Handle client state transitions.
+        """Handle a client availability change.
 
         Return a coroutine if async work is needed, else None.
-        Called when client/state reports a new operational state.
+        Called when client/state reports a new availability.
         """
         return None
 

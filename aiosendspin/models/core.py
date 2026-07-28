@@ -32,14 +32,17 @@ from .player import (
     StreamStartPlayer,
 )
 from .types import (
+    Activity,
     ClientMessage,
-    ClientStateType,
     ConnectionReason,
     GoodbyeReason,
+    PairMethod,
     PlaybackStateType,
     Roles,
     ServerMessage,
+    TrustLevel,
     UndefinedField,
+    undefined_field,
 )
 from .visualizer import (
     ClientHelloVisualizerSupport,
@@ -97,6 +100,8 @@ class DeviceInfo(DataClassORJSONMixin):
     """Device manufacturer name."""
     software_version: str | None = None
     """Software version of the client (not the Sendspin version)."""
+    mac_address: str | None = None
+    """MAC address of the connection's network interface, lowercase colon-separated."""
 
     class Config(BaseConfig):
         """Config for parsing json messages."""
@@ -104,21 +109,50 @@ class DeviceInfo(DataClassORJSONMixin):
         omit_none = True
 
 
+@dataclass
+class PairMethodDescriptor(DataClassORJSONMixin):
+    """A pairing method a client offers in client/hello."""
+
+    method: PairMethod
+    """The pairing method identifier."""
+    out_channels: list[str] | None = None
+    """For dynamic_pin only: channels through which the PIN is conveyed to the operator."""
+    locked_out: bool | None = None
+    """For PIN methods only: True when the method is in terminal lockout."""
+    min_pin_length: int | None = None
+    """For dynamic_pin only: shortest PIN length in digits the client will accept (4-12)."""
+
+    class Config(BaseConfig):
+        """Omit method-specific fields where they do not apply."""
+
+        omit_none = True
+
+
+@dataclass
+class UnpairedAccess(DataClassORJSONMixin):
+    """Whether the client currently admits unpaired access."""
+
+    enabled: bool = False
+
+
 # Client -> Server: client/hello
 @dataclass
 class ClientHelloPayload(DataClassORJSONMixin):
     """Information about a connected client."""
 
-    client_id: str
-    """Uniquely identifies the client for groups and de-duplication."""
     name: str
     """Friendly name of the client."""
-    version: int
-    """Version that the Sendspin client implements."""
     supported_roles: list[str]
     """List of versioned role IDs the client supports (e.g., 'player@v1')."""
+    trust_level: TrustLevel = TrustLevel.NONE
+    """Trust the client extends to this server ('none' during pairing/unpaired playback)."""
     device_info: DeviceInfo | None = None
     """Optional information about the device."""
+    client_id: str | None = None
+    """Client identifier. Omitted under encryption (taken from client/init); sent by
+    legacy unencrypted clients."""
+    version: int | None = None
+    """Core protocol version. Omitted under encryption (taken from client/init)."""
     player_support: Annotated[ClientHelloPlayerSupport | None, Alias("player@v1_support")] = None
     """Player support configuration - only if player role is in supported_roles."""
     artwork_support: Annotated[ClientHelloArtworkSupport | None, Alias("artwork@v1_support")] = None
@@ -131,6 +165,10 @@ class ClientHelloPayload(DataClassORJSONMixin):
         ClientHelloVisualizerSupportDraftR1 | None, Alias("visualizer@_draft_r1_support")
     ] = None
     """Visualizer support for clients on the legacy `visualizer@_draft_r1` wire."""
+    supported_pair_methods: list[PairMethodDescriptor] | None = None
+    """Pairing methods this client offers."""
+    unpaired_access: UnpairedAccess = field(default_factory=UnpairedAccess)
+    """Whether this client currently admits unpaired access."""
 
     # Static mapping: unversioned support key -> actual alias key.
     _SUPPORT_KEY_ALIASES: ClassVar[dict[str, str]] = {
@@ -242,17 +280,23 @@ class ClientTimeMessage(ClientMessage):
 class ClientStatePayload(DataClassORJSONMixin):
     """Client sends state updates to the server."""
 
-    state: ClientStateType | None = None
+    available: bool | None = None
     """
-    Client operational state.
+    Whether the client is available to participate in Sendspin playback.
 
-    - 'synchronized': Client is operational and synchronized with server timestamps.
-    - 'error': Client has a problem preventing normal operation.
-    - 'external_source': Client is in use by an external system and cannot participate
-      in Sendspin playback.
+    - true: operational and ready; for a player, its clock is synchronized.
+    - false: output is in use by an external system, not currently participating.
     """
     player: PlayerStatePayload | None = None
     """Player state - only if client has player role."""
+
+    @classmethod
+    def __pre_deserialize__(cls, d: dict[str, Any]) -> dict[str, Any]:
+        """Normalize a legacy `state` enum to `available` (only external_source is unavailable)."""
+        if d.get("available") is None and "state" in d:
+            d = dict(d)
+            d["available"] = d["state"] != "external_source"
+        return d
 
     class Config(BaseConfig):
         """Config for parsing json messages."""
@@ -312,16 +356,8 @@ class ClientGoodbyeMessage(ClientMessage):
 class ServerHelloPayload(DataClassORJSONMixin):
     """Information about the server."""
 
-    server_id: str
-    """Identifier of the server."""
     name: str
     """Friendly name of the server"""
-    version: int
-    """Version of the core message format (independent of role versions)."""
-    active_roles: list[str]
-    """Versioned role IDs active for this client (e.g., 'player@v1', 'controller@v1')."""
-    connection_reason: ConnectionReason
-    """Reason for this connection (relevant for multi-server environments)."""
 
 
 @dataclass
@@ -330,6 +366,71 @@ class ServerHelloMessage(ServerMessage):
 
     payload: ServerHelloPayload
     type: Literal["server/hello"] = "server/hello"
+
+
+# Legacy (transition-mode) server/hello, for unencrypted clients that predate
+# server/activate. Standalone (NOT a ServerMessage subtype): it serializes to the
+# same ``type: "server/hello"`` as the encrypted-path message above, so keeping it
+# out of the discriminated union avoids an ambiguous dispatch. The server only ever
+# serializes and sends it; our own client always speaks the encrypted path and so
+# never deserializes it.
+@dataclass
+class LegacyServerHelloPayload(DataClassORJSONMixin):
+    """Server identity for a legacy unencrypted connection (no server/activate)."""
+
+    server_id: str
+    """Identifier of the server."""
+    name: str
+    """Friendly name of the server."""
+    version: int
+    """Version of the core message format (independent of role versions)."""
+    connection_reason: ConnectionReason
+    """Reason for this connection (relevant for multi-server environments)."""
+    active_roles: list[str]
+    """Versioned role IDs active for this client (e.g., 'player@v1')."""
+    selected_pair_method: PairMethod | None = None
+    """Pairing method the server picked; present when connection_reason is 'pairing'."""
+
+    class Config(BaseConfig):
+        """Config for parsing json messages."""
+
+        omit_none = True
+
+
+@dataclass
+class LegacyServerHelloMessage(DataClassORJSONMixin):
+    """Legacy server/hello for transition-mode (unencrypted) clients."""
+
+    payload: LegacyServerHelloPayload
+    type: Literal["server/hello"] = "server/hello"
+
+
+# Server -> Client: server/activate
+@dataclass
+class ServerActivatePayload(DataClassORJSONMixin):
+    """Declares the server's current purpose on this connection."""
+
+    activities: list[Activity]
+    """The set of currently-active purposes on this connection. May be empty."""
+    active_roles: list[str] | None = None
+    """Versioned role IDs active for this client (e.g., 'player@v1'). Required on
+    connections capable of playback; absent otherwise. Persists across subsequent
+    server/activate messages that omit it."""
+    selected_pair_method: PairMethod | None = None
+    """Pairing method the server picked. Required when 'pairing' is in activities."""
+
+    class Config(BaseConfig):
+        """Config for parsing json messages."""
+
+        omit_none = True
+
+
+@dataclass
+class ServerActivateMessage(ServerMessage):
+    """Message sent by the server to declare its active purpose on this connection."""
+
+    payload: ServerActivatePayload
+    type: Literal["server/activate"] = "server/activate"
 
 
 # Server -> Client: server/time
@@ -358,17 +459,19 @@ class ServerTimeMessage(ServerMessage):
 class ServerStatePayload(DataClassORJSONMixin):
     """Server sends state updates to the client."""
 
-    metadata: SessionUpdateMetadata | None = None
+    metadata: SessionUpdateMetadata | None | UndefinedField = field(default_factory=undefined_field)
     """Metadata state - only sent to clients with metadata role."""
-    controller: ControllerStatePayload | None = None
+    controller: ControllerStatePayload | None | UndefinedField = field(
+        default_factory=undefined_field
+    )
     """Controller state - only sent to clients with controller role."""
-    color: SessionUpdateColor | None = None
+    color: SessionUpdateColor | None | UndefinedField = field(default_factory=undefined_field)
     """Color state - only sent to clients with color role."""
 
     class Config(BaseConfig):
         """Config for parsing json messages."""
 
-        omit_none = True
+        omit_default = True
 
 
 @dataclass
@@ -483,6 +586,8 @@ def _deserialize_stream_start_visualizer(
 class StreamStartPayload(DataClassORJSONMixin):
     """Information about an active streaming session."""
 
+    server_transmitted: int = 0
+    """Timestamp the server transmitted this message in microseconds. Stamped at send."""
     player: StreamStartPlayer | None = None
     """Information about the player."""
     artwork: StreamStartArtwork | None = None
@@ -530,6 +635,8 @@ STREAM_END_ROLE_FAMILIES = frozenset({"player", "artwork", "visualizer"})
 class StreamClearPayload(DataClassORJSONMixin):
     """Instructs clients to clear buffers without ending the stream."""
 
+    server_transmitted: int = 0
+    """Timestamp the server transmitted this message in microseconds. Stamped at send."""
     roles: list[str] | None = None
     """Roles to clear: player, visualizer, or both. If omitted, clears both roles."""
 
@@ -594,6 +701,8 @@ class StreamRequestFormatMessage(ClientMessage):
 class StreamEndPayload(DataClassORJSONMixin):
     """Payload for stream/end message."""
 
+    server_transmitted: int = 0
+    """Timestamp the server transmitted this message in microseconds. Stamped at send."""
     roles: list[str] | None = None
     """Roles to end streams for. If omitted, ends all active streams."""
 

@@ -12,7 +12,7 @@ import pytest
 from aiosendspin.models.types import PairMethod
 from aiosendspin.noise.keys import generate_psk, psk_id_for
 from aiosendspin.noise.trust_store import (
-    PIN_LOCKOUT_THRESHOLD,
+    PIN_ESCALATION_THRESHOLD,
     ClientPairingRecord,
     ClientPairingStore,
     FileClientPairingStore,
@@ -113,6 +113,39 @@ def test_server_record_pair_methods_round_trip_and_back_compat() -> None:
     legacy = record.to_dict()
     del legacy["pair_methods"]
     assert ServerPairingRecord.from_dict(legacy).pair_methods == []
+
+
+def test_server_record_owner_round_trips_and_back_compat() -> None:
+    """Owner round-trips; a legacy dict without the key loads as ``None``."""
+    record = _server_record()
+    assert record.owner is None
+    owned = ServerPairingRecord(
+        psk_id=record.psk_id,
+        psk=record.psk,
+        client_id=record.client_id,
+        pair_methods=[],
+        owner="user-1",
+    )
+    assert ServerPairingRecord.from_dict(owned.to_dict()) == owned
+    legacy = owned.to_dict()
+    del legacy["owner"]
+    assert ServerPairingRecord.from_dict(legacy).owner is None
+
+
+async def test_server_store_records_by_owner(server_store: ServerPairingStore) -> None:
+    """records_by_owner returns only the records bound to the given owner."""
+    unowned = _server_record(client_id="client-A")
+    psk_b, psk_c = generate_psk(), generate_psk()
+    owned_b = ServerPairingRecord(
+        psk_id=psk_id_for(psk_b), psk=psk_b, client_id="client-B", pair_methods=[], owner="user-1"
+    )
+    owned_c = ServerPairingRecord(
+        psk_id=psk_id_for(psk_c), psk=psk_c, client_id="client-C", pair_methods=[], owner="user-2"
+    )
+    for record in (unowned, owned_b, owned_c):
+        await server_store.store_record(record)
+    assert list(await server_store.records_by_owner("user-1")) == [owned_b]
+    assert list(await server_store.records_by_owner("user-3")) == []
 
 
 def test_client_record_round_trips_and_resolves() -> None:
@@ -301,13 +334,63 @@ async def test_file_client_store_persists_state(tmp_path: Path) -> None:
     await store.store_record(record)
     await store.set_pairing_psk(pairing)
     await store.set_static_pin("12345678")
-    await store.record_pin_failure(PairMethod.DYNAMIC_PIN)
+    await store.record_pin_failure()
 
     reloaded = await FileClientPairingStore.open(path)
     assert await reloaded.record_by_server_id("server-X") == record
     assert await reloaded.pairing_psk() == pairing
     assert await reloaded.static_pin() == "12345678"
-    assert await reloaded.pin_failure_count(PairMethod.DYNAMIC_PIN) == 1
+    assert await reloaded.pin_failure_count() == 1
+
+
+async def test_file_client_store_migrates_per_method_pin_failures(tmp_path: Path) -> None:
+    """A pre-escalation store carries its dynamic-PIN count over, keeping escalation state."""
+    path = tmp_path / "client.json"
+    await FileClientPairingStore.open(path)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["pin_failures"] = {
+        PairMethod.DYNAMIC_PIN.value: PIN_ESCALATION_THRESHOLD,
+        PairMethod.STATIC_PIN.value: 3,
+    }
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+    reloaded = await FileClientPairingStore.open(path)
+    assert await reloaded.pin_failure_count() == PIN_ESCALATION_THRESHOLD
+
+
+async def test_file_client_store_persists_last_playback_server(tmp_path: Path) -> None:
+    """The last-playback server id survives a reload."""
+    path = tmp_path / "client.json"
+    store = await FileClientPairingStore.open(path)
+    await store.set_last_playback_server_id("server-X")
+
+    reloaded = await FileClientPairingStore.open(path)
+    assert await reloaded.get_last_playback_server_id() == "server-X"
+
+
+async def test_last_playback_server_write_retries_after_save_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed save leaves the prior value intact so the same write can retry."""
+    store = InMemoryClientPairingStore()
+    save_attempts = 0
+
+    async def fail_once() -> None:
+        nonlocal save_attempts
+        save_attempts += 1
+        if save_attempts == 1:
+            raise OSError("store unavailable")
+
+    monkeypatch.setattr(store, "_save", fail_once)
+
+    with pytest.raises(OSError, match="store unavailable"):
+        await store.set_last_playback_server_id("server-X")
+    assert await store.get_last_playback_server_id() is None
+
+    await store.set_last_playback_server_id("server-X")
+
+    assert save_attempts == 2
+    assert await store.get_last_playback_server_id() == "server-X"
 
 
 async def test_file_client_store_pairing_outcome_generates_per_server_record(
@@ -416,6 +499,31 @@ async def test_client_store_remove_and_list(client_store: ClientPairingStore) ->
     await client_store.remove_record("absent")
 
 
+async def test_client_store_replace_record_drops_prior_for_server(
+    client_store: ClientPairingStore,
+) -> None:
+    """Re-pairing a server leaves a single record, keyed by the newest psk_id."""
+    old = _client_record(server_id="server-X")
+    await client_store.store_record(old)
+    new = _client_record(server_id="server-X")
+    await client_store.replace_record_for_server_id(new)
+    for_server = [r for r in await client_store.list_records() if r.server_id == "server-X"]
+    assert for_server == [new]
+    assert await client_store.record_by_psk_id(old.psk_id) is None
+
+
+async def test_client_store_replace_record_keeps_shared_records(
+    client_store: ClientPairingStore,
+) -> None:
+    """A shared record binds to no server, so replacing one leaves the others alone."""
+    existing = _shared_record()
+    await client_store.store_record(existing)
+
+    await client_store.replace_record_for_server_id(_shared_record())
+
+    assert await client_store.record_by_psk_id(existing.psk_id) == existing
+
+
 async def test_client_store_reports_no_storage_accounting_by_default(
     client_store: ClientPairingStore,
 ) -> None:
@@ -424,32 +532,25 @@ async def test_client_store_reports_no_storage_accounting_by_default(
 
 
 async def test_pin_failure_counter_increments_and_resets(client_store: ClientPairingStore) -> None:
-    """Failures accumulate per method and reset clears the counter."""
-    assert await client_store.pin_failure_count(PairMethod.DYNAMIC_PIN) == 0
-    assert await client_store.record_pin_failure(PairMethod.DYNAMIC_PIN) == 1
-    assert await client_store.record_pin_failure(PairMethod.DYNAMIC_PIN) == 2
-    await client_store.reset_pin_failures(PairMethod.DYNAMIC_PIN)
-    assert await client_store.pin_failure_count(PairMethod.DYNAMIC_PIN) == 0
+    """Failures accumulate and reset clears the counter."""
+    assert await client_store.pin_failure_count() == 0
+    assert await client_store.record_pin_failure() == 1
+    assert await client_store.record_pin_failure() == 2
+    await client_store.reset_pin_failures()
+    assert await client_store.pin_failure_count() == 0
 
 
-async def test_pin_failure_counter_is_per_method(client_store: ClientPairingStore) -> None:
-    """static_pin and dynamic_pin counters are tracked independently."""
-    await client_store.record_pin_failure(PairMethod.DYNAMIC_PIN)
-    assert await client_store.pin_failure_count(PairMethod.STATIC_PIN) == 0
-    assert await client_store.pin_failure_count(PairMethod.DYNAMIC_PIN) == 1
-
-
-async def test_pin_lockout_at_threshold_and_clears_on_reset(
+async def test_pin_escalation_at_threshold_and_clears_on_reset(
     client_store: ClientPairingStore,
 ) -> None:
-    """Lockout trips at the threshold and clears only on reset."""
-    for _ in range(PIN_LOCKOUT_THRESHOLD - 1):
-        await client_store.record_pin_failure(PairMethod.DYNAMIC_PIN)
-    assert not await client_store.is_pin_locked_out(PairMethod.DYNAMIC_PIN)
-    await client_store.record_pin_failure(PairMethod.DYNAMIC_PIN)
-    assert await client_store.is_pin_locked_out(PairMethod.DYNAMIC_PIN)
-    await client_store.reset_pin_failures(PairMethod.DYNAMIC_PIN)
-    assert not await client_store.is_pin_locked_out(PairMethod.DYNAMIC_PIN)
+    """Escalation trips at the threshold and clears only on reset."""
+    for _ in range(PIN_ESCALATION_THRESHOLD - 1):
+        await client_store.record_pin_failure()
+    assert not await client_store.is_pin_escalated()
+    await client_store.record_pin_failure()
+    assert await client_store.is_pin_escalated()
+    await client_store.reset_pin_failures()
+    assert not await client_store.is_pin_escalated()
 
 
 # --- shared-PSK records --------------------------------------------------

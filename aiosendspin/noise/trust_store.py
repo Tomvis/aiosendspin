@@ -24,12 +24,12 @@ from .keys import (
 )
 from .pin import DEFAULT_MIN_PIN_DIGITS, is_valid_static_pin
 
-# A PIN-pairing method enters terminal lockout when its failure counter reaches
+# Dynamic-PIN pairing escalates to gesture-gating when its failure counter reaches
 # this value.
-PIN_LOCKOUT_THRESHOLD: Final[int] = 10
+PIN_ESCALATION_THRESHOLD: Final[int] = 10
 
 __all__ = [
-    "PIN_LOCKOUT_THRESHOLD",
+    "PIN_ESCALATION_THRESHOLD",
     "ClientPairingConfig",
     "ClientPairingRecord",
     "ClientPairingStore",
@@ -95,6 +95,13 @@ class ServerPairingRecord:
     client_id: str
     pair_methods: list[PairMethod]
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    owner: str | None = None
+    """Application-defined id of the authorization this record is bound to.
+
+    Owned records are meant to be removed once the owning authorization (e.g. a user
+    account or session) ends; the server attaches no behavior to this field. ``None``
+    marks a self-standing credential.
+    """
 
     def __post_init__(self) -> None:
         """Validate the PSK size."""
@@ -118,6 +125,7 @@ class ServerPairingRecord:
             "client_id": self.client_id,
             "pair_methods": [m.value for m in self.pair_methods],
             "created_at": self.created_at.isoformat(),
+            "owner": self.owner,
         }
 
     @classmethod
@@ -129,6 +137,7 @@ class ServerPairingRecord:
             client_id=_str(data, "client_id"),
             pair_methods=_pair_methods(data, "pair_methods"),
             created_at=datetime.fromisoformat(_str(data, "created_at")),
+            owner=_opt_str(data, "owner"),
         )
 
 
@@ -349,6 +358,10 @@ class ServerPairingStore(ABC):
     async def remove_trusted_unpaired(self, client_id: str) -> None:
         """Revoke client's unpaired-playback approval (no-op if absent)."""
 
+    async def records_by_owner(self, owner: str) -> Sequence[ServerPairingRecord]:
+        """Return all long-term records bound to ``owner``."""
+        return [record for record in await self.list_records() if record.owner == owner]
+
 
 class ClientPairingStore(ABC):
     """Pairing state a client holds: long-term records plus its accepted Pairing PSKs."""
@@ -414,20 +427,28 @@ class ClientPairingStore(ABC):
         """Return the configured static PIN, if any."""
 
     @abstractmethod
-    async def pin_failure_count(self, method: PairMethod) -> int:
-        """Return the persisted PIN-pairing failure count for ``method``."""
+    async def pin_failure_count(self) -> int:
+        """Return the persisted dynamic-PIN failure count."""
 
     @abstractmethod
-    async def record_pin_failure(self, method: PairMethod) -> int:
-        """Increment ``method``'s failure counter and return the new count."""
+    async def record_pin_failure(self) -> int:
+        """Increment the dynamic-PIN failure counter and return the new count."""
 
     @abstractmethod
-    async def reset_pin_failures(self, method: PairMethod) -> None:
-        """Reset ``method``'s failure counter to zero (on success or lockout clear)."""
+    async def reset_pin_failures(self) -> None:
+        """Reset the dynamic-PIN failure counter to zero (on ``server_kc`` success)."""
 
     @abstractmethod
-    async def is_pin_locked_out(self, method: PairMethod) -> bool:
-        """Return whether ``method`` is in terminal lockout (count past the threshold)."""
+    async def is_pin_escalated(self) -> bool:
+        """Return whether dynamic PIN is escalated to gesture-gating (count at threshold)."""
+
+    @abstractmethod
+    async def get_last_playback_server_id(self) -> str | None:
+        """Return the persisted last-playback server id, if one is stored."""
+
+    @abstractmethod
+    async def set_last_playback_server_id(self, server_id: str | None) -> None:
+        """Persist the last-playback server id."""
 
     async def can_store_record(self) -> bool:
         """Return whether the store can persist another record (default: unlimited)."""
@@ -478,6 +499,22 @@ class ClientPairingStore(ABC):
     async def can_remove_record(self, psk_id: str) -> bool:
         """Return whether the record at ``psk_id`` may be removed (not record_mode-referenced)."""
         return not await self._record_mode_references(psk_id)
+
+    async def replace_record_for_server_id(self, record: ClientPairingRecord) -> None:
+        """Persist ``record``, dropping any prior removable record bound to the same server."""
+        stale = (
+            [
+                existing.psk_id
+                for existing in await self.list_records()
+                if existing.server_id == record.server_id and existing.psk_id != record.psk_id
+            ]
+            if record.server_id is not None
+            else []
+        )
+        await self.store_record(record)
+        for psk_id in stale:
+            if await self.can_remove_record(psk_id):
+                await self.remove_record(psk_id)
 
 
 class _ServerPairingStoreBase(ServerPairingStore):
@@ -603,11 +640,28 @@ class _ClientPairingStoreBase(ClientPairingStore):
         self._records: dict[str, ClientPairingRecord] = {}
         self._pairing_psk: PairingPsk | None = None
         self._static_pin: str | None = None
-        self._pin_failures: dict[PairMethod, int] = {}
+        self._pin_failures = 0
         self._pairing_config: ClientPairingConfig | None = None
+        self._last_playback_server_id: str | None = None
 
     async def _save(self) -> None:
         """Flush mutated state to durable storage; a no-op for non-persistent stores."""
+
+    async def get_last_playback_server_id(self) -> str | None:
+        """Return the persisted last-playback server id, if any."""
+        return self._last_playback_server_id
+
+    async def set_last_playback_server_id(self, server_id: str | None) -> None:
+        """Persist the last-playback server id."""
+        if server_id == self._last_playback_server_id:
+            return
+        previous_server_id = self._last_playback_server_id
+        self._last_playback_server_id = server_id
+        try:
+            await self._save()
+        except BaseException:
+            self._last_playback_server_id = previous_server_id
+            raise
 
     async def resolve_by_psk_id(self, psk_id: str) -> ResolvedPsk | None:
         """Resolve a ``psk_id`` (long-term record first, then the accepted Pairing PSK)."""
@@ -692,25 +746,25 @@ class _ClientPairingStoreBase(ClientPairingStore):
         """Return the configured static PIN, if any."""
         return self._static_pin
 
-    async def pin_failure_count(self, method: PairMethod) -> int:
-        """Return the PIN-pairing failure count for ``method``."""
-        return self._pin_failures.get(method, 0)
+    async def pin_failure_count(self) -> int:
+        """Return the dynamic-PIN failure count."""
+        return self._pin_failures
 
-    async def record_pin_failure(self, method: PairMethod) -> int:
-        """Increment ``method``'s failure counter and return the new count."""
-        count = self._pin_failures.get(method, 0) + 1
-        self._pin_failures[method] = count
+    async def record_pin_failure(self) -> int:
+        """Increment the dynamic-PIN failure counter and return the new count."""
+        self._pin_failures += 1
         await self._save()
-        return count
+        return self._pin_failures
 
-    async def reset_pin_failures(self, method: PairMethod) -> None:
-        """Reset ``method``'s failure counter to zero (no-op if absent)."""
-        if self._pin_failures.pop(method, None) is not None:
+    async def reset_pin_failures(self) -> None:
+        """Reset the dynamic-PIN failure counter to zero (no-op if already zero)."""
+        if self._pin_failures:
+            self._pin_failures = 0
             await self._save()
 
-    async def is_pin_locked_out(self, method: PairMethod) -> bool:
-        """Return whether ``method`` has reached terminal lockout."""
-        return self._pin_failures.get(method, 0) >= PIN_LOCKOUT_THRESHOLD
+    async def is_pin_escalated(self) -> bool:
+        """Return whether dynamic PIN has escalated to gesture-gating."""
+        return self._pin_failures >= PIN_ESCALATION_THRESHOLD
 
 
 class InMemoryClientPairingStore(_ClientPairingStoreBase):
@@ -755,18 +809,15 @@ class FileClientPairingStore(_ClientPairingStoreBase):
         raw_psk = data.get("pairing_psk")
         self._pairing_psk = PairingPsk.from_dict(raw_psk) if isinstance(raw_psk, Mapping) else None
         self._static_pin = _opt_str(data, "static_pin")
-        failures: dict[PairMethod, int] = {}
-        raw_failures = data.get("pin_failures")
-        if raw_failures is not None:
-            if not isinstance(raw_failures, Mapping):
-                msg = "pairing store 'pin_failures' must be an object"
-                raise TypeError(msg)
-            for method_value, count in raw_failures.items():
-                if isinstance(count, bool) or not isinstance(count, int):
-                    msg = f"pin_failures[{method_value!r}] must be an integer"
-                    raise TypeError(msg)
-                failures[PairMethod(str(method_value))] = count
-        self._pin_failures = failures
+        raw_failures = data.get("pin_failures", 0)
+        if isinstance(raw_failures, Mapping):
+            # Pre-escalation format kept per-method counters; carry over dynamic_pin's.
+            raw_failures = raw_failures.get(PairMethod.DYNAMIC_PIN.value, 0)
+        if isinstance(raw_failures, bool) or not isinstance(raw_failures, int):
+            msg = "pairing store 'pin_failures' must be an integer"
+            raise TypeError(msg)
+        self._pin_failures = raw_failures
+        self._last_playback_server_id = _opt_str(data, "last_playback_server_id")
 
     async def _seed(self) -> None:
         """Provision the default pre-provisioned shared-PSK fallback record (spec §Record mode)."""
@@ -785,7 +836,8 @@ class FileClientPairingStore(_ClientPairingStoreBase):
                 "pairing_config": self._pairing_config.to_dict(),
                 "pairing_psk": self._pairing_psk.to_dict() if self._pairing_psk else None,
                 "static_pin": self._static_pin,
-                "pin_failures": {m.value: c for m, c in self._pin_failures.items()},
+                "pin_failures": self._pin_failures,
+                "last_playback_server_id": self._last_playback_server_id,
             }
             await asyncio.to_thread(_atomic_write_json, self._path, payload)
 

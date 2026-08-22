@@ -5,9 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
 
-from mashumaro.config import BaseConfig
-from mashumaro.mixins.orjson import DataClassORJSONMixin
-
+from .base import SendspinConfig, SendspinModel
 from .core import UnpairedAccess
 from .types import (
     ClientMessage,
@@ -18,7 +16,7 @@ from .types import (
 
 # Server -> Client: server/unpair
 @dataclass
-class ServerUnpairPayload(DataClassORJSONMixin):
+class ServerUnpairPayload(SendspinModel):
     """Empty ``server/unpair`` payload."""
 
 
@@ -32,7 +30,7 @@ class ServerUnpairMessage(ServerMessage):
 
 # Server -> Client: management/list-records
 @dataclass
-class ManagementListRecordsPayload(DataClassORJSONMixin):
+class ManagementListRecordsPayload(SendspinModel):
     """Empty ``management/list-records`` payload."""
 
 
@@ -46,7 +44,7 @@ class ManagementListRecordsMessage(ServerMessage):
 
 # Server -> Client: management/add-record
 @dataclass
-class ManagementAddRecordPayload(DataClassORJSONMixin):
+class ManagementAddRecordPayload(SendspinModel):
     """A pairing record to add directly."""
 
     psk: str
@@ -54,7 +52,7 @@ class ManagementAddRecordPayload(DataClassORJSONMixin):
     server_id: str | None = None
     """Present for stored-pubkey records, absent for shared-PSK records."""
 
-    class Config(BaseConfig):
+    class Config(SendspinConfig):
         """Omit the absent server_id for shared-PSK records."""
 
         omit_none = True
@@ -70,7 +68,7 @@ class ManagementAddRecordMessage(ServerMessage):
 
 # Server -> Client: management/remove-record
 @dataclass
-class ManagementRemoveRecordPayload(DataClassORJSONMixin):
+class ManagementRemoveRecordPayload(SendspinModel):
     """Identifies the record to remove."""
 
     psk_id: str
@@ -86,7 +84,7 @@ class ManagementRemoveRecordMessage(ServerMessage):
 
 # Pairing config (shared wire shapes for get/set-pairing-config)
 @dataclass
-class RecordModeConfig(DataClassORJSONMixin):
+class RecordModeConfig(SendspinModel):
     """The client-wide record mode on the wire."""
 
     psk_id: str
@@ -95,7 +93,7 @@ class RecordModeConfig(DataClassORJSONMixin):
 
 # Server -> Client: management/get-pairing-config
 @dataclass
-class ManagementGetPairingConfigPayload(DataClassORJSONMixin):
+class ManagementGetPairingConfigPayload(SendspinModel):
     """Empty ``management/get-pairing-config`` payload."""
 
 
@@ -111,65 +109,61 @@ class ManagementGetPairingConfigMessage(ServerMessage):
 
 # Server -> Client: management/set-pairing-config
 @dataclass
-class SetPairingPskConfig(DataClassORJSONMixin):
+class SetPairingPskConfig(SendspinModel):
     """Patch for the Pairing PSK method; absent fields are left unchanged."""
 
     enabled: bool | None = None
     psk: str | None = None
     """43-char base64url 32-byte PSK; replaces the configured Pairing PSK."""
 
-    class Config(BaseConfig):
+    class Config(SendspinConfig):
         """Absent (omitted) fields mean 'leave unchanged'."""
 
         omit_none = True
 
 
 @dataclass
-class SetStaticPinConfig(DataClassORJSONMixin):
+class SetStaticPinConfig(SendspinModel):
     """Patch for the static-PIN method; absent fields are left unchanged."""
 
     enabled: bool | None = None
     pin: str | None = None
     """8 decimal digits; replaces the configured static PIN."""
-    locked_out: bool | None = None
-    """Only ``false`` is accepted; clears terminal lockout."""
 
-    class Config(BaseConfig):
+    class Config(SendspinConfig):
         """Absent (omitted) fields mean 'leave unchanged'."""
 
         omit_none = True
 
 
 @dataclass
-class SetDynamicPinConfig(DataClassORJSONMixin):
+class SetDynamicPinConfig(SendspinModel):
     """Patch for the dynamic-PIN method; absent fields are left unchanged."""
 
     enabled: bool | None = None
-    locked_out: bool | None = None
-    """Only ``false`` is accepted; clears terminal lockout."""
     min_pin_length: int | None = None
     """Shortest PIN length in digits the client will accept; must be in 4-12."""
 
-    class Config(BaseConfig):
+    class Config(SendspinConfig):
         """Absent (omitted) fields mean 'leave unchanged'."""
 
         omit_none = True
 
 
 @dataclass
-class SetUnpairedAccessConfig(DataClassORJSONMixin):
+class SetUnpairedAccessConfig(SendspinModel):
     """Patch for unpaired access; absent fields are left unchanged."""
 
     enabled: bool | None = None
 
-    class Config(BaseConfig):
+    class Config(SendspinConfig):
         """Absent (omitted) fields mean 'leave unchanged'."""
 
         omit_none = True
 
 
 @dataclass
-class ManagementSetPairingConfigPayload(DataClassORJSONMixin):
+class ManagementSetPairingConfigPayload(SendspinModel):
     """Partial patch over the client's pairing config; absent method objects are unchanged."""
 
     pairing_psk: SetPairingPskConfig | None = None
@@ -178,7 +172,7 @@ class ManagementSetPairingConfigPayload(DataClassORJSONMixin):
     record_mode: RecordModeConfig | None = None
     unpaired_access: SetUnpairedAccessConfig | None = None
 
-    class Config(BaseConfig):
+    class Config(SendspinConfig):
         """Absent (omitted) objects mean 'leave unchanged'."""
 
         omit_none = True
@@ -192,9 +186,25 @@ class ManagementSetPairingConfigMessage(ServerMessage):
     type: Literal["management/set-pairing-config"] = "management/set-pairing-config"
 
 
+# Server -> Client: management/open-pairing-window
+@dataclass
+class ManagementOpenPairingWindowPayload(SendspinModel):
+    """Empty ``management/open-pairing-window`` payload."""
+
+
+@dataclass
+class ManagementOpenPairingWindowMessage(ServerMessage):
+    """Opens a pairing window on the client in place of the operator gesture."""
+
+    payload: ManagementOpenPairingWindowPayload = field(
+        default_factory=ManagementOpenPairingWindowPayload
+    )
+    type: Literal["management/open-pairing-window"] = "management/open-pairing-window"
+
+
 # Client -> Server: management/result
 @dataclass(kw_only=True)
-class RecordSummary(DataClassORJSONMixin):
+class RecordSummary(SendspinModel):
     """One entry in a list-records result."""
 
     psk_id: str
@@ -203,30 +213,30 @@ class RecordSummary(DataClassORJSONMixin):
     used: bool
     """``True`` once a server has authenticated a session with this record's PSK."""
 
-    class Config(BaseConfig):
+    class Config(SendspinConfig):
         """Omit the absent server_id for shared-PSK records."""
 
         omit_none = True
 
 
 @dataclass
-class PairingMethodConfig(DataClassORJSONMixin):
+class PairingMethodConfig(SendspinModel):
     """A method's config in a get-pairing-config result."""
 
     enabled: bool
-    locked_out: bool | None = None
-    """Only present for PIN methods; ``true`` if locked out."""
     min_pin_length: int | None = None
     """For dynamic_pin only: shortest PIN length in digits the client will accept (4-12)."""
+    escalated: bool | None = None
+    """For dynamic_pin only: ``true`` when the failure counter escalated it to gesture-gating."""
 
-    class Config(BaseConfig):
+    class Config(SendspinConfig):
         """Omit method-specific fields where they do not apply."""
 
         omit_none = True
 
 
 @dataclass
-class ManagementResultData(DataClassORJSONMixin):
+class ManagementResultData(SendspinModel):
     """Operation-specific data for a management/result; present only on ``ok``."""
 
     records: list[RecordSummary] | None = None
@@ -242,14 +252,14 @@ class ManagementResultData(DataClassORJSONMixin):
     unpaired_access: UnpairedAccess | None = None
     """Present for get-pairing-config."""
 
-    class Config(BaseConfig):
+    class Config(SendspinConfig):
         """Omit fields not relevant to the answered request."""
 
         omit_none = True
 
 
 @dataclass
-class StorageAccounting(DataClassORJSONMixin):
+class StorageAccounting(SendspinModel):
     """Record-storage accounting on a management/result.
 
     ``free`` is always present; ``capacity`` and the per-kind costs accompany it only on
@@ -261,21 +271,21 @@ class StorageAccounting(DataClassORJSONMixin):
     cost_individual: int | None = None
     cost_shared: int | None = None
 
-    class Config(BaseConfig):
+    class Config(SendspinConfig):
         """Omit the static fields on results that carry only ``free``."""
 
         omit_none = True
 
 
 @dataclass
-class ManagementResultPayload(DataClassORJSONMixin):
+class ManagementResultPayload(SendspinModel):
     """Result code and optional data for a management request."""
 
     result: ManagementResult
     data: ManagementResultData | None = None
     storage: StorageAccounting | None = None
 
-    class Config(BaseConfig):
+    class Config(SendspinConfig):
         """Omit absent optional fields (data, storage)."""
 
         omit_none = True

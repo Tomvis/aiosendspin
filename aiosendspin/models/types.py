@@ -5,31 +5,31 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
-from mashumaro.config import BaseConfig
-from mashumaro.mixins.orjson import DataClassORJSONMixin
 from mashumaro.types import Discriminator
+
+from .base import SendspinConfig, SendspinModel
 
 
 # Base message classes
 @dataclass
-class ClientMessage(DataClassORJSONMixin):
+class ClientMessage(SendspinModel):
     """Base class for client messages."""
 
-    class Config(BaseConfig):
+    class Config(SendspinConfig):
         """Config for parsing json messages."""
 
         discriminator = Discriminator(field="type", include_subtypes=True)
 
 
 @dataclass
-class ServerMessage(DataClassORJSONMixin):
+class ServerMessage(SendspinModel):
     """Base class for server messages."""
 
     def merge(self, _other: ServerMessage) -> ServerMessage | None:
         """Merge two messages of the same type when safe, else return None."""
         return None
 
-    class Config(BaseConfig):
+    class Config(SendspinConfig):
         """Config for parsing json messages."""
 
         discriminator = Discriminator(field="type", include_subtypes=True)
@@ -37,7 +37,7 @@ class ServerMessage(DataClassORJSONMixin):
 
 # Helpers for discerning between null and undefined fields in messages
 @dataclass
-class UndefinedField(DataClassORJSONMixin):
+class UndefinedField(SendspinModel):
     """Marker type to indicate undefined fields in messages."""
 
 
@@ -81,6 +81,8 @@ class Roles(Enum):
     """
     COLOR = "color@v1"
     """Receives colors derived from the current audio."""
+    SOURCE = "source@v1"
+    """Captures audio from a local input and streams it to the server."""
 
 
 class BinaryMessageType(Enum):
@@ -118,6 +120,10 @@ class BinaryMessageType(Enum):
     VISUALIZATION_PITCH = 21
     """Perceived pitch (MIDI 8.8 + confidence) (Visualizer role, slot 5)."""
 
+    # Source role (bits 000011xx, IDs 12-15):
+    SOURCE_AUDIO_CHUNK = 12
+    """Encoded audio frame captured by a source client (Source role, slot 0)."""
+
 
 class RepeatMode(Enum):
     """Enum for Repeat Modes."""
@@ -125,6 +131,13 @@ class RepeatMode(Enum):
     OFF = "off"
     ONE = "one"
     ALL = "all"
+
+
+class SignalState(Enum):
+    """Line-sensing/signal presence reported by a source that supports it."""
+
+    PRESENT = "present"
+    ABSENT = "absent"
 
 
 class PlaybackStateType(Enum):
@@ -248,7 +261,6 @@ class PairAbortReason(Enum):
 
     ATTEMPT_TIMEOUT = "attempt_timeout"
     CONCURRENT_ATTEMPT = "concurrent_attempt"
-    LOCKED_OUT = "locked_out"
     METHOD_NOT_SUPPORTED = "method_not_supported"
     PIN_LENGTH_UNACCEPTABLE = "pin_length_unacceptable"
     PIN_MISMATCH = "pin_mismatch"
@@ -256,9 +268,7 @@ class PairAbortReason(Enum):
 
 
 # The sender closes the connection after these abort reasons; every other reason keeps it open.
-CLOSING_ABORT_REASONS: frozenset[PairAbortReason] = frozenset(
-    {PairAbortReason.CONCURRENT_ATTEMPT, PairAbortReason.METHOD_NOT_SUPPORTED}
-)
+CLOSING_ABORT_REASONS: frozenset[PairAbortReason] = frozenset({PairAbortReason.CONCURRENT_ATTEMPT})
 
 
 class ManagementResult(Enum):

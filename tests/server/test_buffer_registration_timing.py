@@ -33,6 +33,12 @@ class _DummyServer:
     def is_external_player(self, client_id: str) -> bool:  # noqa: ARG002
         return False
 
+    def _signal_client_connected(self, client_id: str) -> None:
+        pass
+
+    def _signal_client_disconnected(self, client_id: str, goodbye_reason: object = None) -> None:
+        pass
+
 
 class _DummyGroup:
     def __init__(self, clients: list[Any], group_id: str = "g1") -> None:
@@ -54,7 +60,7 @@ class _DummyGroup:
 
 
 @pytest.mark.asyncio
-async def test_buffer_tracker_does_not_backpressure_until_send() -> None:
+async def test_buffer_tracker_does_not_backpressure_until_send() -> None:  # noqa: PLR0915
     """
     Backpressure must reflect bytes that have actually left the server.
 
@@ -78,6 +84,8 @@ async def test_buffer_tracker_does_not_backpressure_until_send() -> None:
     conn = SendspinConnection(server, wsock_client=wsock)
     conn._transport = wsock  # noqa: SLF001
     await conn._setup_connection()  # noqa: SLF001
+    # Streaming player: initial state already received.
+    conn._initial_state_received = True  # noqa: SLF001
     conn._writer_task = asyncio.create_task(conn._writer())  # noqa: SLF001
 
     group = _DummyGroup(clients=[])

@@ -8,12 +8,9 @@ synchronization, stream lifecycle management, and role-based state updates and c
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass, field, fields, is_dataclass
 from typing import Annotated, Any, ClassVar, Literal
 
-from mashumaro.config import BaseConfig
-from mashumaro.mixins.orjson import DataClassORJSONMixin
 from mashumaro.types import Alias
 
 from .artwork import (
@@ -21,6 +18,7 @@ from .artwork import (
     StreamRequestFormatArtwork,
     StreamStartArtwork,
 )
+from .base import SendspinConfig, SendspinModel
 from .color import SessionUpdateColor
 from .controller import ControllerCommandPayload, ControllerStatePayload
 from .metadata import SessionUpdateMetadata
@@ -30,6 +28,11 @@ from .player import (
     PlayerStatePayload,
     StreamRequestFormatPlayer,
     StreamStartPlayer,
+)
+from .source import (
+    ClientHelloSourceSupport,
+    SourceCommandServerPayload,
+    SourceStatePayload,
 )
 from .types import (
     Activity,
@@ -55,8 +58,6 @@ from .visualizer_draft_r1 import (
 from .visualizer_draft_r1 import (
     StreamStartVisualizer as StreamStartVisualizerDraftR1,
 )
-
-logger = logging.getLogger(__name__)
 
 
 def _has_merge_value(value: Any) -> bool:
@@ -91,7 +92,7 @@ def _merge_optional_dataclass_fields(existing: Any, incoming: Any) -> Any:
 
 
 @dataclass
-class DeviceInfo(DataClassORJSONMixin):
+class DeviceInfo(SendspinModel):
     """Optional information about the device."""
 
     product_name: str | None = None
@@ -103,33 +104,33 @@ class DeviceInfo(DataClassORJSONMixin):
     mac_address: str | None = None
     """MAC address of the connection's network interface, lowercase colon-separated."""
 
-    class Config(BaseConfig):
+    class Config(SendspinConfig):
         """Config for parsing json messages."""
 
         omit_none = True
 
 
 @dataclass
-class PairMethodDescriptor(DataClassORJSONMixin):
+class PairMethodDescriptor(SendspinModel):
     """A pairing method a client offers in client/hello."""
 
     method: PairMethod
     """The pairing method identifier."""
     out_channels: list[str] | None = None
     """For dynamic_pin only: channels through which the PIN is conveyed to the operator."""
-    locked_out: bool | None = None
-    """For PIN methods only: True when the method is in terminal lockout."""
     min_pin_length: int | None = None
     """For dynamic_pin only: shortest PIN length in digits the client will accept (4-12)."""
+    locations: list[str] | None = None
+    """For static_pin and pairing_psk only: where the operator finds the configured secret."""
 
-    class Config(BaseConfig):
+    class Config(SendspinConfig):
         """Omit method-specific fields where they do not apply."""
 
         omit_none = True
 
 
 @dataclass
-class UnpairedAccess(DataClassORJSONMixin):
+class UnpairedAccess(SendspinModel):
     """Whether the client currently admits unpaired access."""
 
     enabled: bool = False
@@ -137,7 +138,7 @@ class UnpairedAccess(DataClassORJSONMixin):
 
 # Client -> Server: client/hello
 @dataclass
-class ClientHelloPayload(DataClassORJSONMixin):
+class ClientHelloPayload(SendspinModel):
     """Information about a connected client."""
 
     name: str
@@ -169,6 +170,15 @@ class ClientHelloPayload(DataClassORJSONMixin):
     """Pairing methods this client offers."""
     unpaired_access: UnpairedAccess = field(default_factory=UnpairedAccess)
     """Whether this client currently admits unpaired access."""
+    legacy_support_keys_used: list[str] | None = None
+    """Unversioned support keys the parser rewrote to versioned aliases, recorded for
+    the server to flag. Not part of the wire schema (omitted when None)."""
+    unlisted_support_roles: list[str] | None = None
+    """Roles whose support object was provided without listing the role in
+    ``supported_roles`` (dropped during parse), recorded for the server to flag.
+    Not part of the wire schema (omitted when None)."""
+    source_support: Annotated[ClientHelloSourceSupport | None, Alias("source@v1_support")] = None
+    """Source support configuration."""
 
     # Static mapping: unversioned support key -> actual alias key.
     _SUPPORT_KEY_ALIASES: ClassVar[dict[str, str]] = {
@@ -180,22 +190,19 @@ class ClientHelloPayload(DataClassORJSONMixin):
 
     @classmethod
     def __pre_deserialize__(cls, d: dict[str, Any]) -> dict[str, Any]:
-        """Normalize legacy role support keys to versioned names."""
-        legacy_fields_used: list[tuple[str, str]] = []
+        """Rewrite legacy unversioned support keys to versioned aliases, recording which."""
         normalized = dict(d)
+        legacy_keys: list[str] = []
         for legacy_key, versioned_key in cls._SUPPORT_KEY_ALIASES.items():
-            if legacy_key in normalized and versioned_key not in normalized:
-                legacy_fields_used.append((legacy_key, versioned_key))
-                normalized[versioned_key] = normalized.pop(legacy_key)
-        if legacy_fields_used:
-            old_names = ", ".join(old for old, _ in legacy_fields_used)
-            new_names = ", ".join(new for _, new in legacy_fields_used)
-            logger.warning(
-                "client/hello message used deprecated field names (%s), "
-                "please update client to use (%s) instead",
-                old_names,
-                new_names,
-            )
+            if legacy_key not in normalized:
+                continue
+            legacy_keys.append(legacy_key)
+            value = normalized.pop(legacy_key)
+            # Rewrite to the versioned alias only when the client didn't also send it.
+            if versioned_key not in normalized:
+                normalized[versioned_key] = value
+        # Always overwrite so a client cannot spoof the record via the wire.
+        normalized["legacy_support_keys_used"] = legacy_keys or None
         return normalized
 
     def __post_init__(self) -> None:
@@ -204,6 +211,7 @@ class ClientHelloPayload(DataClassORJSONMixin):
         # Require support objects only for the exact role version we parse (e.g. "player@v1").
         # Clients may advertise newer versions (e.g. "player@v2") which this server may not
         # implement. Those must not trigger v1 support requirements.
+        unlisted: list[str] = []
         player_role_supported = Roles.PLAYER.value in self.supported_roles
         if player_role_supported and self.player_support is None:
             raise ValueError(
@@ -211,6 +219,8 @@ class ClientHelloPayload(DataClassORJSONMixin):
                 "'player@v1' is in supported_roles"
             )
         if not player_role_supported:
+            if self.player_support is not None:
+                unlisted.append(Roles.PLAYER.value)
             self.player_support = None
 
         # Validate artwork role and support configuration
@@ -221,6 +231,8 @@ class ClientHelloPayload(DataClassORJSONMixin):
                 "'artwork@v1' is in supported_roles"
             )
         if not artwork_role_supported:
+            if self.artwork_support is not None:
+                unlisted.append(Roles.ARTWORK.value)
             self.artwork_support = None
 
         # Validate visualizer role and support configuration.
@@ -231,6 +243,8 @@ class ClientHelloPayload(DataClassORJSONMixin):
                 "provided when 'visualizer@v1' is in supported_roles"
             )
         if not visualizer_role_supported:
+            if self.visualizer_support is not None:
+                unlisted.append(Roles.VISUALIZER.value)
             self.visualizer_support = None
 
         # Validate legacy `visualizer@_draft_r1` support configuration.
@@ -241,9 +255,25 @@ class ClientHelloPayload(DataClassORJSONMixin):
                 "'visualizer@_draft_r1' is in supported_roles"
             )
         if not visualizer_draft_supported:
+            if self.visualizer_draft_r1_support is not None:
+                unlisted.append("visualizer@_draft_r1")
             self.visualizer_draft_r1_support = None
 
-    class Config(BaseConfig):
+        source_role_supported = Roles.SOURCE.value in self.supported_roles
+        if source_role_supported and self.source_support is None:
+            raise ValueError(
+                "source@v1_support (source_support alias) must be provided when "
+                "'source@v1' is in supported_roles"
+            )
+        if not source_role_supported:
+            if self.source_support is not None:
+                unlisted.append(Roles.SOURCE.value)
+            self.source_support = None
+
+        # Overwrite so a client cannot spoof the record via the wire.
+        self.unlisted_support_roles = unlisted or None
+
+    class Config(SendspinConfig):
         """Config for parsing json messages."""
 
         omit_none = True
@@ -260,7 +290,7 @@ class ClientHelloMessage(ClientMessage):
 
 # Client -> Server: client/time
 @dataclass
-class ClientTimePayload(DataClassORJSONMixin):
+class ClientTimePayload(SendspinModel):
     """Timing information from the client."""
 
     client_transmitted: int
@@ -277,7 +307,7 @@ class ClientTimeMessage(ClientMessage):
 
 # Client -> Server: client/state
 @dataclass
-class ClientStatePayload(DataClassORJSONMixin):
+class ClientStatePayload(SendspinModel):
     """Client sends state updates to the server."""
 
     available: bool | None = None
@@ -289,16 +319,24 @@ class ClientStatePayload(DataClassORJSONMixin):
     """
     player: PlayerStatePayload | None = None
     """Player state - only if client has player role."""
+    legacy_state_used: bool | None = None
+    """Set when the parser read a legacy top-level `state` field, recorded for the server
+    to flag. Not part of the wire schema (omitted when None)."""
+    source: SourceStatePayload | None = None
+    """Source state."""
 
     @classmethod
     def __pre_deserialize__(cls, d: dict[str, Any]) -> dict[str, Any]:
-        """Normalize a legacy `state` enum to `available` (only external_source is unavailable)."""
-        if d.get("available") is None and "state" in d:
-            d = dict(d)
+        """Normalize a legacy `state` enum to `available`, recording that it was used."""
+        d = dict(d)
+        legacy_state = "state" in d
+        if d.get("available") is None and legacy_state:
             d["available"] = d["state"] != "external_source"
+        # Always overwrite so a client cannot spoof the record via the wire.
+        d["legacy_state_used"] = legacy_state or None
         return d
 
-    class Config(BaseConfig):
+    class Config(SendspinConfig):
         """Config for parsing json messages."""
 
         omit_none = True
@@ -314,13 +352,13 @@ class ClientStateMessage(ClientMessage):
 
 # Client -> Server: client/command
 @dataclass
-class ClientCommandPayload(DataClassORJSONMixin):
+class ClientCommandPayload(SendspinModel):
     """Client sends commands to the server."""
 
     controller: ControllerCommandPayload | None = None
     """Controller commands - only if client has controller role."""
 
-    class Config(BaseConfig):
+    class Config(SendspinConfig):
         """Config for parsing json messages."""
 
         omit_none = True
@@ -336,7 +374,7 @@ class ClientCommandMessage(ClientMessage):
 
 # Client -> Server: client/goodbye
 @dataclass
-class ClientGoodbyePayload(DataClassORJSONMixin):
+class ClientGoodbyePayload(SendspinModel):
     """Payload for client goodbye message."""
 
     reason: GoodbyeReason
@@ -353,7 +391,7 @@ class ClientGoodbyeMessage(ClientMessage):
 
 # Server -> Client: server/hello
 @dataclass
-class ServerHelloPayload(DataClassORJSONMixin):
+class ServerHelloPayload(SendspinModel):
     """Information about the server."""
 
     name: str
@@ -375,7 +413,7 @@ class ServerHelloMessage(ServerMessage):
 # serializes and sends it; our own client always speaks the encrypted path and so
 # never deserializes it.
 @dataclass
-class LegacyServerHelloPayload(DataClassORJSONMixin):
+class LegacyServerHelloPayload(SendspinModel):
     """Server identity for a legacy unencrypted connection (no server/activate)."""
 
     server_id: str
@@ -391,14 +429,14 @@ class LegacyServerHelloPayload(DataClassORJSONMixin):
     selected_pair_method: PairMethod | None = None
     """Pairing method the server picked; present when connection_reason is 'pairing'."""
 
-    class Config(BaseConfig):
+    class Config(SendspinConfig):
         """Config for parsing json messages."""
 
         omit_none = True
 
 
 @dataclass
-class LegacyServerHelloMessage(DataClassORJSONMixin):
+class LegacyServerHelloMessage(SendspinModel):
     """Legacy server/hello for transition-mode (unencrypted) clients."""
 
     payload: LegacyServerHelloPayload
@@ -407,7 +445,25 @@ class LegacyServerHelloMessage(DataClassORJSONMixin):
 
 # Server -> Client: server/activate
 @dataclass
-class ServerActivatePayload(DataClassORJSONMixin):
+class ActivatePairing(SendspinModel):
+    """Parameters of the pairing attempt a server/activate admits."""
+
+    method: PairMethod
+    """Pairing method the server picked, drawn from the client's supported_pair_methods."""
+    pin_length: int | None = None
+    """The dynamic PIN length for this session. Required for dynamic_pin; absent otherwise."""
+    languages: list[str] | None = None
+    """BCP 47 tags in descending operator preference, for spoken PIN emission. Optional
+    for dynamic_pin; absent otherwise."""
+
+    class Config(SendspinConfig):
+        """Config for parsing json messages."""
+
+        omit_none = True
+
+
+@dataclass
+class ServerActivatePayload(SendspinModel):
     """Declares the server's current purpose on this connection."""
 
     activities: list[Activity]
@@ -416,10 +472,10 @@ class ServerActivatePayload(DataClassORJSONMixin):
     """Versioned role IDs active for this client (e.g., 'player@v1'). Required on
     connections capable of playback; absent otherwise. Persists across subsequent
     server/activate messages that omit it."""
-    selected_pair_method: PairMethod | None = None
-    """Pairing method the server picked. Required when 'pairing' is in activities."""
+    pairing: ActivatePairing | None = None
+    """Parameters of the admitted pairing attempt. Required when 'pairing' is in activities."""
 
-    class Config(BaseConfig):
+    class Config(SendspinConfig):
         """Config for parsing json messages."""
 
         omit_none = True
@@ -435,7 +491,7 @@ class ServerActivateMessage(ServerMessage):
 
 # Server -> Client: server/time
 @dataclass
-class ServerTimePayload(DataClassORJSONMixin):
+class ServerTimePayload(SendspinModel):
     """Timing information from the server."""
 
     client_transmitted: int
@@ -456,7 +512,7 @@ class ServerTimeMessage(ServerMessage):
 
 # Server -> Client: server/state
 @dataclass
-class ServerStatePayload(DataClassORJSONMixin):
+class ServerStatePayload(SendspinModel):
     """Server sends state updates to the client."""
 
     metadata: SessionUpdateMetadata | None | UndefinedField = field(default_factory=undefined_field)
@@ -468,7 +524,7 @@ class ServerStatePayload(DataClassORJSONMixin):
     color: SessionUpdateColor | None | UndefinedField = field(default_factory=undefined_field)
     """Color state - only sent to clients with color role."""
 
-    class Config(BaseConfig):
+    class Config(SendspinConfig):
         """Config for parsing json messages."""
 
         omit_default = True
@@ -491,7 +547,7 @@ class ServerStateMessage(ServerMessage):
 
 # Server -> Client: group/update
 @dataclass
-class GroupUpdateServerPayload(DataClassORJSONMixin):
+class GroupUpdateServerPayload(SendspinModel):
     """State update of the group this client is part of."""
 
     playback_state: PlaybackStateType | None = None
@@ -501,7 +557,7 @@ class GroupUpdateServerPayload(DataClassORJSONMixin):
     group_name: str | None = None
     """Friendly name of the group."""
 
-    class Config(BaseConfig):
+    class Config(SendspinConfig):
         """Config for parsing json messages."""
 
         omit_none = True
@@ -525,13 +581,15 @@ class GroupUpdateServerMessage(ServerMessage):
 
 # Server -> Client: server/command
 @dataclass
-class ServerCommandPayload(DataClassORJSONMixin):
+class ServerCommandPayload(SendspinModel):
     """Server sends commands to the client."""
 
     player: PlayerCommandPayload | None = None
     """Player commands - only sent to clients with player role."""
+    source: SourceCommandServerPayload | None = None
+    """Source command - only sent to clients with source role."""
 
-    class Config(BaseConfig):
+    class Config(SendspinConfig):
         """Config for parsing json messages."""
 
         omit_none = True
@@ -583,7 +641,7 @@ def _deserialize_stream_start_visualizer(
 
 # Server -> Client: stream/start
 @dataclass
-class StreamStartPayload(DataClassORJSONMixin):
+class StreamStartPayload(SendspinModel):
     """Information about an active streaming session."""
 
     server_transmitted: int = 0
@@ -609,7 +667,7 @@ class StreamStartPayload(DataClassORJSONMixin):
     get the draft schema. Roles emit whichever matches their negotiated wire.
     """
 
-    class Config(BaseConfig):
+    class Config(SendspinConfig):
         """Config for parsing json messages."""
 
         omit_none = True
@@ -632,7 +690,7 @@ STREAM_END_ROLE_FAMILIES = frozenset({"player", "artwork", "visualizer"})
 
 # Server -> Client: stream/clear
 @dataclass
-class StreamClearPayload(DataClassORJSONMixin):
+class StreamClearPayload(SendspinModel):
     """Instructs clients to clear buffers without ending the stream."""
 
     server_transmitted: int = 0
@@ -656,7 +714,7 @@ class StreamClearPayload(DataClassORJSONMixin):
                     f"application roles, got invalid roles: {invalid}"
                 )
 
-    class Config(BaseConfig):
+    class Config(SendspinConfig):
         """Config for parsing json messages."""
 
         omit_none = True
@@ -672,7 +730,7 @@ class StreamClearMessage(ServerMessage):
 
 # Client -> Server: stream/request-format
 @dataclass
-class StreamRequestFormatPayload(DataClassORJSONMixin):
+class StreamRequestFormatPayload(SendspinModel):
     """Request different stream format (upgrade or downgrade)."""
 
     player: StreamRequestFormatPlayer | None = None
@@ -682,7 +740,7 @@ class StreamRequestFormatPayload(DataClassORJSONMixin):
     visualizer: StreamRequestFormatVisualizer | None = None
     """Visualizer format request (only for clients with visualizer role)."""
 
-    class Config(BaseConfig):
+    class Config(SendspinConfig):
         """Config for parsing json messages."""
 
         omit_none = True
@@ -698,7 +756,7 @@ class StreamRequestFormatMessage(ClientMessage):
 
 # Server -> Client: stream/end
 @dataclass
-class StreamEndPayload(DataClassORJSONMixin):
+class StreamEndPayload(SendspinModel):
     """Payload for stream/end message."""
 
     server_transmitted: int = 0
@@ -722,7 +780,7 @@ class StreamEndPayload(DataClassORJSONMixin):
                     f"application roles, got invalid roles: {invalid}"
                 )
 
-    class Config(BaseConfig):
+    class Config(SendspinConfig):
         """Config for parsing json messages."""
 
         omit_none = True

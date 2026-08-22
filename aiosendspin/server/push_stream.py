@@ -45,6 +45,10 @@ _LOGGER = logging.getLogger(__name__)
 DEFAULT_INITIAL_DELAY_US = 250_000  # 250ms
 # Pre-roll amount for catch-up encoding to absorb codec startup delay.
 ENCODER_CATCHUP_WARMUP_US = 120_000
+# Source audio encoded between yields while replaying the PCM cache. The cache holds
+# everything the producer has buffered ahead (tens of seconds), so encoding it in one
+# step would stall the loop and starve the live commit that keeps the timeline moving.
+_PCM_SEQUENCE_YIELD_INTERVAL_US = 500_000
 # Dithering policy when reducing to 16-bit integer PCM.
 _DITHER_METHOD_TRIANGULAR_HP = "triangular_hp"
 # Maximum allowed drift between transformer's internal timeline and the expected output
@@ -702,9 +706,10 @@ class PushStream:
         self._clock = clock
         self._group = group
         self._is_stopped = False
-        # Whether the audio source is realtime (live) vs buffered. Live sources
-        # honor min_buffer_ms at startup since the queue cannot grow after
-        # playback begins. Buffered sources skip the min_buffer startup wait.
+        # Whether the audio source is realtime (live) vs buffered. Both honor
+        # min_buffer_ms at startup; buffered sources may raise that floor to
+        # required_lead_time_ms, since only a buffered queue can keep growing
+        # after playback begins and absorb the extra lead.
         # Default to buffered; callers opt into live via set_live_source(True).
         self._is_live: bool = False
         # Monotonic lifecycle token used to invalidate in-flight commit work on stop().
@@ -848,10 +853,11 @@ class PushStream:
     def set_live_source(self, is_live: bool) -> None:  # noqa: FBT001
         """Configure whether subsequent stream startups treat audio as live or buffered.
 
-        Buffered (default): startup uses only required_lead_time_ms since the
-        queue can grow naturally after playback begins. Live: startup waits for
-        min_buffer_ms so the jitter buffer is filled before playback, since a
-        realtime source cannot grow the queue after start.
+        Both wait for min_buffer_ms at startup so the jitter buffer is filled
+        before playback. Buffered (default) raises that floor to
+        required_lead_time_ms when it is larger, which costs no lasting latency
+        because the queue keeps growing after playback begins; a live source
+        cannot grow its queue, so the extra lead would be permanent.
 
         Call before the first commit_audio of a new stream session so the startup
         anchor uses the right floor.
@@ -996,11 +1002,11 @@ class PushStream:
     ) -> int:
         """Return a safe minimum playback timestamp for late-join replay."""
         now_us = self._clock.now_us()
-        delay_us = role.get_static_delay_us() if role is not None else 0
-        effective_lead_us = max(0, min_lead_us)
         if role is not None:
-            effective_lead_us = max(effective_lead_us, role.get_required_lead_time_us())
-        target_us = now_us + effective_lead_us + delay_us
+            effective_lead_us = max(min_lead_us, self._role_send_ahead_us(role))
+        else:
+            effective_lead_us = max(0, min_lead_us)
+        target_us = now_us + effective_lead_us
         if align_to_channel_tail and channel_id is not None and channel_id in self._channel_timing:
             # For channels that currently have no other subscribers, anchor catch-up
             # to that channel's own live tail when it is near real time. If that tail
@@ -2141,7 +2147,7 @@ class PushStream:
         )
         self._channel_timing_residue[channel_id] = 0
 
-    def _encode_pcm_sequence(
+    async def _encode_pcm_sequence(
         self,
         pcm_chunks: list[CachedPCMChunk],
         encoder: AudioTransformer | None,
@@ -2153,6 +2159,9 @@ class PushStream:
     ) -> list[CachedChunk]:
         """Resample PCM chunks to the target format and encode them sequentially.
 
+        Yields periodically so a deep cache does not stall the loop. Output timestamps
+        come from the cached chunks, so they are unaffected by when the work runs.
+
         Pass `resamplers`/`quantizers` to share state across calls (single resampler
         instance per key reused between batches).
         """
@@ -2163,8 +2172,14 @@ class PushStream:
         if quantizers is None:
             quantizers = {}
         prev_resampler_key: _ResamplerKey | None = None
+        since_yield_us = 0
 
         for chunk in pcm_chunks:
+            since_yield_us += chunk.duration_us
+            if since_yield_us >= _PCM_SEQUENCE_YIELD_INTERVAL_US:
+                since_yield_us = 0
+                await asyncio.sleep(0)
+
             source_format = AudioFormat(
                 sample_rate=chunk.sample_rate,
                 bit_depth=chunk.bit_depth,
@@ -2271,7 +2286,7 @@ class PushStream:
         resamplers: dict[_ResamplerKey, _ResamplerState] | None = None,
         quantizers: dict[_ResamplerKey, _ResamplerState] | None = None,
     ) -> list[CachedChunk]:
-        return self._encode_pcm_sequence(
+        return await self._encode_pcm_sequence(
             pcm_chunks,
             encoder,
             req,

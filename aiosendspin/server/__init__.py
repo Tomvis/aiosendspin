@@ -10,6 +10,8 @@ __all__ = [
     "AudioCodec",
     "AudioFormat",
     "ClientAddedEvent",
+    "ClientConnectedEvent",
+    "ClientDisconnectedEvent",
     "ClientEvent",
     "ClientGroupChangedEvent",
     "ClientRemovedEvent",
@@ -31,11 +33,16 @@ __all__ = [
     "SendspinEvent",
     "SendspinGroup",
     "SendspinServer",
+    "SignalState",
+    "SourceSignalChangedEvent",
+    "SourceStream",
+    "SourceStreamEndedEvent",
+    "SourceStreamStartedEvent",
     "StaticDelayChangedEvent",
     "VolumeChangedEvent",
 ]
 
-from aiosendspin.models.types import AudioCodec
+from aiosendspin.models.types import AudioCodec, SignalState
 
 from .audio import AudioFormat
 from .client import ConnectionSecurity, DisconnectBehaviour, SendspinClient
@@ -59,8 +66,16 @@ from .roles.player.events import (
     StaticDelayChangedEvent,
     VolumeChangedEvent,
 )
+from .roles.source import (
+    SourceSignalChangedEvent,
+    SourceStream,
+    SourceStreamEndedEvent,
+    SourceStreamStartedEvent,
+)
 from .server import (
     ClientAddedEvent,
+    ClientConnectedEvent,
+    ClientDisconnectedEvent,
     ClientRemovedEvent,
     ClientUpdatedEvent,
     ExternalStreamStartCallback,

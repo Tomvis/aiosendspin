@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Callable, Sequence
 from contextlib import suppress
 
 from aiohttp import ClientSession, web
@@ -18,7 +18,8 @@ from aiosendspin.models.core import (
     ServerStatePayload,
     StreamStartMessage,
 )
-from aiosendspin.models.player import ClientHelloPlayerSupport
+from aiosendspin.models.player import ClientHelloPlayerSupport, SupportedAudioFormat
+from aiosendspin.models.source import ClientHelloSourceSupport
 from aiosendspin.models.types import (
     Activity,
     GoodbyeReason,
@@ -32,12 +33,16 @@ from aiosendspin.models.visualizer import ClientHelloVisualizerSupport, Visualiz
 from aiosendspin.noise.driver import HandshakeAbortedError
 from aiosendspin.noise.keys import Identity
 from aiosendspin.noise.pairing import PairingError
+from aiosendspin.noise.session import NoiseCipherSuite
 from aiosendspin.noise.trust_store import ClientPairingStore, ResolvedPsk
 
 from .connection import DECODABLE_CODECS, UNSYNCED_PLAY_LEAD_US, SendspinConnection
-from .models import AudioFormat, ServerInfo
+from .models import AudioFormat, PairingSupport, PinDisplay, PinSpeaker, ServerInfo
+from .source import SourceCapture
 
 logger = logging.getLogger(__name__)
+
+_PAIRING_WINDOW_LIFETIME_S: float = 300.0
 
 
 def _validate_decodable_formats(player_support: ClientHelloPlayerSupport) -> None:
@@ -80,7 +85,10 @@ AudioChunkCallback = Callable[[int, bytes, AudioFormat], None]
 # Callback invoked when the client disconnects from the server.
 DisconnectCallback = Callable[[], None]
 
-# Callback invoked when server sends player commands (volume, mute).
+# Callback invoked with the abort reason when a non-closing pairing attempt ends.
+PairingAbortCallback = Callable[[PairAbortReason], None]
+
+# Callback invoked when the server sends a command.
 ServerCommandCallback = Callable[[ServerCommandPayload], None]
 
 # Callback invoked when visualizer frames are received. Beat events are
@@ -117,6 +125,8 @@ class SendspinClient:
     """Artwork capabilities (only set if ARTWORK role is supported)."""
     _visualizer_support: ClientHelloVisualizerSupport | None
     """Visualizer capabilities (only set if VISUALIZER role is supported)."""
+    _source_support: ClientHelloSourceSupport | None
+    """Source capabilities."""
     _session: ClientSession | None
     """Optional aiohttp ClientSession for WebSocket connection."""
 
@@ -141,6 +151,15 @@ class SendspinClient:
     _admission_lock: asyncio.Lock
     """Serializes the admit/displace decision across concurrent connections."""
 
+    _pairing_support: PairingSupport | None
+    """Operator wiring whose presence enables the PIN methods, if configured."""
+    _pairing_window_opened: asyncio.Event
+    """Set when a pairing window opens; wakes a gated attempt's wait."""
+    _pairing_window_deadline: float | None = None
+    """Loop-time deadline of the open pairing window, if one is open."""
+    _pairing_window_waiters: int = 0
+    """Gated attempts currently waiting for a window; refcounts the gesture prompt."""
+
     last_playback_server_id: str | None = None
     """server_id of the last server admitted with the playback activity; the discovery tiebreak."""
 
@@ -162,6 +181,8 @@ class SendspinClient:
     """Callbacks invoked when audio chunks are received."""
     _disconnect_callbacks: list[DisconnectCallback]
     """Callbacks invoked when the client disconnects."""
+    _pairing_abort_callbacks: list[PairingAbortCallback]
+    """Callbacks invoked when a non-closing pairing attempt ends with an abort reason."""
     _server_command_callbacks: list[ServerCommandCallback]
     """Callbacks invoked when server sends player commands."""
     _visualizer_callbacks: list[VisualizerCallback]
@@ -187,6 +208,7 @@ class SendspinClient:
         player_support: ClientHelloPlayerSupport | None = None,
         artwork_support: ClientHelloArtworkSupport | None = None,
         visualizer_support: ClientHelloVisualizerSupport | None = None,
+        source_support: ClientHelloSourceSupport | None = None,
         session: ClientSession | None = None,
         static_delay_ms: float = 0.0,
         required_lead_time_ms: float = 250.0,
@@ -194,9 +216,9 @@ class SendspinClient:
         initial_volume: int = 100,
         initial_muted: bool = False,
         state_supported_commands: list[PlayerCommand] | None = None,
-        pin_display: Callable[[str | None], Awaitable[None]] | None = None,
-        pairing_window: Callable[[], Awaitable[None]] | None = None,
+        pairing_support: PairingSupport | None = None,
         clock: Clock | None = None,
+        cipher_suite: NoiseCipherSuite = NoiseCipherSuite.CHACHAPOLY,
     ) -> None:
         """Create a new Sendspin client instance."""
         self._identity = identity
@@ -205,9 +227,9 @@ class SendspinClient:
         self._device_info = device_info
         self._roles = list(roles)
         self._pairing_store = pairing_store
-        self._pin_display = pin_display
-        self._pairing_window = pairing_window
+        self._pairing_support = pairing_support
         self._clock: Clock = clock or RawMonotonicClock()
+        self._cipher_suite = cipher_suite
 
         # Validate and store player support
         if Roles.PLAYER in self._roles:
@@ -233,6 +255,13 @@ class SendspinClient:
             self._visualizer_support = visualizer_support
         else:
             self._visualizer_support = None
+
+        if Roles.SOURCE in self._roles:
+            if source_support is None:
+                raise ValueError("source_support is required when SOURCE role is specified")
+            self._source_support = source_support
+        else:
+            self._source_support = None
         self._session = session
         self._owns_session = session is None
         self._loop = asyncio.get_running_loop()
@@ -245,6 +274,8 @@ class SendspinClient:
 
         self._provisional_connections = set()
         self._admission_lock = asyncio.Lock()
+        self._last_playback_loaded = False
+        self._pairing_window_opened = asyncio.Event()
 
         # Initialize callback lists
         self._metadata_callbacks = []
@@ -256,6 +287,7 @@ class SendspinClient:
         self._stream_clear_callbacks = []
         self._audio_chunk_callbacks = []
         self._disconnect_callbacks = []
+        self._pairing_abort_callbacks = []
         self._server_command_callbacks = []
         self._visualizer_callbacks = []
         self._artwork_callbacks = []
@@ -266,6 +298,11 @@ class SendspinClient:
     def identity(self) -> Identity:
         """This client's static public X25519 identity."""
         return self._identity
+
+    @property
+    def cipher_suite(self) -> NoiseCipherSuite:
+        """Noise cipher suite this client picks for its handshakes."""
+        return self._cipher_suite
 
     @property
     def client_name(self) -> str:
@@ -298,38 +335,108 @@ class SendspinClient:
         return self._visualizer_support
 
     @property
+    def source_support(self) -> ClientHelloSourceSupport | None:
+        """Source capabilities."""
+        return self._source_support
+
+    def create_source_capture(self, audio_format: SupportedAudioFormat) -> SourceCapture:
+        """Create a capture for PCM matching ``audio_format`` on the source connection."""
+        if Roles.SOURCE not in self._roles:
+            raise RuntimeError("Client does not have the source role")
+        if self._admitted_connection is None:
+            raise RuntimeError("Client is not connected")
+        return SourceCapture(self, self._admitted_connection, audio_format)
+
+    @property
     def pairing_store(self) -> ClientPairingStore:
         """Trust store holding the long-term records and Pairing PSKs."""
         return self._pairing_store
 
     @property
-    def pin_display(self) -> Callable[[str | None], Awaitable[None]] | None:
+    def pin_display(self) -> PinDisplay | None:
         """Out-channel that surfaces a derived pairing PIN, if configured.
 
         Called with the PIN string when one is derived, and with ``None`` when the
         pairing exchange ends (success or failure) so the channel can clear.
         """
-        return self._pin_display
+        return self._pairing_support.pin_display if self._pairing_support is not None else None
 
     @property
-    def pairing_window(self) -> Callable[[], Awaitable[None]] | None:
-        """Gesture gate for static-PIN pairing, if configured.
+    def pin_speaker(self) -> PinSpeaker | None:
+        """Spoken out-channel for a derived pairing PIN, if configured."""
+        return self._pairing_support.pin_speaker if self._pairing_support is not None else None
 
-        Awaited when a static-PIN attempt is selected; resolves once the operator
-        opens the pairing window, and is cancelled if the server ends the attempt
-        first. The callable owns the window lifetime: an expired window must not
-        resolve the wait. Its presence enables offering ``static_pin``.
+    @property
+    def pin_out_channels(self) -> tuple[str, ...]:
+        """Channels the dynamic PIN is conveyed through, in descriptor order."""
+        channels = []
+        if self.pin_display is not None:
+            channels.append("display")
+        if self.pin_speaker is not None:
+            channels.append("speaker")
+        return tuple(channels)
+
+    @property
+    def secret_locations(self) -> tuple[str, ...]:
+        """Where the operator finds a configured static secret, empty when undeclared."""
+        return self._pairing_support.secret_locations if self._pairing_support is not None else ()
+
+    @property
+    def pairing_window_open(self) -> bool:
+        """Whether a pairing window is currently open."""
+        deadline = self._pairing_window_deadline
+        return deadline is not None and self._loop.time() < deadline
+
+    async def await_pairing_window(self) -> None:
+        """Claim a pairing window for the caller's attempt, prompting for a gesture meanwhile."""
+        if self._claim_pairing_window():
+            return
+        support = self._pairing_support
+        prompt = support.gesture_prompt if support is not None else None
+        self._pairing_window_waiters += 1
+        try:
+            if self._pairing_window_waiters == 1 and prompt is not None:
+                await prompt(True)  # noqa: FBT003
+            while not self._claim_pairing_window():
+                self._pairing_window_opened.clear()
+                await self._pairing_window_opened.wait()
+        finally:
+            self._pairing_window_waiters -= 1
+            if self._pairing_window_waiters == 0 and prompt is not None:
+                await prompt(False)  # noqa: FBT003
+
+    def _claim_pairing_window(self) -> bool:
+        """Close an open pairing window for one attempt, reporting whether one was open."""
+        if not self.pairing_window_open:
+            return False
+        self.consume_pairing_window()
+        return True
+
+    def consume_pairing_window(self) -> None:
+        """Close the pairing window as a pairing attempt starts."""
+        self._pairing_window_deadline = None
+        self._pairing_window_opened.clear()
+
+    def open_pairing_window(self) -> None:
+        """Open a pairing window admitting one gesture-gated pairing attempt.
+
+        Called on an operator gesture, or by a paired server through
+        ``management/open-pairing-window``. A no-op while a window is already open.
         """
-        return self._pairing_window
+        if self.pairing_window_open:
+            return
+        self._pairing_window_deadline = self._loop.time() + _PAIRING_WINDOW_LIFETIME_S
+        self._pairing_window_opened.set()
 
     @property
     def implemented_pair_methods(self) -> frozenset[PairMethod]:
         """Pairing methods this client implements: each PIN method needs its wiring."""
         methods = {PairMethod.PAIRING_PSK}
-        if self._pairing_window is not None:
-            methods.add(PairMethod.STATIC_PIN)
-        if self._pin_display is not None:
-            methods.add(PairMethod.DYNAMIC_PIN)
+        if self._pairing_support is not None:
+            if self._pairing_support.offer_static_pin:
+                methods.add(PairMethod.STATIC_PIN)
+            if self.pin_out_channels:
+                methods.add(PairMethod.DYNAMIC_PIN)
         return frozenset(methods)
 
     @property
@@ -465,8 +572,13 @@ class SendspinClient:
             self._provisional_connections.discard(connection)
 
         # Hold the lock only for the admit decision, not for start()/pairing.
-        async with self._admission_lock:
-            await self._admit_connection(connection)
+        try:
+            async with self._admission_lock:
+                await self._admit_connection(connection)
+        except BaseException:
+            # Bring-up already dropped it from _provisional_connections, so nothing else owns it.
+            await connection.disconnect()
+            raise
         await connection.start()
 
     async def attach_websocket(
@@ -501,11 +613,17 @@ class SendspinClient:
             self._provisional_connections.discard(connection)
 
         # Hold the lock only for the admit/reject decision, not for start()/pairing.
-        async with self._admission_lock:
-            if not self._should_admit_connection(connection):
-                await self._reject_connection(connection)
-                return
-            await self._admit_connection(connection)
+        try:
+            async with self._admission_lock:
+                await self._ensure_last_playback_loaded()
+                if not self._should_admit_connection(connection):
+                    await self._reject_connection(connection)
+                    return
+                await self._admit_connection(connection)
+        except BaseException:
+            # Bring-up already dropped it from _provisional_connections, so nothing else owns it.
+            await connection.disconnect()
+            raise
         try:
             await connection.start()
         except (PairingError, OSError, RuntimeError, TimeoutError) as exc:
@@ -560,24 +678,38 @@ class SendspinClient:
             )
         return True
 
+    async def _ensure_last_playback_loaded(self) -> None:
+        """Load the persisted last-playback server once, seeding the discovery tiebreak."""
+        if self._last_playback_loaded:
+            return
+        if self.last_playback_server_id is None:
+            self.last_playback_server_id = await self._pairing_store.get_last_playback_server_id()
+        self._last_playback_loaded = True
+
     async def _admit_connection(self, connection: SendspinConnection) -> None:
         """Make ``connection`` the admitted one, displacing any prior holder."""
         previous = self._admitted_connection
         if previous is connection:
             return
+        await self._record_last_playback(connection)
         self._admitted_connection = connection
-        self.note_playback_activity(connection)
         if previous is not None:
             await self._dismiss_connection(previous, GoodbyeReason.ANOTHER_SERVER)
             await previous.disconnect()
 
-    def note_playback_activity(self, connection: SendspinConnection) -> None:
+    async def note_playback_activity(self, connection: SendspinConnection) -> None:
         """Record the admitted server as last-playback when it carries the playback activity."""
+        if connection is self._admitted_connection:
+            await self._record_last_playback(connection)
+
+    async def _record_last_playback(self, connection: SendspinConnection) -> None:
+        """Persist the last-playback server before caching it, so a failed write retries."""
         if (
-            connection is self._admitted_connection
-            and Activity.PLAYBACK in connection.activities
+            Activity.PLAYBACK in connection.activities
             and connection.server_id is not None
+            and connection.server_id != self.last_playback_server_id
         ):
+            await self._pairing_store.set_last_playback_server_id(connection.server_id)
             self.last_playback_server_id = connection.server_id
 
     async def _reject_connection(self, connection: SendspinConnection) -> None:
@@ -610,12 +742,29 @@ class SendspinClient:
         volume: int,
         muted: bool,
     ) -> None:
-        """Send the current player state to the server."""
+        """Send player state, including client availability.
+
+        Player clients can report availability here. Use ``send_available()`` when no
+        player fields changed.
+        """
         if self._admitted_connection is None:
             raise RuntimeError("Client is not connected")
         await self._admitted_connection.send_player_state(
             available=available, volume=volume, muted=muted
         )
+
+    async def send_available(self, *, available: bool) -> None:
+        """Report whether this client can participate in Sendspin.
+
+        Use this for non-player clients or when no player fields changed.
+        An active source stream ends before the client reports unavailable.
+
+        Args:
+            available: True when operational and ready, False when unavailable.
+        """
+        if self._admitted_connection is None:
+            raise RuntimeError("Client is not connected")
+        await self._admitted_connection.send_available(available=available)
 
     async def send_group_command(
         self,
@@ -788,6 +937,19 @@ class SendspinClient:
             else None
         )
 
+    def add_pairing_abort_listener(self, callback: PairingAbortCallback) -> Callable[[], None]:
+        """Add a listener for non-closing pairing aborts.
+
+        Returns:
+            A function that removes this listener when called.
+        """
+        self._pairing_abort_callbacks.append(callback)
+        return lambda: (
+            self._pairing_abort_callbacks.remove(callback)
+            if callback in self._pairing_abort_callbacks
+            else None
+        )
+
     def add_server_command_listener(self, callback: ServerCommandCallback) -> Callable[[], None]:
         """Add a listener for server command events.
 
@@ -891,6 +1053,14 @@ class SendspinClient:
                 callback()
             except Exception:
                 logger.exception("Error in disconnect callback %s", callback)
+
+    def notify_pairing_abort_callback(self, reason: PairAbortReason) -> None:
+        """Dispatch a non-closing pairing abort to the registered listeners."""
+        for callback in list(self._pairing_abort_callbacks):
+            try:
+                callback(reason)
+            except Exception:
+                logger.exception("Error in pairing abort callback %s", callback)
 
     def notify_server_command_callback(self, payload: ServerCommandPayload) -> None:
         """Dispatch a server/command to the registered listeners."""

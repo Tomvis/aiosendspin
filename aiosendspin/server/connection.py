@@ -38,17 +38,21 @@ from collections import defaultdict, deque
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
+from functools import partial
 from typing import TYPE_CHECKING, Any, cast
 
 import orjson
 from aiohttp import ClientWebSocketResponse, WSMessage, WSMsgType, web
 
+from aiosendspin.models import BINARY_HEADER_SIZE, unpack_binary_header
 from aiosendspin.models.core import (
+    ActivatePairing,
     ClientCommandMessage,
     ClientGoodbyeMessage,
     ClientHelloMessage,
     ClientHelloPayload,
     ClientStateMessage,
+    ClientStatePayload,
     ClientTimeMessage,
     LegacyServerHelloMessage,
     LegacyServerHelloPayload,
@@ -68,6 +72,7 @@ from aiosendspin.models.management import (
     ManagementAddRecordPayload,
     ManagementGetPairingConfigMessage,
     ManagementListRecordsMessage,
+    ManagementOpenPairingWindowMessage,
     ManagementRemoveRecordMessage,
     ManagementRemoveRecordPayload,
     ManagementResultData,
@@ -78,6 +83,10 @@ from aiosendspin.models.management import (
     RecordSummary,
     ServerUnpairMessage,
     StorageAccounting,
+)
+from aiosendspin.models.source import (
+    ClientStreamEndMessage,
+    ClientStreamStartMessage,
 )
 from aiosendspin.models.types import (
     CLOSING_ABORT_REASONS,
@@ -106,6 +115,7 @@ from aiosendspin.noise.pairing import (
     PairingAbortError,
     PairingAttempt,
     PairingError,
+    PairingTimeoutError,
     abort_pairing,
     run_dynamic_pin_server,
     run_pairing_psk_server,
@@ -118,9 +128,10 @@ from aiosendspin.noise.wire import EncryptedWebSocket
 from aiosendspin.util import create_task
 
 from .client import SendspinClient
+from .compliance import ClientComplianceError
 from .events import ClientEvent, ClientGroupChangedEvent, GroupEvent, GroupStateChangedEvent
 from .roles.negotiation import negotiate_roles
-from .roles.registry import ROLE_FACTORIES, ROLE_SUPPORT_SPECS
+from .roles.registry import ROLE_FACTORIES, ROLE_SUPPORT_SPECS, role_requires_pairing
 
 if TYPE_CHECKING:
     from .audio import BufferTracker
@@ -142,6 +153,7 @@ QUIESCE_TIMEOUT_S: float = 30.0
 
 _PAIRING_MESSAGE_TYPES: frozenset[str] = frozenset(
     {
+        "client/pair-pending",
         "client/pair-init",
         "client/pair-finalize",
         "client/pair-auth",
@@ -154,6 +166,7 @@ _PAIR_TRANSITION_TYPES: frozenset[str] = frozenset(
     {
         "noise/handshake",
         "client/hello",
+        "client/pair-pending",
         "client/pair-init",
         "client/pair-finalize",
         "client/pair-auth",
@@ -298,6 +311,11 @@ class SendspinConnection:
 
         self._initial_state_received = False
         self._initial_state_timeout_handle: asyncio.TimerHandle | None = None
+        # Binary held while a role that receives binary awaits the initial client/state.
+        # The spec forbids sending binary before it; flushed once the state arrives.
+        # Each entry carries the role's epoch at buffer time so a stream boundary
+        # in the meantime (which bumps the epoch) discards it instead of replaying.
+        self._pending_binary: list[tuple[str, int, Callable[[], None]]] = []
 
         self._last_goodbye_reason: GoodbyeReason | None = None
         self._epoch_by_role: defaultdict[str, int] = defaultdict(int)
@@ -358,6 +376,34 @@ class SendspinConnection:
             return False
         return any(role.requires_initial_state() for role in self._client.active_roles)
 
+    def _flush_pending_binary(self) -> None:
+        """Enqueue binary held until the initial client/state arrived, dropping stale entries."""
+        pending, self._pending_binary = self._pending_binary, []
+        for role, epoch, send in pending:
+            # A stream boundary during the wait bumped the epoch; that data is stale.
+            if epoch == self._epoch_by_role[role]:
+                send()
+
+    def _flag_initial_state_deviations(self, payload: ClientStatePayload) -> None:
+        """Flag spec requirements the initial client/state must satisfy but does not."""
+        reasons: list[str] = []
+        if payload.available is None:
+            reasons.append("omitted the required 'available' field")
+        if self._client is not None:
+            for role in self._client.active_roles:
+                reasons.extend(role.initial_state_deviations(payload))
+        for reason in reasons:
+            self._flag_noncompliance(f"initial client/state {reason}")
+
+    def _flag_inactive_role_payloads(self, kind: str, present: dict[str, object]) -> None:
+        """Flag role objects sent for a family the client has no active role in."""
+        if self._client is None:
+            return
+        active = {role.role_family for role in self._client.active_roles}
+        for family, obj in present.items():
+            if obj is not None and family not in active:
+                self._flag_noncompliance(f"{kind} carried a {family} object for an inactive role")
+
     def drop_pending_binary(self, roles: list[str] | None) -> None:
         """Drop queued binary payloads for the specified roles.
 
@@ -392,6 +438,27 @@ class SendspinConnection:
             buffer_byte_count: Byte count for buffer tracking.
             duration_us: Duration for buffer tracking.
         """
+        if self.requires_initial_state() and not self._initial_state_received:
+            # No binary before the client's initial state; replay once it arrives,
+            # tagged with the current epoch so a stream boundary can invalidate it.
+            self._pending_binary.append(
+                (
+                    role,
+                    self._epoch_by_role[role],
+                    partial(
+                        self.send_binary,
+                        data,
+                        role=role,
+                        timestamp_us=timestamp_us,
+                        message_type=message_type,
+                        buffer_end_time_us=buffer_end_time_us,
+                        buffer_byte_count=buffer_byte_count,
+                        duration_us=duration_us,
+                    ),
+                )
+            )
+            return
+
         if self._is_role_queue_full(role):
             self._disconnect_due_to_queue_overflow(
                 f"Role queue full for {role} ({len(self._role_queues.get(role, []))}/"
@@ -572,16 +639,18 @@ class SendspinConnection:
         if self._initial_state_received:
             return
         self._initial_state_timeout_handle = None
-        self._logger.warning(
-            "Client %s failed to send required initial state within timeout (spec violation)",
-            self._client_id or "unknown",
-        )
-        # Be lenient: keep the connection and mark the client as connected anyway.
-        # Some clients may not send an initial state update promptly.
+        try:
+            self._flag_noncompliance("did not send the required initial client/state in time")
+        except ClientComplianceError:
+            # A timer callback can't propagate into the message loop, so tear down here.
+            create_task(self.disconnect(retry_connection=False))
+            return
+        # Lenient: keep the connection and mark the client connected anyway.
         if self._client is not None:
             self._initial_state_received = True
             self._client.mark_connected()
             self._server.on_client_first_connect(self._client.client_id)
+            self._flush_pending_binary()
 
     @staticmethod
     def _first_registered_role_id_in_family(
@@ -815,6 +884,7 @@ class SendspinConnection:
         assert transport is not None
 
         if not self.is_encrypted:
+            # Non-spec transition path: the legacy hello replaces server/hello plus activate.
             assert self._pending_first_text is not None
             client_hello_text = self._pending_first_text
             self._pending_first_text = None
@@ -851,10 +921,14 @@ class SendspinConnection:
                 try:
                     if not await self._pair(transport):
                         return False
+                except PairingTimeoutError as exc:
+                    # Timeout waiting for client; the connection stays open for a retry.
+                    self._logger.debug("Initial-connect pairing timed out: %s", exc)
+                    self._pairing_attempt = None
                 except PairingAbortError as exc:
                     if exc.reason in CLOSING_ABORT_REASONS:
                         raise
-                    # Non-closing abort reason: the connection stays open for a retry.
+                    # Non-closing abort reason; the connection stays open for a retry.
                     self._logger.debug("Initial-connect pairing aborted: %s", exc)
                     self._pairing_attempt = None
             await self._activate()
@@ -877,8 +951,30 @@ class SendspinConnection:
         client_hello_text = await receive_text_frame(transport, what="client/hello")
         return await self._ingest_client_hello(client_hello_text)
 
+    def _flag_noncompliance(self, reason: str) -> None:
+        """Log a tolerated spec violation, or reject it when the server is strict.
+
+        Usable during the hello exchange before a persistent client exists; once
+        attached, delegates to the client so its logger carries the client_id.
+        """
+        if self._client is not None:
+            self._client.flag_noncompliance(reason)
+            return
+        if not self._server.allow_noncompliant_clients:
+            self._logger.error("rejecting non-compliant client: %s", reason)
+            raise ClientComplianceError(reason)
+        self._logger.warning("non-compliant client: %s", reason)
+
     async def _ingest_client_hello(self, text: str) -> bool:
         """Validate and record the client/hello, attaching the client; False if rejected."""
+        try:
+            return await self._ingest_client_hello_checked(text)
+        except ClientComplianceError:
+            await self.disconnect(retry_connection=False)
+            return False
+
+    async def _ingest_client_hello_checked(self, text: str) -> bool:
+        """Body of the hello exchange; raises ClientComplianceError in strict mode."""
         try:
             message = self._deserialize_client_message(text)
         except (LookupError, TypeError, ValueError) as exc:
@@ -900,6 +996,10 @@ class SendspinConnection:
             )
             await self.disconnect(retry_connection=False)
             return False
+        # Encrypted clients carry version in client/init, so only an unencrypted
+        # hello is required to include it.
+        if not self.is_encrypted and client_info.version is None:
+            self._flag_noncompliance("unencrypted client/hello omitted required version")
         # The Noise handshake sets client_id (authenticated); a legacy client
         # instead carries it in the hello payload.
         client_id = self._client_id or client_info.client_id
@@ -914,9 +1014,21 @@ class SendspinConnection:
 
         self._client_info = client_info
         self._client_id = client_id
-        self._negotiated_roles = negotiate_roles(client_info.supported_roles)
+        self._negotiated_roles = negotiate_roles(
+            client_info.supported_roles, strict=not self._server.allow_noncompliant_clients
+        )
         self._logger = logger.getChild(client_id)
         self._logger.debug("Received client/hello: %s", client_info)
+        if client_info.legacy_support_keys_used:
+            self._flag_noncompliance(
+                "client/hello used unversioned support keys: "
+                + ", ".join(client_info.legacy_support_keys_used)
+            )
+        if client_info.unlisted_support_roles:
+            self._flag_noncompliance(
+                "client/hello sent support objects for unlisted roles: "
+                + ", ".join(client_info.unlisted_support_roles)
+            )
         if unimplemented := self._unimplemented_roles(client_info.supported_roles):
             self._logger.info(
                 "Client offered roles/versions this server does not implement: %s", unimplemented
@@ -930,7 +1042,8 @@ class SendspinConnection:
         if self._client is None:
             client = self._server.get_or_create_client(client_id)
             if not self.is_encrypted:
-                initial_active = self._negotiated_roles  # legacy: no activation filtering
+                # Legacy unencrypted is never paired, so drop pairing-required roles.
+                initial_active = self._filter_pairing_roles(self._negotiated_roles)
             elif self._is_pairing():
                 initial_active = []
             else:
@@ -999,11 +1112,22 @@ class SendspinConnection:
         )
 
     @property
+    def _is_long_term_paired(self) -> bool:
+        """Whether the connection was admitted by a long-term Sendspin PSK (trust ``user``)."""
+        return self._noise_psk is not None and self._noise_psk.category is PskCategory.LONG_TERM
+
+    def _filter_pairing_roles(self, role_ids: list[str]) -> list[str]:
+        """Drop roles that require pairing unless the connection is long-term paired."""
+        if self._is_long_term_paired:
+            return role_ids
+        return [rid for rid in role_ids if not role_requires_pairing(rid)]
+
+    @property
     def _roles_to_activate(self) -> list[str]:
         """Active roles to advertise — the negotiated set when playback-capable, else empty."""
         if not self._playback_capable:
             return []
-        return self._negotiated_roles
+        return self._filter_pairing_roles(self._negotiated_roles)
 
     @property
     def _desired_activities(self) -> list[Activity]:
@@ -1075,6 +1199,7 @@ class SendspinConnection:
         """Run a pairing attempt on a connection.
 
         A pair abort raises and leaves the connection for a retry or ``end_pairing``.
+        A server-side timeout raises after leaving pairing, also keeping the connection.
         Any other failure propagates for the caller to disconnect.
         """
         if self._pairing_attempt is not None:
@@ -1101,6 +1226,12 @@ class SendspinConnection:
             if current_task is not None and current_task.cancelling():
                 # Our own cancellation was forwarded into the child and converted; restore it.
                 raise asyncio.CancelledError from None
+            raise
+        except PairingTimeoutError:
+            # A server has no pair/abort reason for its own timeout: cancel the attempt in
+            # band with the leave activate (best-effort; the client may be gone).
+            with suppress(Exception):
+                await self._leave_pairing()
             raise
         finally:
             self._pairing_attempt = None
@@ -1147,27 +1278,36 @@ class SendspinConnection:
         try:
             if not await self._rehandshake_for_pairing_if_needed(transport):
                 return False
-            assert self._client_info is not None
-            offered = {d.method for d in (self._client_info.supported_pair_methods or [])}
-            chosen = (
+            method = (
                 self._pairing_attempt.method
                 if self._pairing_attempt is not None
                 else PairMethod.PAIRING_PSK
             )
-            method = chosen if chosen in offered else None
-            if method is None:
-                # Client doesn't offer the requested method — close silently per spec.
-                return False
+            pin_length = (
+                self._negotiated_dynamic_pin_length() if method is PairMethod.DYNAMIC_PIN else None
+            )
+            languages = (
+                list(self._pairing_attempt.languages)
+                if method is PairMethod.DYNAMIC_PIN
+                and self._pairing_attempt is not None
+                and self._pairing_attempt.languages
+                else None
+            )
+            # No gate on the hello-advertised methods: the advertisement may lag the client's
+            # live pairing config (management can change it mid-connection). The client
+            # arbitrates, aborting an unsupported method with ``method_not_supported``.
             await transport.send_str(
                 ServerActivateMessage(
                     payload=ServerActivatePayload(
                         activities=[Activity.PAIRING],
                         active_roles=[],
-                        selected_pair_method=method,
+                        pairing=ActivatePairing(
+                            method=method, pin_length=pin_length, languages=languages
+                        ),
                     )
                 ).to_json()
             )
-            record = await self._run_pairing_protocol(method, transport)
+            record = await self._run_pairing_protocol(method, transport, pin_length)
         except asyncio.CancelledError:
             # A cancelled attempt ends like any local abort: the task never reports
             # cancelled(), so awaiting callers see the abort rather than the cancel.
@@ -1189,17 +1329,20 @@ class SendspinConnection:
             return await rehandshake
 
     async def _run_pairing_protocol(
-        self, method: PairMethod, transport: EncryptedWebSocket
+        self, method: PairMethod, transport: EncryptedWebSocket, pin_length: int | None
     ) -> ServerPairingRecord | None:
         """Run ``method``'s exchange, returning the record (``None`` when verifying)."""
         assert self._client_id is not None
         self._pairing_index += 1
         pairing_index = self._pairing_index
         if method is PairMethod.PAIRING_PSK:
+            # The attempt is absent when the client dialed in with a staged Pairing PSK.
+            attempt = self._pairing_attempt
             return await run_pairing_psk_server(
                 transport,
                 client_id=self._client_id,
                 store=self._server.pairing_store,
+                owner=attempt.owner if attempt is not None else None,
             )
         assert self._pairing_attempt is not None
         assert self._pairing_attempt.pin_provider is not None
@@ -1217,16 +1360,21 @@ class SendspinConnection:
                 client_id=self._client_id,
                 store=self._server.pairing_store,
                 verify=verify,
+                on_pair_pending=self._pairing_attempt.on_pair_pending,
+                owner=self._pairing_attempt.owner,
             )
+        assert pin_length is not None
         return await run_dynamic_pin_server(
             transport,
             handshake_hash=self._handshake_hash,
             pairing_index=pairing_index,
             pin_provider=self._pairing_attempt.pin_provider,
-            pin_length=self._negotiated_dynamic_pin_length(),
+            pin_length=pin_length,
             client_id=self._client_id,
             store=self._server.pairing_store,
             verify=verify,
+            on_pair_pending=self._pairing_attempt.on_pair_pending,
+            owner=self._pairing_attempt.owner,
         )
 
     def _negotiated_dynamic_pin_length(self) -> int:
@@ -1240,7 +1388,11 @@ class SendspinConnection:
             ),
             None,
         )
-        client_min = descriptor.min_pin_length if descriptor is not None else None
+        if descriptor is None:
+            # Method enabled after hello (management): no advertised floor, so use our own and
+            # let the client arbitrate via ``pin_length_unacceptable``.
+            return self._server.min_pin_length
+        client_min = descriptor.min_pin_length
         if client_min is None or not MIN_PIN_DIGITS <= client_min <= MAX_PIN_DIGITS:
             raise PairingError("client does not (correctly) offer dynamic PIN pairing")
         # Both floors are validated to [MIN_PIN_DIGITS, MAX_PIN_DIGITS], so the max stays in range.
@@ -1349,7 +1501,7 @@ class SendspinConnection:
         """Deliver a management reply, draining the waiter slot."""
         waiter = self._management_waiter
         if waiter is None:
-            self._logger.warning("Unsolicited management reply; ignoring")
+            self._flag_noncompliance("sent an unsolicited management/result")
             return
         # Clear even an abandoned waiter, so its late reply can't match the next request.
         self._management_waiter = None
@@ -1426,6 +1578,13 @@ class SendspinConnection:
         )
         return payload.result
 
+    async def open_pairing_window(self) -> ManagementResult:
+        """Open a pairing window on the client in place of the operator gesture."""
+        payload = await self._management_request(
+            ManagementOpenPairingWindowMessage(), ManagementResultPayload
+        )
+        return payload.result
+
     def _start_message_loops(self) -> None:
         """Spawn the reader/writer tasks."""
         self._writer_task = create_task(self._writer())
@@ -1485,7 +1644,7 @@ class SendspinConnection:
                     break
 
                 if msg.type == WSMsgType.BINARY:
-                    self._logger.warning("Received binary message from client (spec violation)")
+                    self._route_inbound_binary(cast("bytes", msg.data))
                     continue
 
                 if msg.type != WSMsgType.TEXT:
@@ -1518,6 +1677,10 @@ class SendspinConnection:
         except asyncio.CancelledError:
             cancelled = True
             self._logger.debug("Message loop cancelled")
+        except ClientComplianceError:
+            # Strict mode: hard-reject (no warm reconnect). Cleanup reads _closing.
+            # flag_noncompliance already logged the reason at error before raising.
+            self._closing = True
         except Exception:
             self._logger.exception("Unexpected error inside websocket API")
         finally:
@@ -1528,11 +1691,27 @@ class SendspinConnection:
             if not cancelled:
                 self._connection_done.set()
 
+    def _route_inbound_binary(self, data: bytes) -> None:
+        """Route an inbound binary chunk to the role that declares its message type."""
+        if self._client is None:
+            return
+        if len(data) < BINARY_HEADER_SIZE:
+            self._logger.warning("Inbound binary message shorter than header, dropping")
+            return
+        header = unpack_binary_header(data)
+        payload = data[BINARY_HEADER_SIZE:]
+        for role in self._client.active_roles:
+            if role.handles_inbound_binary(header.message_type):
+                role.on_binary_chunk(header.message_type, header.timestamp_us, payload)
+                return
+        self._logger.warning(
+            "Received unhandled binary message type %s from client", header.message_type
+        )
+
     async def _handle_message(self, message: ClientMessage, timestamp_us: int) -> None:
         """Handle a single client message, dispatching to roles or the connection."""
         if isinstance(message, ClientHelloMessage):
-            # client/hello is consumed during the hello exchange; a second one is a protocol error.
-            self._logger.warning("Unexpected client/hello after the hello exchange; ignoring")
+            self._flag_noncompliance("sent a second client/hello after the hello exchange")
             return
 
         if isinstance(message, ClientTimeMessage):
@@ -1549,36 +1728,43 @@ class SendspinConnection:
             return
 
         if isinstance(message, ClientStateMessage):
-            payload = message.payload
-            if self._client is None:
-                return
-
-            if self.requires_initial_state() and not self._initial_state_received:
-                self._initial_state_received = True
-                if self._initial_state_timeout_handle is not None:
-                    self._initial_state_timeout_handle.cancel()
-                    self._initial_state_timeout_handle = None
-                self._client.mark_connected()
-                self._server.on_client_first_connect(self._client.client_id)
-
-            if payload.available is not None and payload.available != self._client.available:
-                await self._client.handle_availability_change(available=payload.available)
-            for role in self._client.active_roles:
-                role.on_client_state(payload)
+            await self._handle_client_state(message.payload)
             return
 
         if isinstance(message, StreamRequestFormatMessage):
             if self._client is None:
                 return
+            fmt = message.payload
+            self._flag_inactive_role_payloads(
+                "stream/request-format",
+                {"player": fmt.player, "artwork": fmt.artwork, "visualizer": fmt.visualizer},
+            )
             for role in self._client.active_roles:
-                role.on_stream_request_format(message.payload)
+                role.on_stream_request_format(fmt)
             return
 
         if isinstance(message, ClientCommandMessage):
             if self._client is None:
                 return
+            self._flag_inactive_role_payloads(
+                "client/command", {"controller": message.payload.controller}
+            )
             for role in self._client.active_roles:
                 role.on_command(message.payload)
+            return
+
+        if isinstance(message, ClientStreamStartMessage):
+            if self._client is None:
+                return
+            for role in self._client.active_roles:
+                role.on_client_stream_start(message.payload)
+            return
+
+        if isinstance(message, ClientStreamEndMessage):
+            if self._client is None:
+                return
+            for role in self._client.active_roles:
+                role.on_client_stream_end()
             return
 
         if isinstance(message, ManagementResultMessage):
@@ -1594,6 +1780,38 @@ class SendspinConnection:
             retry = message.payload.reason == GoodbyeReason.RESTART
             await self.disconnect(retry_connection=retry)
             return
+
+    async def _handle_client_state(self, payload: ClientStatePayload) -> None:
+        """Apply a client/state update: compliance checks, initial-state gate, dispatch."""
+        if self._client is None:
+            return
+
+        # Validate before applying initial state.
+        is_initial = self.requires_initial_state() and not self._initial_state_received
+        if is_initial:
+            self._flag_initial_state_deviations(payload)
+        if payload.legacy_state_used:
+            self._flag_noncompliance("client/state used the legacy top-level 'state' field")
+        self._flag_inactive_role_payloads(
+            "client/state", {"player": payload.player, "source": payload.source}
+        )
+        for role in self._client.active_roles:
+            for reason in role.client_state_deviations(payload):
+                self._flag_noncompliance(f"client/state {reason}")
+
+        if is_initial:
+            self._initial_state_received = True
+            if self._initial_state_timeout_handle is not None:
+                self._initial_state_timeout_handle.cancel()
+                self._initial_state_timeout_handle = None
+            self._client.mark_connected()
+            self._server.on_client_first_connect(self._client.client_id)
+            self._flush_pending_binary()
+
+        if payload.available is not None and payload.available != self._client.available:
+            await self._client.handle_availability_change(available=payload.available)
+        for role in self._client.active_roles:
+            role.on_client_state(payload)
 
     def _check_late_binary(
         self,

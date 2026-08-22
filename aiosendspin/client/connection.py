@@ -12,9 +12,15 @@ from typing import TYPE_CHECKING, NoReturn, assert_never
 
 from aiohttp import ClientWebSocketResponse, WSMessage, WSMsgType, web
 
-from aiosendspin.models import BINARY_HEADER_SIZE, BinaryMessageType, unpack_binary_header
+from aiosendspin.models import (
+    BINARY_HEADER_SIZE,
+    BinaryMessageType,
+    pack_binary_header_raw,
+    unpack_binary_header,
+)
 from aiosendspin.models.controller import ControllerCommandPayload
 from aiosendspin.models.core import (
+    ActivatePairing,
     ClientCommandMessage,
     ClientCommandPayload,
     ClientGoodbyeMessage,
@@ -47,6 +53,7 @@ from aiosendspin.models.management import (
     ManagementAddRecordMessage,
     ManagementGetPairingConfigMessage,
     ManagementListRecordsMessage,
+    ManagementOpenPairingWindowMessage,
     ManagementRemoveRecordMessage,
     ManagementResultMessage,
     ManagementResultPayload,
@@ -54,6 +61,13 @@ from aiosendspin.models.management import (
     ServerUnpairMessage,
 )
 from aiosendspin.models.player import PlayerStatePayload, StreamStartPlayer
+from aiosendspin.models.source import (
+    ClientStreamEndMessage,
+    ClientStreamStartMessage,
+    ClientStreamStartPayload,
+    ClientStreamStartSource,
+    SourceStatePayload,
+)
 from aiosendspin.models.types import (
     CLOSING_ABORT_REASONS,
     Activity,
@@ -66,6 +80,7 @@ from aiosendspin.models.types import (
     PlayerCommand,
     Roles,
     ServerMessage,
+    SignalState,
     TrustLevel,
     UndefinedField,
     role_family,
@@ -79,6 +94,8 @@ from aiosendspin.noise.driver import (
 )
 from aiosendspin.noise.keys import psk_id_for
 from aiosendspin.noise.models import (
+    ClientPairPendingMessage,
+    ClientPairPendingPayload,
     NoiseHandshakeMessage,
     PairAbortMessage,
     PairAbortPayload,
@@ -92,7 +109,7 @@ from aiosendspin.noise.pairing import (
     run_pairing_psk_client,
     run_static_pin_client,
 )
-from aiosendspin.noise.session import NoiseCipherSuite
+from aiosendspin.noise.pin import MAX_PIN_DIGITS, MIN_PIN_DIGITS, SHORT_PIN_DIGITS
 from aiosendspin.noise.trust_store import PskCategory, ResolvedPsk
 from aiosendspin.noise.wire import EncryptedWebSocket
 
@@ -101,6 +118,7 @@ from .management import (
     handle_add_record,
     handle_get_pairing_config,
     handle_list_records,
+    handle_open_pairing_window,
     handle_remove_record,
     handle_set_pairing_config,
     handle_unpair,
@@ -123,10 +141,11 @@ _ManagementRequest = (
     | ManagementRemoveRecordMessage
     | ManagementGetPairingConfigMessage
     | ManagementSetPairingConfigMessage
+    | ManagementOpenPairingWindowMessage
 )
 
-# A provisional (incoming) connection must complete bring-up through its first
-# server/activate within this window or be dropped (spec: multi-server admission).
+# A provisional connection must complete bring-up through its first server/activate
+# within this window or be dropped (spec: multi-server admission).
 PROVISIONAL_CONNECTION_TIMEOUT_S: float = 30.0
 
 # Backstop for the post-pairing transition (re-handshake → hello → activate); the per-message
@@ -135,9 +154,6 @@ POST_PAIRING_ACTIVATE_TIMEOUT_S: float = 60.0
 
 # Lead time applied to play-time estimates before clock sync converges.
 UNSYNCED_PLAY_LEAD_US: int = 500_000
-
-# PIN-pairing method families, subject to lockout and the locked_out descriptor.
-_PIN_METHODS: list[PairMethod] = [PairMethod.DYNAMIC_PIN, PairMethod.STATIC_PIN]
 
 # psk_id of the Sentinel PSK — the client matches it during PIN pairing / discovery.
 _SENTINEL_PSK_ID: str = psk_id_for(SENTINEL_PSK)
@@ -228,6 +244,8 @@ class SendspinConnection:
     """True if visualizer stream is active."""
     _artwork_stream_active: bool = False
     """True if artwork stream is active."""
+    _source_stream_active: bool = False
+    """True between client_stream/start and client_stream/end for the source role."""
     _current_visualizer_config: StreamStartVisualizer | None = None
     """Current visualizer config from stream/start."""
 
@@ -244,7 +262,8 @@ class SendspinConnection:
         self._reported_available: bool = True
         self._reported_volume = client.initial_volume
         self._reported_muted = client.initial_muted
-        self._selected_pair_method: PairMethod | None = None
+        self._reported_source_signal: SignalState | None = None
+        self._selected_pairing: ActivatePairing | None = None
         self._pairing_index = 0
         self._pairing_attempt_in_progress = False
         self._exchange_in_progress = False
@@ -300,13 +319,21 @@ class SendspinConnection:
         self, raw_ws: ClientWebSocketResponse, *, expected_server_id: str | None
     ) -> None:
         """Run the handshake over a client-initiated ``raw_ws`` and bring the connection up."""
-        await self._run_noise_handshake(raw_ws, expected_server_id=expected_server_id)
-        await self._run_inner_handshake()
+        await self._bring_up(raw_ws, expected_server_id=expected_server_id)
 
     async def attach_websocket(
         self, ws: web.WebSocketResponse, *, expected_server_id: str | None
     ) -> None:
         """Run the handshake over an incoming ``ws`` and bring the connection up."""
+        await self._bring_up(ws, expected_server_id=expected_server_id)
+
+    async def _bring_up(
+        self,
+        ws: ClientWebSocketResponse | web.WebSocketResponse,
+        *,
+        expected_server_id: str | None,
+    ) -> None:
+        """Reach the first server/activate under a bring-up timeout, closing on stall."""
         try:
             async with asyncio.timeout(PROVISIONAL_CONNECTION_TIMEOUT_S):
                 await self._run_noise_handshake(ws, expected_server_id=expected_server_id)
@@ -335,7 +362,7 @@ class SendspinConnection:
             result = await run_handshake_client(
                 raw_ws,
                 local_identity=self._client.identity,
-                suite=NoiseCipherSuite.CHACHAPOLY,
+                suite=self._client.cipher_suite,
                 psk_resolver=self._resolve_psk,
                 expected_server_id=expected_server_id,
             )
@@ -425,6 +452,10 @@ class SendspinConnection:
         effective_roles = (
             payload.active_roles if payload.active_roles is not None else self._active_roles
         )
+        if category is not PskCategory.LONG_TERM and any(
+            role_family(role_id) == "source" for role_id in effective_roles
+        ):
+            return GoodbyeReason.UNAUTHORIZED
         has_roles = bool(effective_roles)
         unpaired_access = await self._unpaired_access_enabled()
         if not _admissible(
@@ -440,9 +471,15 @@ class SendspinConnection:
             return GoodbyeReason.UNAUTHORIZED
         self._activities = payload.activities
         if payload.active_roles is not None:
+            source_dropped = (
+                Roles.SOURCE.value in self._active_roles
+                and Roles.SOURCE.value not in payload.active_roles
+            )
             self._active_roles = payload.active_roles
-        self._selected_pair_method = payload.selected_pair_method
-        self._client.note_playback_activity(self)
+            if source_dropped and self._source_stream_active and self.connected:
+                await self.send_client_stream_end()
+        self._selected_pairing = payload.pairing
+        await self._client.note_playback_activity(self)
         return None
 
     async def start(self) -> None:
@@ -470,13 +507,14 @@ class SendspinConnection:
 
     async def _send_full_client_state(self) -> None:
         """Push the client's full state to the server, (re)populating its role instances."""
-        if Roles.PLAYER not in self._client.roles or not self._is_role_active("player"):
-            return
-        await self.send_player_state(
-            available=self._reported_available,
-            volume=self._reported_volume,
-            muted=self._reported_muted,
-        )
+        if Roles.PLAYER in self._client.roles and self._is_role_active("player"):
+            await self.send_player_state(
+                available=self._reported_available,
+                volume=self._reported_volume,
+                muted=self._reported_muted,
+            )
+        if self._is_role_active("source") and self.is_time_synchronized():
+            await self._send_source_state()
 
     async def _pair(self) -> None:
         """Run one pairing attempt; on a non-closing abort stay in pairing for a retry."""
@@ -493,6 +531,7 @@ class SendspinConnection:
                     logger.info(
                         "Pairing attempt with %s ended: %s", self._server_id, err.reason.value
                     )
+                    self._client.notify_pairing_abort_callback(err.reason)
                 return
             if (reason := await self._apply_activation(activate)) is not None:
                 await self._goodbye_and_disconnect(reason)
@@ -514,9 +553,8 @@ class SendspinConnection:
         assert self._server_id is not None
         self._pairing_index += 1
         pairing_index = self._pairing_index
-        method = self._selected_pair_method
-        await self._validate_pair_method(method)
-        assert method is not None  # _validate_pair_method rejects None
+        pairing = await self._validate_pairing(self._selected_pairing)
+        method = pairing.method
         store = self._client.pairing_store
         if method is PairMethod.PAIRING_PSK:
             with self._attempt_in_progress():
@@ -524,12 +562,11 @@ class SendspinConnection:
                     self._ws, server_id=self._server_id, store=store
                 )
         assert self._handshake_hash is not None
-        if await store.is_pin_locked_out(method):
-            await self._abort_pairing(PairAbortReason.LOCKED_OUT)
         if method is PairMethod.STATIC_PIN:
             static_pin = await store.static_pin()
             assert static_pin is not None  # offered only when configured
-            if (leave := await self._await_pairing_window()) is not None:
+            # Every static-PIN attempt is gesture-gated.
+            if (leave := await self._gate_on_pairing_window(pairing_index)) is not None:
                 return leave
             with self._attempt_in_progress():
                 return await run_static_pin_client(
@@ -540,19 +577,26 @@ class SendspinConnection:
                     server_id=self._server_id,
                     store=store,
                 )
-        try:  # PairMethod.DYNAMIC_PIN
+        # PairMethod.DYNAMIC_PIN: gesture-gated only when escalated or the PIN is short.
+        pin_length = await self._validate_pin_length(pairing.pin_length)
+        if (await store.is_pin_escalated() or pin_length < SHORT_PIN_DIGITS) and (
+            leave := await self._gate_on_pairing_window(pairing_index)
+        ) is not None:
+            return leave
+        self._client.consume_pairing_window()
+        try:
             with self._attempt_in_progress():
                 return await run_dynamic_pin_client(
                     self._ws,
                     handshake_hash=self._handshake_hash,
                     pairing_index=pairing_index,
+                    pin_length=pin_length,
                     pin_emitter=self._emit_pin,
                     server_id=self._server_id,
                     store=store,
                 )
         finally:
-            if self._client.pin_display is not None:
-                await self._client.pin_display(None)
+            await self._emit_pin(None)
 
     @contextmanager
     def _attempt_in_progress(self) -> Iterator[None]:
@@ -563,23 +607,33 @@ class SendspinConnection:
         finally:
             self._pairing_attempt_in_progress = False
 
-    async def _await_pairing_window(self) -> str | None:
-        """Wait for the operator gesture without leaving the socket unread.
+    async def _gate_on_pairing_window(self, pairing_index: int) -> str | None:
+        """Hold a gesture-gated attempt until a pairing window is open.
 
-        Returns the raw ``server/activate`` frame if the server leaves pairing before
-        an attempt started, else ``None`` once the gesture arrives.
-        Anything else received during the wait - the ``pair/abort`` withdrawing the
-        attempt, an unexpected frame, or a close - raises out of the pending receive.
+        With no window open, signals ``client/pair-pending`` first and waits without
+        leaving the socket unread. Returns the raw ``server/activate`` frame if the
+        server leaves pairing first, else ``None``.
         """
-        assert self._client.pairing_window is not None  # offered only when set
         assert self._ws is not None
-        window = asyncio.ensure_future(self._client.pairing_window())
+        if self._client.pairing_window_open:
+            # Claims the window without signalling pair-pending, since none is awaited.
+            await self._client.await_pairing_window()
+            return None
+        await self._ws.send_str(
+            ClientPairPendingMessage(
+                payload=ClientPairPendingPayload(pairing_index=pairing_index),
+            ).to_json(),
+        )
+        window = asyncio.ensure_future(self._client.await_pairing_window())
         receive = asyncio.create_task(receive_pairing_abort(self._ws))
         try:
             done, _ = await asyncio.wait((window, receive), return_when=asyncio.FIRST_COMPLETED)
         finally:
             window.cancel()
             receive.cancel()
+        if window not in done:
+            # Let the window wait finish unwinding (its cleanup clears the gesture prompt).
+            await asyncio.wait((window,))
         if receive not in done:
             # The cancelled receive must exit ws.receive() before anyone else may read.
             await asyncio.wait((receive,))
@@ -592,12 +646,12 @@ class SendspinConnection:
 
     async def _resolve_pairing_activate(self, leftover: str | None) -> ServerActivatePayload:
         """Resolve the server/activate that ends pairing, re-handshaking first if it finalized."""
-        method = self._selected_pair_method
-        assert method is not None
+        pairing = self._selected_pairing
+        assert pairing is not None
         async with asyncio.timeout(POST_PAIRING_ACTIVATE_TIMEOUT_S):
             if leftover is None:
                 # Server finalized and re-handshakes onto the new long-term PSK.
-                logger.info("Paired with server %s via %s", self._server_id, method.value)
+                logger.info("Paired with server %s via %s", self._server_id, pairing.method.value)
                 await self._rehandshake()
                 return await self._exchange_hellos()
             # Server left pairing without finalizing: apply the leave server/activate.
@@ -633,28 +687,51 @@ class SendspinConnection:
         """Whether the client currently admits unpaired access (from pairing config)."""
         return (await self._client.pairing_store.get_pairing_config()).unpaired_access_enabled
 
-    async def _validate_pair_method(self, method: PairMethod | None) -> None:
-        """Reject a pairing method the matched PSK disallows or the client did not offer."""
+    async def _validate_pairing(self, pairing: ActivatePairing | None) -> ActivatePairing:
+        """Reject a pairing whose method the matched PSK disallows or the client did not offer."""
         assert self._noise_psk is not None
+        method = pairing.method if pairing is not None else None
         # pairing_psk iff the matched PSK is the Pairing PSK; a PIN method otherwise.
         method_fits_psk = (method is PairMethod.PAIRING_PSK) == (
             self._noise_psk.category is PskCategory.PAIRING
         )
         supported = await self._supported_pair_methods()
-        if method is None or not method_fits_psk or method not in supported:
+        if pairing is None or not method_fits_psk or method not in supported:
             await self._abort_pairing(PairAbortReason.METHOD_NOT_SUPPORTED)
+        return pairing
+
+    async def _validate_pin_length(self, pin_length: int | None) -> int:
+        """Validate the activation's dynamic ``pin_length``, aborting when unacceptable."""
+        min_length = await self._min_pin_length()
+        if pin_length is None or not min_length <= pin_length <= MAX_PIN_DIGITS:
+            await self._abort_pairing(PairAbortReason.PIN_LENGTH_UNACCEPTABLE)
+        return pin_length
+
+    async def _min_pin_length(self) -> int:
+        """Shortest dynamic PIN this client accepts, held to the spec's advertisable range."""
+        config = await self._client.pairing_store.get_pairing_config()
+        return min(max(config.dynamic_pin_min_length, MIN_PIN_DIGITS), MAX_PIN_DIGITS)
 
     async def _abort_pairing(self, reason: PairAbortReason) -> NoReturn:
         """Send ``pair/abort``; never returns (the abort raises)."""
         assert self._ws is not None
         await abort_pairing(self._ws, reason)
 
-    async def _emit_pin(self, pin: str) -> None:
-        """Surface the derived pairing PIN through the configured out-channel."""
+    async def _emit_pin(self, pin: str | None) -> None:
+        """Hand ``pin`` to every configured out-channel, or release them when it is ``None``."""
+        emissions = []
         if self._client.pin_display is not None:
-            await self._client.pin_display(pin)
-        else:
-            logger.warning("Pairing PIN (no display configured): %s", pin)
+            emissions.append(self._client.pin_display(pin))
+        if self._client.pin_speaker is not None:
+            emissions.append(self._client.pin_speaker(pin, languages=self._activation_languages()))
+        await asyncio.gather(*emissions)
+
+    def _activation_languages(self) -> tuple[str, ...]:
+        """Operator language preferences carried by the pairing activation."""
+        pairing = self._selected_pairing
+        if pairing is None or pairing.languages is None:
+            return ()
+        return tuple(pairing.languages)
 
     async def _rehandshake(self, hs1_text: str | None = None) -> None:
         """Re-run the Noise handshake as responder and swap the session (None reads msg 1)."""
@@ -739,6 +816,7 @@ class SendspinConnection:
         self._current_player = None
         self._artwork_stream_active = False
         self._visualizer_stream_active = False
+        self._source_stream_active = False
         self._current_visualizer_config = None
         self._activities = []
         self._active_roles = []
@@ -756,7 +834,7 @@ class SendspinConnection:
         """Send the current player state to the server."""
         if not self.connected:
             raise RuntimeError("Client is not connected")
-        self._reported_available = available
+        await self._update_reported_available(available=available)
         self._reported_volume = volume
         self._reported_muted = muted
         message = ClientStateMessage(
@@ -773,6 +851,24 @@ class SendspinConnection:
             )
         )
         await self._send_message(message.to_json())
+
+    async def send_available(self, *, available: bool) -> None:
+        """Send the current client-level availability."""
+        if not self.connected:
+            raise RuntimeError("Client is not connected")
+        await self._update_reported_available(available=available)
+        if self._is_role_active("source"):
+            if not self.is_time_synchronized():
+                return
+            await self._send_source_state()
+            return
+        message = ClientStateMessage(payload=ClientStatePayload(available=available))
+        await self._send_message(message.to_json())
+
+    async def _update_reported_available(self, *, available: bool) -> None:
+        if not available and self._source_stream_active:
+            await self.send_client_stream_end()
+        self._reported_available = available
 
     async def send_group_command(
         self,
@@ -797,6 +893,83 @@ class SendspinConnection:
         message = ClientCommandMessage(payload=payload)
         await self._send_message(message.to_json())
 
+    async def send_client_stream_start(
+        self,
+        *,
+        codec: AudioCodec,
+        sample_rate: int,
+        channels: int,
+        bit_depth: int,
+        codec_header: str | None,
+    ) -> None:
+        """Start a source stream."""
+        message = ClientStreamStartMessage(
+            payload=ClientStreamStartPayload(
+                source=ClientStreamStartSource(
+                    codec=codec,
+                    channels=channels,
+                    sample_rate=sample_rate,
+                    bit_depth=bit_depth,
+                    codec_header=codec_header,
+                )
+            )
+        )
+        async with self._send_lock:
+            self._ensure_source_authorized()
+            if not self.is_time_synchronized():
+                raise RuntimeError("Source capture requires a synchronized clock")
+            if self._exchange_in_progress:
+                raise RuntimeError("Connection is busy with an in-band exchange")
+            await self._send_message_locked(message.to_json())
+            self._source_stream_active = True
+
+    async def send_client_stream_end(self) -> None:
+        """End the source stream."""
+        async with self._send_lock:
+            if not self.connected:
+                raise RuntimeError("Client is not connected")
+            if not self._source_stream_active:
+                return
+            if self._exchange_in_progress:
+                raise RuntimeError("Connection is busy with an in-band exchange")
+            await self._send_message_locked(ClientStreamEndMessage().to_json())
+            self._source_stream_active = False
+
+    async def send_source_chunk(self, frame: bytes, *, timestamp_us: int) -> None:
+        """Send an encoded source audio frame."""
+        header = pack_binary_header_raw(BinaryMessageType.SOURCE_AUDIO_CHUNK.value, timestamp_us)
+        async with self._send_lock:
+            self._ensure_source_authorized(require_stream=True)
+            await self._send_bytes_locked(header + frame)
+
+    async def send_source_signal(self, signal: SignalState) -> None:
+        """Report source signal presence."""
+        self._ensure_source_authorized()
+        self._reported_source_signal = signal
+        if not self.is_time_synchronized():
+            return
+        await self._send_source_state()
+
+    async def _send_source_state(self) -> None:
+        """Send current source state."""
+        message = ClientStateMessage(
+            payload=ClientStatePayload(
+                available=self._reported_available,
+                source=SourceStatePayload(signal=self._reported_source_signal),
+            )
+        )
+        await self._send_message(message.to_json())
+
+    def _ensure_source_authorized(self, *, require_stream: bool = False) -> None:
+        if not self.connected:
+            raise RuntimeError("Client is not connected")
+        if self._noise_psk is None or self._noise_psk.category is not PskCategory.LONG_TERM:
+            raise RuntimeError("Source role requires a paired connection")
+        if not self._is_role_active("source"):
+            raise RuntimeError("Source role is not active")
+        if require_stream and not self._source_stream_active:
+            raise RuntimeError("Source stream is not active")
+
     def is_time_synchronized(self) -> bool:
         """Return whether time synchronization with the server has converged."""
         return self._time_filter.is_synchronized
@@ -809,6 +982,7 @@ class SendspinConnection:
             player_support=self._client.player_support,
             artwork_support=self._client.artwork_support,
             visualizer_support=self._client.visualizer_support,
+            source_support=self._client.source_support,
             trust_level=self._compute_trust(),
             supported_pair_methods=[
                 await self._pair_method_descriptor(m) for m in await self._supported_pair_methods()
@@ -818,20 +992,17 @@ class SendspinConnection:
         return ClientHelloMessage(payload=payload)
 
     async def _pair_method_descriptor(self, method: PairMethod) -> PairMethodDescriptor:
-        """Build the ``client/hello`` descriptor for ``method`` (lockout + out-channels)."""
-        if method not in _PIN_METHODS:
-            return PairMethodDescriptor(method=method)
-        min_pin_length = None
-        out_channels = None
-        if method is PairMethod.DYNAMIC_PIN:
-            out_channels = ["display"]
-            config = await self._client.pairing_store.get_pairing_config()
-            min_pin_length = config.dynamic_pin_min_length
+        """Build the ``client/hello`` descriptor for ``method``."""
+        if method is not PairMethod.DYNAMIC_PIN:
+            locations = self._client.secret_locations
+            return PairMethodDescriptor(
+                method=method, locations=list(locations) if locations else None
+            )
+        out_channels = self._client.pin_out_channels
         return PairMethodDescriptor(
             method=method,
-            out_channels=out_channels,
-            locked_out=await self._client.pairing_store.is_pin_locked_out(method),
-            min_pin_length=min_pin_length,
+            out_channels=list(out_channels) if out_channels else None,
+            min_pin_length=await self._min_pin_length(),
         )
 
     def _compute_trust(self) -> TrustLevel:
@@ -855,12 +1026,29 @@ class SendspinConnection:
     async def _send_message(self, payload: str, *, force: bool = False) -> None:
         """Send a JSON frame; ``force`` bypasses the in-band-exchange suppression."""
         async with self._send_lock:
-            # Re-check under the lock: disconnect() can null _ws while we await it.
-            if self._ws is None:
-                raise RuntimeError("WebSocket is not connected")
-            if self._exchange_in_progress and not force:
-                return
-            await self._ws.send_str(payload)
+            await self._send_message_locked(payload, force=force)
+
+    async def _send_message_locked(self, payload: str, *, force: bool = False) -> None:
+        if self._ws is None:
+            raise RuntimeError("WebSocket is not connected")
+        if self._exchange_in_progress and not force:
+            return
+        await self._ws.send_str(payload)
+
+    async def _send_bytes(self, payload: bytes) -> None:
+        async with self._send_lock:
+            await self._send_bytes_locked(payload)
+
+    async def _send_bytes_locked(self, payload: bytes) -> None:
+        if self._ws is None:
+            raise RuntimeError("WebSocket is not connected")
+        if self._exchange_in_progress:
+            return
+        await self._ws.send_bytes(payload)
+
+    def is_source_stream_active(self) -> bool:
+        """Return whether this connection has an open source stream."""
+        return self._source_stream_active
 
     @asynccontextmanager
     async def _exchange(self) -> AsyncIterator[None]:
@@ -919,7 +1107,7 @@ class SendspinConnection:
             case ServerActivateMessage(payload=payload):
                 await self._handle_server_activate(payload)
             case ServerTimeMessage(payload=payload):
-                self._handle_server_time(payload)
+                await self._handle_server_time(payload)
             case StreamStartMessage():
                 await self._handle_stream_start(message)
             case StreamClearMessage():
@@ -940,6 +1128,7 @@ class SendspinConnection:
                 | ManagementRemoveRecordMessage()
                 | ManagementGetPairingConfigMessage()
                 | ManagementSetPairingConfigMessage()
+                | ManagementOpenPairingWindowMessage()
             ):
                 await self._handle_management_request(message)
             case _:
@@ -1005,6 +1194,7 @@ class SendspinConnection:
         self, payload: ServerActivatePayload, *, resync: bool = False
     ) -> None:
         was_player_active = self._is_role_active("player")
+        was_source_active = self._is_role_active("source")
         if (reason := await self._apply_activation(payload)) is not None:
             await self._goodbye_and_disconnect(reason)
             return
@@ -1012,7 +1202,9 @@ class SendspinConnection:
             await self._pair()
             return
         self._resume_time_sync()
-        if resync or not was_player_active:
+        player_activated = not was_player_active and self._is_role_active("player")
+        source_activated = not was_source_active and self._is_role_active("source")
+        if resync or player_activated or source_activated:
             await self._send_full_client_state()
 
     async def _pause_time_sync(self) -> None:
@@ -1027,7 +1219,8 @@ class SendspinConnection:
         if self._time_task is None or self._time_task.done():
             self._time_task = self._client.loop.create_task(self._time_sync_loop())
 
-    def _handle_server_time(self, payload: ServerTimePayload) -> None:
+    async def _handle_server_time(self, payload: ServerTimePayload) -> None:
+        was_synchronized = self._time_filter.is_synchronized
         now_us = self.now_us()
         offset = (
             (payload.server_received - payload.client_transmitted)
@@ -1038,6 +1231,12 @@ class SendspinConnection:
             - (payload.server_transmitted - payload.server_received)
         ) / 2
         self._time_filter.update(round(offset), round(delay), now_us)
+        if (
+            not was_synchronized
+            and self._time_filter.is_synchronized
+            and self._is_role_active("source")
+        ):
+            await self._send_source_state()
 
     async def _handle_stream_start(self, message: StreamStartMessage) -> None:
         if message.payload.visualizer is not None:
@@ -1180,6 +1379,12 @@ class SendspinConnection:
                 payload, effect = await handle_set_pairing_config(
                     store, request, implemented_pair_methods=self._client.implemented_pair_methods
                 )
+            case ManagementOpenPairingWindowMessage():
+                payload, effect = await handle_open_pairing_window(
+                    store,
+                    implemented_pair_methods=self._client.implemented_pair_methods,
+                    open_window=self._client.open_pairing_window,
+                )
             case _:
                 assert_never(message)
         payload = await with_storage(
@@ -1293,6 +1498,10 @@ class SendspinConnection:
         """Convert a client timestamp to a server timestamp, with static delay removed."""
         adjusted_client_time = client_timestamp_us + self._static_delay_us
         return self._time_filter.compute_server_time(adjusted_client_time)
+
+    def compute_source_timestamp(self, capture_timestamp_us: int) -> int:
+        """Convert a capture timestamp to server time without playback delay."""
+        return self._time_filter.compute_server_time(capture_timestamp_us)
 
     async def _time_sync_loop(self) -> None:
         try:

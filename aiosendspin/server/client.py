@@ -31,6 +31,7 @@ from aiosendspin.models.types import (
 from aiosendspin.noise.trust_store import PskCategory
 from aiosendspin.util import create_task
 
+from .compliance import ClientComplianceError
 from .events import ClientEvent, ClientGroupChangedEvent
 from .roles import Role
 from .roles.base import BinaryHandling
@@ -50,7 +51,7 @@ logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
 
 # Cleanup delay for reconnect-friendly disconnect reasons (seconds)
-CLIENT_CLEANUP_DELAY = 30.0
+CLIENT_CLEANUP_DELAY = 180.0
 
 # Reasons that trigger immediate client cleanup from the registry.
 # Note: ANOTHER_SERVER is intentionally excluded and never auto-cleaned up.
@@ -132,10 +133,25 @@ class SendspinClient:
         # Built when roles are attached for cached lookup in _send_binary_frame().
         self._binary_handling_cache: dict[int, tuple[BinaryHandling, Role]] = {}
 
+        # Reasons already logged, deduped for the client's lifetime.
+        self._noncompliance_logged: set[str] = set()
+
         # Pending cleanup handle (scheduled via loop.call_soon/call_later on disconnect)
         self._cleanup_handle: asyncio.Handle | None = None
         # True when we intentionally retain a disconnected client after ANOTHER_SERVER goodbye.
         self._cleanup_on_mdns_removal: bool = False
+
+    def flag_noncompliance(self, reason: str) -> None:
+        """Log a tolerated spec violation once, or reject it when the server is strict."""
+        if not self._server.allow_noncompliant_clients:
+            self._logger.error("rejecting non-compliant client: %s", reason)
+            raise ClientComplianceError(reason)
+        # Recurring deviations (e.g. per client/state) would otherwise log every
+        # message, so log each distinct reason only once.
+        if reason in self._noncompliance_logged:
+            return
+        self._noncompliance_logged.add(reason)
+        self._logger.warning("non-compliant client: %s", reason)
 
     @property
     def client_id(self) -> str:
@@ -470,6 +486,7 @@ class SendspinClient:
 
         previous_info = self._info
         self._set_identity_from_hello(client_info, negotiated_roles=negotiated_roles)
+        self._server._signal_client_connected(self._client_id)  # noqa: SLF001
         if previous_info is not None and previous_info != client_info:
             self._server._signal_client_updated(self._client_id)  # noqa: SLF001
         self._logger = logger.getChild(self._client_id)
@@ -515,7 +532,7 @@ class SendspinClient:
                 role.on_connect()
             roles[role.role_id] = role
         if self._roles_attached:
-            for dropped_role in self._roles.values():
+            for dropped_role in reversed(self._roles.values()):
                 dropped_role.on_disconnect()
         self._roles = roles
 
@@ -530,7 +547,8 @@ class SendspinClient:
                 self._rebuild_binary_handling_cache()
             return
 
-        for role_id in list(self._roles):
+        # Tear down in reverse attach order: the controller unwinds before the player it reads.
+        for role_id in reversed(list(self._roles)):
             if role_id not in desired_set:
                 deactivated_role = self._roles.pop(role_id)
                 deactivated_role.on_deactivate()
@@ -628,6 +646,10 @@ class SendspinClient:
 
         self._connection = None
 
+        self._server._signal_client_disconnected(  # noqa: SLF001
+            self._client_id, goodbye_reason
+        )
+
         if goodbye_reason == GoodbyeReason.ANOTHER_SERVER:
             create_task(self._handle_takeover_disconnect())
 
@@ -636,7 +658,7 @@ class SendspinClient:
 
     def _retire_roles_warm(self) -> None:
         """Run role disconnect hooks but keep instances alive for warm reuse on reconnect."""
-        for role in self._roles.values():
+        for role in reversed(self._roles.values()):
             role.on_disconnect()
         self._binary_handling_cache.clear()
         self._roles_warm_disconnected = True
@@ -705,7 +727,7 @@ class SendspinClient:
     def _hard_detach_roles(self, *, call_disconnect_hooks: bool = True) -> None:
         """Run role disconnect hooks and clear role-related caches."""
         if call_disconnect_hooks:
-            for role in self._roles.values():
+            for role in reversed(self._roles.values()):
                 role.on_disconnect()
         self._roles.clear()
         self._active_roles = None
@@ -723,7 +745,9 @@ class SendspinClient:
         self._info = client_info
         self._name = client_info.name
         if negotiated_roles is None:
-            self._negotiated_role_ids = negotiate_roles(client_info.supported_roles)
+            self._negotiated_role_ids = negotiate_roles(
+                client_info.supported_roles, strict=not self._server.allow_noncompliant_clients
+            )
         else:
             self._negotiated_role_ids = negotiated_roles
 

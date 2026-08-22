@@ -30,9 +30,9 @@ from zeroconf.asyncio import AsyncServiceBrowser, AsyncServiceInfo, AsyncZerocon
 
 from aiosendspin.clock import Clock, RawMonotonicClock
 from aiosendspin.models.core import ClientHelloPayload
-from aiosendspin.models.types import ConnectionReason
+from aiosendspin.models.types import ConnectionReason, GoodbyeReason
 from aiosendspin.noise.keys import Identity
-from aiosendspin.noise.pairing import PairingAbortError, PairingAttempt
+from aiosendspin.noise.pairing import PairingAbortError, PairingAttempt, PairingTimeoutError
 from aiosendspin.noise.pin import DEFAULT_MIN_PIN_DIGITS, MAX_PIN_DIGITS, MIN_PIN_DIGITS
 from aiosendspin.noise.trust_store import ServerPairingStore, TrustedUnpairedClient
 from aiosendspin.util import create_task, get_local_ip
@@ -84,6 +84,37 @@ class ClientRemovedEvent(SendspinEvent):
     client_id: str
 
 
+@dataclass
+class ClientConnectedEvent(SendspinEvent):
+    """A client established a transport connection (first or reconnect).
+
+    Fired on every ``attach_connection()`` — the first connection of a
+    brand-new client and subsequent reconnects alike. Complementary to
+    ``ClientDisconnectedEvent`` which fires when the transport goes down.
+
+    .. note::
+       This event may fire **before** ``ClientAddedEvent`` for new clients
+       (the client is added to the registry later in the attach flow).
+       Consumers should not assume the client is already in the registry
+       when handling this event.
+    """
+
+    client_id: str
+
+
+@dataclass
+class ClientDisconnectedEvent(SendspinEvent):
+    """A client's transport connection was lost.
+
+    Fired on every ``detach_connection()`` regardless of goodbye reason.
+    The ``goodbye_reason`` is ``None`` for an unexpected disconnect
+    (e.g. WebSocket close without protocol goodbye).
+    """
+
+    client_id: str
+    goodbye_reason: GoodbyeReason | None
+
+
 @dataclass(frozen=True, slots=True)
 class ExternalStreamStartRequest:
     """Request payload for externally managed player connection on stream start."""
@@ -124,10 +155,28 @@ class SendspinServer:
         *,
         pairing_store: ServerPairingStore,
         allow_unencrypted: bool = False,
+        allow_noncompliant_clients: bool = True,
         min_pin_length: int = DEFAULT_MIN_PIN_DIGITS,
         clock: Clock | None = None,
     ) -> None:
-        """Initialize a Sendspin server instance."""
+        """Initialize a Sendspin server instance.
+
+        Args:
+            loop: Event loop the server runs on.
+            identity: The server's long-term Noise identity.
+            server_name: Human-readable name advertised to clients.
+            client_session: Shared aiohttp session, or None to create and own one.
+            pairing_store: Persistent store for pairing records and config.
+            allow_unencrypted: Accept legacy unencrypted clients over the non-spec
+                transition-mode hello, off by default. Enable it only to bridge
+                pre-encryption clients during migration.
+            allow_noncompliant_clients: Tolerate and log deviations from clients
+                built against pre-1.0 spec drafts when True, reject the client when
+                False. Tolerance is transitional and will be removed in a future
+                version.
+            min_pin_length: Minimum dynamic-PIN length the server accepts.
+            clock: Clock source, or None for the default monotonic clock.
+        """
         if not MIN_PIN_DIGITS <= min_pin_length <= MAX_PIN_DIGITS:
             msg = f"min_pin_length must be in [{MIN_PIN_DIGITS}, {MAX_PIN_DIGITS}]"
             raise ValueError(msg)
@@ -137,6 +186,7 @@ class SendspinServer:
         self._name = server_name
         self._pairing_store = pairing_store
         self._allow_unencrypted = allow_unencrypted
+        self._allow_noncompliant_clients = allow_noncompliant_clients
         self._min_pin_length = min_pin_length
         self._clock: Clock = clock or RawMonotonicClock()
 
@@ -218,6 +268,11 @@ class SendspinServer:
         return self._allow_unencrypted
 
     @property
+    def allow_noncompliant_clients(self) -> bool:
+        """Whether non-spec-compliant clients are tolerated instead of rejected."""
+        return self._allow_noncompliant_clients
+
+    @property
     def name(self) -> str:
         """Return the human-readable server name."""
         return self._name
@@ -249,10 +304,12 @@ class SendspinServer:
     def set_visualizer_pitch_enabled(self, *, enabled: bool) -> None:
         """Enable or disable the visualizer `pitch` feature server-wide.
 
-        Enabling is technically non-compliant: `pitch` uses reserved binary type
-        21, which the spec says must not be used. It stays available as an opt-in
-        extension. Pitch (YINFFT) is also the heaviest per-frame visualizer
-        computation, so leaving it off sheds that cost on constrained hardware.
+        This option is ignored while `allow_noncompliant_clients` is False: `pitch`
+        uses reserved binary type 21, which the spec forbids, so a compliance-strict
+        server never emits it regardless of this toggle. It otherwise stays available
+        as an opt-in extension. Pitch (YINFFT) is also the heaviest per-frame
+        visualizer computation, so leaving it off sheds that cost on constrained
+        hardware.
         Toggling drops/adds `pitch` on live roles' negotiated types and re-emits
         `stream/start`; new roles pick the setting up when they connect.
         """
@@ -381,6 +438,16 @@ class SendspinServer:
         """Emit a ClientUpdatedEvent (called from SendspinClient)."""
         self._signal_event(ClientUpdatedEvent(client_id))
 
+    def _signal_client_connected(self, client_id: str) -> None:
+        """Emit a ClientConnectedEvent (called from SendspinClient)."""
+        self._signal_event(ClientConnectedEvent(client_id))
+
+    def _signal_client_disconnected(
+        self, client_id: str, goodbye_reason: GoodbyeReason | None
+    ) -> None:
+        """Emit a ClientDisconnectedEvent (called from SendspinClient)."""
+        self._signal_event(ClientDisconnectedEvent(client_id, goodbye_reason))
+
     async def on_client_connect(self, request: web.Request) -> web.StreamResponse:
         """Handle an incoming WebSocket connection from a Sendspin client."""
         logger.debug("Incoming client connection from %s", request.remote)
@@ -487,12 +554,13 @@ class SendspinServer:
         """Run a pairing attempt on a connected client.
 
         A pair abort raises and leaves the connection open (retry with another
-        ``initiate_pairing`` or drop out with ``end_pairing``); other failures disconnect.
+        ``initiate_pairing`` or drop out with ``end_pairing``); a server-side timeout
+        raises with pairing already left; other failures disconnect.
         """
         connection = self._connection_for(client_id)
         try:
             await connection.initiate_pairing(attempt)
-        except PairingAbortError:
+        except (PairingAbortError, PairingTimeoutError):
             raise
         except BaseException:
             await connection.disconnect(retry_connection=False)

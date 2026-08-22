@@ -35,7 +35,9 @@ def test_float_duration_from_caller_reaches_the_wire_as_an_integer() -> None:
         track_duration=217.0 * 1000,
         playback_speed=1000,
         year=2020.0,
-        track=3.0,
+        album_track=3.0,
+        queue_track=7.0,
+        total_tracks=12.0,
     )
 
     for update in (metadata.diff_update(None, timestamp=1_000_000), metadata.snapshot_update(1)):
@@ -43,4 +45,6 @@ def test_float_duration_from_caller_reaches_the_wire_as_an_integer() -> None:
         assert payload["progress"]["track_duration"] == 217_000
         assert type(payload["progress"]["track_duration"]) is int
         assert type(payload["year"]) is int
-        assert type(payload["track"]) is int
+        assert type(payload["album_track"]) is int
+        assert type(payload["queue_track"]) is int
+        assert type(payload["total_tracks"]) is int

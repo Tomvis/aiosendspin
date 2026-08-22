@@ -120,14 +120,18 @@ def test_metadata_role_path_emits_integers() -> None:
     update = SessionUpdateMetadata(
         timestamp=1.5e6,
         year=2020.0,
-        track=3.0,
+        album_track=3.0,
+        queue_track=7.0,
+        total_tracks=12.0,
         progress=Progress(track_progress=1000.0, track_duration=217000.0, playback_speed=1000.0),
     )
     payload = json.loads(update.to_json())
 
     assert payload["timestamp"] == 1_500_000
     assert payload["year"] == 2020
-    assert payload["track"] == 3
+    assert payload["album_track"] == 3
+    assert payload["queue_track"] == 7
+    assert payload["total_tracks"] == 12
     assert payload["progress"] == {
         "track_progress": 1000,
         "track_duration": 217000,

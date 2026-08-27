@@ -62,6 +62,9 @@ class _DummyConnection:
     def send_message(self, message: object) -> None:
         self.sent_json.append(message)
 
+    def drop_pending_binary(self, roles: list[str] | None) -> None:  # noqa: ARG002
+        return
+
     def send_role_message(self, role: str, message: object) -> None:  # noqa: ARG002
         self.sent_json.append(message)
 
@@ -225,7 +228,7 @@ async def test_reconnect_refreshes_audio_requirements_from_new_hello() -> None:
                     codec=AudioCodec.FLAC,
                     channels=2,
                     sample_rate=48_000,
-                    bit_depth=32,
+                    bit_depth=16,
                 )
             ],
         ),
@@ -239,7 +242,7 @@ async def test_reconnect_refreshes_audio_requirements_from_new_hello() -> None:
     first_req = role.get_audio_requirements()
     assert first_req is not None
     assert first_req.sample_rate == 48_000
-    assert first_req.bit_depth == 32
+    assert first_req.bit_depth == 16
     assert first_req.channels == 2
 
     client.detach_connection(None)

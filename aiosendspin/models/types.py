@@ -187,6 +187,7 @@ class MediaCommand(Enum):
 class PictureFormat(Enum):
     """Supported image formats for artwork/media art."""
 
+    # Removed from the spec, still served to clients that declare it.
     BMP = "bmp"
     JPEG = "jpeg"
     PNG = "png"
@@ -251,9 +252,16 @@ class GoodbyeReason(Enum):
 class PairMethod(Enum):
     """A pairing method a client offers or a server selects."""
 
-    DYNAMIC_PIN = "dynamic_pin"
+    DYNAMIC_PAIRING_CODE = "dynamic_pairing_code"
     PAIRING_PSK = "pairing_psk"
-    STATIC_PIN = "static_pin"
+    STATIC_PAIRING_CODE = "static_pairing_code"
+
+
+class PairingCodeFormat(Enum):
+    """An emission format for the dynamic pairing code."""
+
+    DIGITS = "digits"
+    QR_CODE = "qr_code"
 
 
 class PairAbortReason(Enum):
@@ -262,8 +270,7 @@ class PairAbortReason(Enum):
     ATTEMPT_TIMEOUT = "attempt_timeout"
     CONCURRENT_ATTEMPT = "concurrent_attempt"
     METHOD_NOT_SUPPORTED = "method_not_supported"
-    PIN_LENGTH_UNACCEPTABLE = "pin_length_unacceptable"
-    PIN_MISMATCH = "pin_mismatch"
+    PAIRING_CODE_MISMATCH = "pairing_code_mismatch"
     USER_CANCELLED = "user_cancelled"
 
 

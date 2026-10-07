@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from aiosendspin.models.controller import ControllerCommandPayload, ControllerStatePayload
@@ -28,7 +27,6 @@ from aiosendspin.server.roles.controller.events import (
     ControllerVolumeEvent,
 )
 from aiosendspin.server.roles.metadata.group import MetadataGroupRole
-from aiosendspin.server.roles.metadata.state import Metadata
 from aiosendspin.server.roles.player.events import VolumeChangedEvent
 
 if TYPE_CHECKING:
@@ -109,24 +107,25 @@ class ControllerGroupRole(GroupRole):
 
     def set_repeat(self, mode: RepeatMode) -> None:
         """Set group repeat mode and push state to members if changed."""
+        changed = mode != self._repeat
         self._repeat = mode
         self._push_state_to_members()
-        self._mirror_to_metadata_back_compat()
+        if changed:
+            self._restate_legacy_metadata()
 
     def set_shuffle(self, shuffle: bool) -> None:  # noqa: FBT001
         """Set group shuffle state and push state to members if changed."""
+        changed = shuffle != self._shuffle
         self._shuffle = shuffle
         self._push_state_to_members()
-        self._mirror_to_metadata_back_compat()
+        if changed:
+            self._restate_legacy_metadata()
 
-    def _mirror_to_metadata_back_compat(self) -> None:
-        """Mirror repeat/shuffle into metadata state for v1 clients."""
-        # Deprecated: drop with metadata dual-emit.
-        metadata_gr = self._group.group_role("metadata")
-        if not isinstance(metadata_gr, MetadataGroupRole):
-            return
-        current = metadata_gr.metadata or Metadata()
-        metadata_gr.set_metadata(replace(current, repeat=self._repeat, shuffle=self._shuffle))
+    # DEPRECATED(spec-pr-81): remove in aiosendspin <version>
+    def _restate_legacy_metadata(self) -> None:
+        metadata_group_role = self._group.group_role("metadata")
+        if isinstance(metadata_group_role, MetadataGroupRole):
+            metadata_group_role._restate_to_legacy_members()  # noqa: SLF001
 
     def set_supported_commands(self, commands: list[MediaCommand]) -> None:
         """Set the commands supported by the application.
@@ -144,31 +143,42 @@ class ControllerGroupRole(GroupRole):
         self._seek_max_ms = value
         self._push_state_to_members()
 
+    def push_state(self) -> None:
+        """Push controller state to all members if it changed since the last push."""
+        self._push_state_to_members()
+
     def on_member_join(self, role: Role) -> None:
         """Send current controller state to newly joined member."""
         self._send_state_to_role(role)
 
     def _get_supported_commands(self) -> list[MediaCommand]:
         """Get list of commands supported by protocol + application."""
-        protocol_commands = [
+        commands = {
             MediaCommand.VOLUME,
             MediaCommand.MUTE,
             MediaCommand.SWITCH,
-        ]
+            *self._supported_commands,
+        }
 
-        if self._supported_commands:
-            commands = set(protocol_commands) | set(self._supported_commands)
-        else:
-            commands = set(protocol_commands)
+        # Group volume and mute exist only while some player in the group supports them.
+        player_group_role = self._group.group_role("player")
+        if player_group_role is None or player_group_role.get_group_volume() is None:
+            commands.discard(MediaCommand.VOLUME)
+        if player_group_role is None or player_group_role.get_group_muted() is None:
+            commands.discard(MediaCommand.MUTE)
 
         # Absolute seek needs a known upper bound to advertise.
         if self._seek_max_ms is None:
             commands.discard(MediaCommand.SEEK)
 
-        return list(commands)
+        return [command for command in MediaCommand if command in commands]
 
     def _send_state_to_role(self, role: Role) -> None:
-        """Send current controller state to a single role."""
+        """
+        Send the complete current controller state to a single role.
+
+        Every required field is always set, falling back to defaults.
+        """
         supported_commands = self._get_supported_commands()
         controller_state = ControllerStatePayload(
             supported_commands=supported_commands,
@@ -255,12 +265,30 @@ class ControllerGroupRole(GroupRole):
         if cmd.command == MediaCommand.SEEK_RELATIVE:
             if cmd.offset_ms is None:
                 return
-            self.emit_group_event(ControllerSeekRelativeEvent(offset_ms=cmd.offset_ms))
+            offset_ms = self._clamp_seek_offset(cmd.offset_ms)
+            self.emit_group_event(ControllerSeekRelativeEvent(offset_ms=offset_ms))
             return
 
         event = self._command_to_event(cmd)
         if event is not None:
             self.emit_group_event(event)
+
+    def _clamp_seek_offset(self, offset_ms: int) -> int:
+        """Clamp an offset so its target lands between 0 and `seek_max_ms`.
+
+        From a position already beyond `seek_max_ms` the target is kept between 0 and that
+        position instead, so the seek never moves in the opposite direction.
+        """
+        metadata_group_role = self._group.group_role("metadata")
+        if not isinstance(metadata_group_role, MetadataGroupRole):
+            return offset_ms
+        position = metadata_group_role.track_progress
+        if position is None:
+            return offset_ms
+        target = max(0, position + offset_ms)
+        if self._seek_max_ms is not None:
+            target = min(target, max(position, self._seek_max_ms))
+        return target - position
 
     def _command_to_event(self, cmd: ControllerCommandPayload) -> ControllerEvent | None:
         """Convert a command payload to an event."""

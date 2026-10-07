@@ -18,11 +18,17 @@ from aiosendspin.models.source import (
     ClientHelloSourceSupport,
     ClientStreamStartPayload,
     ClientStreamStartSource,
+    SourceStatePayload,
 )
 from aiosendspin.models.types import AudioCodec, BinaryMessageType
 from aiosendspin.server.roles.source import SourceStreamStartedEvent
 from aiosendspin.server.roles.source.v1 import SourceV1Role
 from tests.conftest import sine_pcm_16bit
+
+
+class _ServerSideConnection:
+    def record_source_start(self) -> None:
+        pass
 
 
 class _ServerSideClient:
@@ -37,12 +43,15 @@ class _ServerSideClient:
             )
 
         self.info = _Info()
-        self.connection = object()
+        self.connection = _ServerSideConnection()
         self.available = True
         self.sent: list[Any] = []
 
     def _signal_event(self, event: Any) -> None:
         self.events.append(event)
+
+    def awaits_role_state(self, _role_family: str) -> bool:
+        return False
 
     def send_role_message(self, _family: str, message: Any) -> None:
         self.sent.append(message)
@@ -90,6 +99,9 @@ class _LoopbackConnection:
     def is_source_stream_active(self) -> bool:
         return self._role.stream_active
 
+    def is_in_rehandshake_quiet_period(self) -> bool:
+        return False
+
 
 class _ClientSideClient:
     def now_us(self) -> int:
@@ -106,7 +118,7 @@ async def test_source_loopback(codec: AudioCodec) -> None:
     server_client = _ServerSideClient()
     role = SourceV1Role(client=server_client)  # type: ignore[arg-type]
     role.on_connect()
-    role.on_client_state(ClientStatePayload(available=True))
+    role.on_client_state(ClientStatePayload(available=True, source=SourceStatePayload()))
     role.request_start()
     conn = _LoopbackConnection(role)
 
@@ -142,7 +154,7 @@ async def test_flac_24_bit_source_loopback_preserves_packed_pcm() -> None:
     server_client = _ServerSideClient()
     role = SourceV1Role(client=server_client)  # type: ignore[arg-type]
     role.on_connect()
-    role.on_client_state(ClientStatePayload(available=True))
+    role.on_client_state(ClientStatePayload(available=True, source=SourceStatePayload()))
     role.request_start()
     conn = _LoopbackConnection(role)
     capture = SourceCapture(

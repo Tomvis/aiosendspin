@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 
 from aiosendspin.client.connection import SendspinConnection
-from aiosendspin.client.source import SourceCapture
+from aiosendspin.client.source import MAX_CAPTURE_BACKLOG_US, SourceCapture
 from aiosendspin.models.player import SupportedAudioFormat
 from aiosendspin.models.types import AudioCodec
 from tests.conftest import sine_pcm_16bit
@@ -19,9 +19,14 @@ class _FakeConnection:
         self.chunks: list[tuple[int, bytes]] = []
         self.synchronized = synchronized
         self.source_stream_active = False
+        # Each capture starts with one server start delivered.
+        self.start_authorized = True
 
     async def send_client_stream_start(self, **kwargs: Any) -> None:
+        if not self.start_authorized:
+            raise RuntimeError("Source stream start requires a server start command")
         self.calls.append(("start", kwargs))
+        self.start_authorized = False
         self.source_stream_active = True
 
     async def send_source_chunk(self, frame: bytes, *, timestamp_us: int) -> None:
@@ -29,6 +34,7 @@ class _FakeConnection:
 
     async def send_client_stream_end(self) -> None:
         self.calls.append(("end", None))
+        self.start_authorized = False
         self.source_stream_active = False
 
     def compute_source_timestamp(self, capture_timestamp_us: int) -> int:
@@ -41,10 +47,16 @@ class _FakeConnection:
     def is_source_stream_active(self) -> bool:
         return self.source_stream_active
 
+    def is_in_rehandshake_quiet_period(self) -> bool:
+        return False
+
 
 class _FakeClient:
+    def __init__(self) -> None:
+        self.now = 1_000_000
+
     def now_us(self) -> int:
-        return 5_000_000
+        return self.now
 
 
 def _pcm_format() -> SupportedAudioFormat:
@@ -72,7 +84,7 @@ async def test_opus_timestamps_lead_capture_by_the_encoder_pre_skip() -> None:
 
 
 async def test_start_announces_client_stream_only() -> None:
-    """start() sends client_stream/start and nothing else (framing is the lifecycle)."""
+    """start() sends client-stream/start and nothing else (framing is the lifecycle)."""
     conn = _FakeConnection()
     capture = SourceCapture(_FakeClient(), conn, _pcm_format())  # type: ignore[arg-type]
     await capture.start()
@@ -137,13 +149,16 @@ async def test_start_before_time_sync_raises() -> None:
         await capture.start()
 
 
-async def test_start_recovers_after_connection_ends_stream() -> None:
-    """A capture can restart after its connection closes the wire stream."""
+async def test_start_requires_new_server_start_after_connection_ends_stream() -> None:
+    """A capture reopens after its connection ends the wire stream only on a new server start."""
     conn = _FakeConnection()
     capture = SourceCapture(_FakeClient(), conn, _pcm_format())  # type: ignore[arg-type]
     await capture.start()
     conn.source_stream_active = False
 
+    with pytest.raises(RuntimeError, match="server start"):
+        await capture.start()
+    conn.start_authorized = True
     await capture.start()
 
     assert [kind for kind, _ in conn.calls] == ["start", "start"]
@@ -161,15 +176,16 @@ async def test_stop_discards_buffer_after_connection_ends_stream() -> None:
 
     with pytest.raises(RuntimeError, match="start"):
         await capture.feed(sine_pcm_16bit(1))
+    conn.start_authorized = True
     await capture.start()
     await capture.feed(sine_pcm_16bit(1200), capture_timestamp_us=2_000_000)
     assert [timestamp for timestamp, _ in conn.chunks] == [2_000_000]
 
 
-def test_compute_source_timestamp_excludes_static_delay() -> None:
-    """Capture timestamps skip the static delay that playback conversion applies."""
+def test_compute_source_timestamp_excludes_output_delay() -> None:
+    """Capture timestamps skip the output delay that playback conversion applies."""
     conn = SendspinConnection.__new__(SendspinConnection)
-    conn._static_delay_us = 250_000  # noqa: SLF001
+    conn._output_delay_us = 250_000  # noqa: SLF001
 
     class _IdentityFilter:
         def compute_server_time(self, client_time: int) -> int:
@@ -178,3 +194,38 @@ def test_compute_source_timestamp_excludes_static_delay() -> None:
     conn._time_filter = _IdentityFilter()  # type: ignore[assignment]  # noqa: SLF001
     assert conn.compute_source_timestamp(1_000_000) == 1_000_000
     assert conn.compute_server_time(1_000_000) == 1_250_000
+
+
+async def test_feed_drops_pcm_older_than_the_backlog_bound() -> None:
+    """Stall backlog is dropped, and fresh capture then streams at its own timestamp."""
+    client = _FakeClient()
+    client.now = 10_000_000
+    conn = _FakeConnection()
+    capture = SourceCapture(client, conn, _pcm_format())  # type: ignore[arg-type]
+    await capture.start()
+    frame = sine_pcm_16bit(1200)
+
+    await capture.feed(frame, capture_timestamp_us=client.now - 2 * MAX_CAPTURE_BACKLOG_US)
+    await capture.feed(frame, capture_timestamp_us=client.now - MAX_CAPTURE_BACKLOG_US + 1)
+    await capture.feed(frame)
+
+    assert [ts for ts, _ in conn.chunks] == [client.now - MAX_CAPTURE_BACKLOG_US + 1, client.now]
+    assert [kind for kind, _ in conn.calls] == ["start"]
+
+
+async def test_feed_skips_encoded_frames_that_went_stale() -> None:
+    """A frame the encoder held across a stall is skipped once its capture time is stale."""
+    client = _FakeClient()
+    conn = _FakeConnection()
+    capture = SourceCapture(client, conn, _pcm_format())  # type: ignore[arg-type]
+    await capture.start()
+    start_us = client.now
+
+    # The 100 samples past the first 25 ms frame stay in the encoder.
+    await capture.feed(sine_pcm_16bit(1300), capture_timestamp_us=start_us)
+    client.now = start_us + 1_000_000
+    await capture.feed(sine_pcm_16bit(1200), capture_timestamp_us=client.now)
+    await capture.feed(sine_pcm_16bit(1200), capture_timestamp_us=client.now + 25_000)
+
+    # The held frame starts with stale capture; the next starts 100 samples into fresh audio.
+    assert [ts for ts, _ in conn.chunks] == [start_us, client.now + 22_916]

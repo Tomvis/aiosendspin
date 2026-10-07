@@ -13,7 +13,7 @@ from dataclasses import dataclass
 
 import pytest
 
-from aiosendspin.models.core import ClientHelloPayload, StreamEndMessage
+from aiosendspin.models.core import ClientHelloPayload, ClientStatePayload, StreamEndMessage
 from aiosendspin.models.player import ClientHelloPlayerSupport, SupportedAudioFormat
 from aiosendspin.models.types import (
     AudioCodec,
@@ -21,10 +21,12 @@ from aiosendspin.models.types import (
     PlayerCommand,
     Roles,
 )
-from aiosendspin.models.visualizer import ClientHelloVisualizerSupport
+from aiosendspin.models.visualizer import ClientHelloVisualizerSupport, VisualizerStatePayload
 from aiosendspin.server.client import SendspinClient
 from aiosendspin.server.clock import LoopClock
 from aiosendspin.server.group import SendspinGroup
+from aiosendspin.server.roles.color.group import ColorGroupRole
+from aiosendspin.server.roles.color.state import Color
 
 
 @dataclass(slots=True)
@@ -91,9 +93,7 @@ def _hello(client_id: str, *, supported_roles: list[str]) -> ClientHelloPayload:
             supported_commands=[PlayerCommand.VOLUME, PlayerCommand.MUTE],
         )
     if Roles.VISUALIZER.value in supported_roles:
-        visualizer_support = ClientHelloVisualizerSupport(
-            types=["loudness", "beat"], buffer_capacity=65536, rate_max=30
-        )
+        visualizer_support = ClientHelloVisualizerSupport(buffer_capacity=65536)
     return ClientHelloPayload(
         client_id=client_id,
         name=client_id,
@@ -153,6 +153,13 @@ async def test_surviving_visualizer_gets_stream_end_without_active_stream() -> N
 
     group = player.group
     await group.add_client(visualizer)
+    # The visualizer stream was announced before the track transition kept it open.
+    role = visualizer.role(Roles.VISUALIZER.value)
+    assert role is not None
+    role.on_client_state(
+        ClientStatePayload(visualizer=VisualizerStatePayload(types=["loudness"], rate_max=30))
+    )
+    role.on_stream_start()
     # PLAYING with no PushStream mirrors the track-transition window.
     group._set_playback_state(PlaybackStateType.PLAYING)  # noqa: SLF001
     assert not group.has_active_stream
@@ -198,6 +205,10 @@ async def test_removing_sole_player_from_streamless_playing_group_sends_stream_e
 
     player = _make_client(server, "web", supported_roles=[Roles.PLAYER.value])
     group = player.group
+    # The player stream was announced before the track transition kept it open.
+    role = player.role(Roles.PLAYER.value)
+    assert role is not None
+    role._stream_started = True  # noqa: SLF001
     group._set_playback_state(PlaybackStateType.PLAYING)  # noqa: SLF001
     assert not group.has_active_stream
 
@@ -208,3 +219,40 @@ async def test_removing_sole_player_from_streamless_playing_group_sends_stream_e
     await group.remove_client(player)
 
     assert any(isinstance(msg, StreamEndMessage) for _, msg in connection.role_messages)
+
+
+@pytest.mark.asyncio
+async def test_deleting_group_cancels_deferred_scheduled_send() -> None:
+    """A group emptied while holding back a scheduled state stops its deferred send."""
+    loop = asyncio.get_running_loop()
+    server = _DummyServer(loop=loop, clock=LoopClock(loop))
+    mover = _make_client(server, "mover", supported_roles=[Roles.PLAYER.value])
+    target = _make_client(server, "target", supported_roles=[Roles.PLAYER.value])
+    color_role = mover.group.group_role("color")
+    assert isinstance(color_role, ColorGroupRole)
+    color_role.set_color(Color(primary=(1, 2, 3)), timestamp_us=server.clock.now_us() + 60_000_000)
+    handle = color_role._send_scheduled_handle  # noqa: SLF001
+    assert handle is not None
+
+    await target.group.add_client(mover)
+
+    assert handle.cancelled()
+    assert color_role._send_scheduled_handle is None  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_removing_player_from_stopped_group_sends_no_stream_end() -> None:
+    """A player removed from a stopped multi-client group had no stream, so gets no stream/end."""
+    loop = asyncio.get_running_loop()
+    server = _DummyServer(loop=loop, clock=LoopClock(loop))
+    owner = _make_client(server, "owner", supported_roles=[Roles.PLAYER.value])
+    member = _make_client(server, "member", supported_roles=[Roles.PLAYER.value])
+    await owner.group.add_client(member)
+    assert owner.group.state == PlaybackStateType.STOPPED
+    connection = member.connection
+    assert connection is not None
+    connection.role_messages.clear()
+
+    await owner.group.remove_client(member)
+
+    assert not any(isinstance(msg, StreamEndMessage) for _, msg in connection.role_messages)

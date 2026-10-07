@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable
 from contextlib import suppress
 from types import SimpleNamespace
 from typing import ClassVar
@@ -11,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from aiohttp import ClientConnectionError, ClientWebSocketResponse
 
-from aiosendspin.models.types import GoodbyeReason, PairMethod
+from aiosendspin.models.types import ConnectionReason, GoodbyeReason, PairMethod
 from aiosendspin.noise.keys import Identity, generate_psk
 from aiosendspin.noise.pairing import PairingAttempt
 from aiosendspin.noise.trust_store import InMemoryServerPairingStore
@@ -216,20 +217,67 @@ async def test_connect_to_client_and_wait_can_retry_initial_failure(
     assert session.calls == 2
 
 
+class _FailThenConnectSession:
+    """Client session whose first ``failures`` connections fail."""
+
+    def __init__(self, failures: int) -> None:
+        self.closed = False
+        self.calls = 0
+        self._failures = failures
+
+    def ws_connect(self, *_args: object, **_kwargs: object) -> _SuccessfulConnectContext:
+        self.calls += 1
+        if self.calls <= self._failures:
+            raise ClientConnectionError("offline")
+        return _SuccessfulConnectContext()
+
+    async def close(self) -> None:
+        self.closed = True
+
+
 @pytest.mark.asyncio
-async def test_connect_to_client_and_wait_raises_when_initial_retry_exhausted(
+async def test_connect_to_client_and_wait_retries_initial_failure_past_backoff_ceiling(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Bounded initial retry should not leave waiters unresolved."""
-    session = _FailingInitialConnectSession()
+    """Initial retry keeps going at the backoff ceiling until the client is reachable."""
+    session = _FailThenConnectSession(failures=4)
     server = _make_server(session)
     url = "ws://127.0.0.1:9999/sendspin"
+    sleep_calls: list[float] = []
+
+    class _FakeConnection:
+        closing = False
+        goodbye_reason = None
+        should_retry_server_initiated_connection = False
+
+        def __init__(
+            self,
+            _server: SendspinServer,
+            *,
+            wsock_client: object,  # noqa: ARG002
+            url: str | None = None,  # noqa: ARG002
+            expected_client_id: str | None = None,  # noqa: ARG002
+            pairing_attempt: object | None = None,  # noqa: ARG002
+        ) -> None:
+            return
+
+        async def handle_client(self) -> None:
+            return
+
+    async def _fake_wait_for(awaitable: Awaitable[object], timeout: float) -> None:  # noqa: ASYNC109
+        sleep_calls.append(timeout)
+        if asyncio.iscoroutine(awaitable):
+            awaitable.close()
+        raise TimeoutError
+
+    monkeypatch.setattr("aiosendspin.server.server.SendspinConnection", _FakeConnection)
     monkeypatch.setattr("aiosendspin.server.server.MAX_RECONNECT_BACKOFF_S", 1.0)
+    monkeypatch.setattr("aiosendspin.server.server.asyncio.wait_for", _fake_wait_for)
 
-    with pytest.raises(TimeoutError, match="Initial connection did not succeed"):
-        await server.connect_to_client_and_wait(url, retry_initial_connection=True)
+    await server.connect_to_client_and_wait(url, retry_initial_connection=True)
 
-    assert session.calls == 1
+    assert session.calls == 5
+    assert sleep_calls == [1.0, 1.0, 1.0, 1.0]
 
 
 @pytest.mark.asyncio
@@ -373,16 +421,17 @@ async def test_server_initiated_backoff_resets_only_after_stable_session(
 
 
 @pytest.mark.asyncio
-async def test_retry_indefinitely_keeps_reconnecting_after_backoff_ceiling(
+async def test_reconnects_past_backoff_ceiling_without_giving_up(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Persistent address connections should cap backoff without giving up."""
+    """Reconnection caps the backoff at its ceiling and never gives up on its own."""
     session = _PersistentSuccessfulSession()
     server = _make_server(session)
     url = "ws://127.0.0.1:9999/sendspin"
+    max_attempts = 5
     attempts = 0
     sleep_calls: list[float] = []
-    monotonic_iter = iter([0.0, 0.1, 0.2, 0.3])
+    monotonic_iter = iter([float(i) for i in range(2 * max_attempts)])
 
     class _FakeConnection:
         closing = False
@@ -399,7 +448,7 @@ async def test_retry_indefinitely_keeps_reconnecting_after_backoff_ceiling(
         ) -> None:
             nonlocal attempts
             attempts += 1
-            self.should_retry_server_initiated_connection = attempts < 2
+            self.should_retry_server_initiated_connection = attempts < max_attempts
 
         async def handle_client(self) -> None:
             return
@@ -411,22 +460,40 @@ async def test_retry_indefinitely_keeps_reconnecting_after_backoff_ceiling(
         return next(monotonic_iter)
 
     monkeypatch.setattr("aiosendspin.server.server.SendspinConnection", _FakeConnection)
-    monkeypatch.setattr("aiosendspin.server.server.MAX_RECONNECT_BACKOFF_S", 1.0)
+    monkeypatch.setattr("aiosendspin.server.server.MAX_RECONNECT_BACKOFF_S", 2.0)
     monkeypatch.setattr(
         "aiosendspin.server.server.time",
         SimpleNamespace(monotonic=_fake_monotonic),
     )
     monkeypatch.setattr("aiosendspin.server.server.asyncio.sleep", _fake_sleep)
-    server._set_connection_options(  # noqa: SLF001
-        url,
-        retry_initial_connection=False,
-        retry_indefinitely=True,
-    )
 
     await server._handle_client_connection(url)  # noqa: SLF001
 
+    assert session.calls == max_attempts
+    assert sleep_calls == [1.0, 2.0, 2.0, 2.0]
+
+
+# DEPRECATED(spec-pr-207): remove in aiosendspin <version>
+@pytest.mark.asyncio
+async def test_retry_indefinitely_keyword_is_accepted_and_ignored() -> None:
+    """The retired retry_indefinitely keyword is still accepted and has no effect."""
+    session = _FailingInitialConnectSession()
+    server = _make_server(session)
+    url = "ws://127.0.0.1:9999/sendspin"
+
+    with pytest.raises(ClientConnectionError):
+        await server.connect_to_client_and_wait(url, retry_indefinitely=True)
+    await _wait_for_connection_task_cleanup(server, url)
+
+    server.connect_to_client(url, retry_indefinitely=True)
+    await _wait_for_connection_task_cleanup(server, url)
+
     assert session.calls == 2
-    assert sleep_calls == [1.0]
+    assert url not in server._connection_tasks  # noqa: SLF001
+    assert not hasattr(
+        server._get_connection_options(url),  # noqa: SLF001
+        "retry_indefinitely",
+    )
 
 
 def test_should_retry_false_when_closing() -> None:
@@ -646,9 +713,39 @@ async def test_mdns_update_reconnect_decision(
 
     assert server._mdns_client_urls[service_name] == expected_url  # noqa: SLF001
     if expect_reconnect:
-        server.connect_to_client.assert_called_once_with(expected_url)
+        server.connect_to_client.assert_called_once_with(
+            expected_url, connection_reason=ConnectionReason.DISCOVERY
+        )
     else:
         server.connect_to_client.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_mdns_reannounce_keeps_pending_playback_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An mDNS re-announce before the reclaim dial activates keeps its playback reason."""
+    server = _make_server(_PersistentSuccessfulSession())
+    service_name = "service._sendspin._tcp.local."
+    url = "ws://10.0.0.2:9999/sendspin"
+
+    _FakeAsyncServiceInfo.addresses = ["10.0.0.2"]
+    _FakeAsyncServiceInfo.port = 9999
+    _FakeAsyncServiceInfo.properties = {b"path": b"/sendspin"}
+    monkeypatch.setattr("aiosendspin.server.server.AsyncServiceInfo", _FakeAsyncServiceInfo)
+
+    connection_task = asyncio.create_task(asyncio.sleep(3600))
+    server._connection_tasks[url] = connection_task  # noqa: SLF001
+    server.register_client_url("speaker", url)
+
+    try:
+        assert server.reclaim_client_for_playback("speaker", timeout_s=0)
+        await server._handle_service_added(MagicMock(), "_sendspin._tcp.local.", service_name)  # noqa: SLF001
+        assert server.get_connection_reason(url) is ConnectionReason.PLAYBACK
+    finally:
+        connection_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await connection_task
 
 
 @pytest.mark.asyncio
@@ -659,7 +756,9 @@ async def test_pairing_attempt_queued_for_existing_dial_task(
     session = _PersistentSuccessfulSession()
     server = _make_server(session)
     url = "ws://127.0.0.1:9999/sendspin"
-    attempt = PairingAttempt(method=PairMethod.PAIRING_PSK, pairing_psk=generate_psk())
+    attempt = PairingAttempt(
+        method=PairMethod.PAIRING_PSK, pairing_psk=generate_psk(), client_id="client-A"
+    )
     received: list[object] = []
 
     class _FakeConnection:

@@ -38,6 +38,11 @@ class _DummyGroup:
         self.clients = clients
         self.transformer_pool = TransformerPool()
 
+    group_name = "dummy group"
+
+    def _publish_if_name_changed(self, previous: str) -> None:  # noqa: ARG002
+        return
+
     def on_client_connected(self, client: SendspinClient) -> None:  # noqa: ARG002
         return
 
@@ -79,6 +84,7 @@ class _FakeConnection:
         buffer_end_time_us: int | None = None,
         buffer_byte_count: int | None = None,
         duration_us: int | None = None,
+        player_audio_header: bool = False,  # noqa: ARG002
     ) -> bool:
         self.sent_binary.append(data)
         if (
@@ -95,6 +101,7 @@ def _make_client_hello() -> MagicMock:
     hello = MagicMock()
     hello.client_id = "test-client"
     hello.name = "Test Client"
+    hello.device_info = None
     hello.player_support = ClientHelloPlayerSupport(
         supported_formats=[
             SupportedAudioFormat(

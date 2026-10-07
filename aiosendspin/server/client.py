@@ -24,14 +24,13 @@ from aiosendspin.models.types import (
     GoodbyeReason,
     PlaybackStateType,
     Roles,
-    TrustLevel,
     has_role,
     has_role_family,
 )
 from aiosendspin.noise.trust_store import PskCategory
 from aiosendspin.util import create_task
 
-from .compliance import ClientComplianceError
+from .compliance import ClientComplianceError, describe_client, noncompliance_subject
 from .events import ClientEvent, ClientGroupChangedEvent
 from .roles import Role
 from .roles.base import BinaryHandling
@@ -85,8 +84,6 @@ class ConnectionSecurity:
 
     psk_category: PskCategory
     """Category of the PSK that admitted the connection; a server-verified fact."""
-    trust_level: TrustLevel
-    """Trust the client declared toward this server; a client-asserted claim."""
 
 
 class SendspinClient:
@@ -98,6 +95,8 @@ class SendspinClient:
         self._client_id = client_id
         self._name = client_id
         self._info: ClientHelloPayload | None = None
+        # Operator-facing identity for log lines, replaced from every hello.
+        self._description = describe_client(None, client_id)
         self._negotiated_role_ids: list[str] = []
         self._roles: dict[str, Role] = {}
         # Cached tuple of active roles, rebuilt when the role set changes.
@@ -110,6 +109,9 @@ class SendspinClient:
         self._roles_warm_disconnected: bool = False
         self._roles_cold_preinitialized: bool = False
         self._roles_attached: bool = False
+        # Families of roles activated on the current connection that still wait for
+        # their client/state object; they get no stream or binary until it arrives.
+        self._roles_awaiting_state: set[str] = set()
 
         self.disconnect_behaviour = DisconnectBehaviour.UNGROUP
 
@@ -119,11 +121,11 @@ class SendspinClient:
         # Client-level availability (reported by client/state). Persists across reconnects.
         self._available: bool = True
 
-        # External-source recovery state (persists across reconnects).
+        # Previous-group recovery state (persists across reconnects).
         self._previous_group_id: str | None = None
-        """Group ID to rejoin after external_source ends."""
-        self._external_source_solo_group_id: str | None = None
-        """Solo group ID created when entering external_source."""
+        """Group ID a switch rejoins after the client became unavailable or left."""
+        self._leave_solo_group_id: str | None = None
+        """Solo group ID the client was moved to on becoming unavailable or leaving."""
         self._switch_lock: asyncio.Lock = asyncio.Lock()
 
         # Role-owned persistent state (per role family).
@@ -143,15 +145,17 @@ class SendspinClient:
 
     def flag_noncompliance(self, reason: str) -> None:
         """Log a tolerated spec violation once, or reject it when the server is strict."""
+        subject = noncompliance_subject(self._description)
         if not self._server.allow_noncompliant_clients:
-            self._logger.error("rejecting non-compliant client: %s", reason)
+            self._logger.error("rejecting %s: %s", subject, reason)
             raise ClientComplianceError(reason)
         # Recurring deviations (e.g. per client/state) would otherwise log every
-        # message, so log each distinct reason only once.
+        # message, so log each distinct reason only once. The subject names the client,
+        # not the deviation, so it takes no part in the dedupe.
         if reason in self._noncompliance_logged:
             return
         self._noncompliance_logged.add(reason)
-        self._logger.warning("non-compliant client: %s", reason)
+        self._logger.warning("%s: %s", subject, reason)
 
     @property
     def client_id(self) -> str:
@@ -250,11 +254,7 @@ class SendspinClient:
         conn = self._connection
         if conn is None or conn.psk_category is None:
             return None
-        trust_level = self._info.trust_level if self._info is not None else TrustLevel.NONE
-        return ConnectionSecurity(
-            psk_category=conn.psk_category,
-            trust_level=trust_level,
-        )
+        return ConnectionSecurity(psk_category=conn.psk_category)
 
     @property
     def is_paired(self) -> bool:
@@ -282,8 +282,11 @@ class SendspinClient:
         """Return whether the client is available to participate, per `client/state`."""
         return self._available
 
-    async def handle_availability_change(self, available: bool) -> None:  # noqa: FBT001
-        """Handle a client availability change by notifying all roles."""
+    async def set_availability(self, available: bool) -> None:  # noqa: FBT001
+        """Record the availability a `client/state` reports and notify all roles.
+
+        Group membership is left unchanged.
+        """
         old_available = self._available
         self._available = available
 
@@ -293,22 +296,29 @@ class SendspinClient:
             if coro is not None:
                 await coro
 
+    async def handle_availability_change(self, available: bool) -> None:  # noqa: FBT001
+        """Handle a client availability change; becoming unavailable leaves any shared group."""
+        await self.set_availability(available)
         if not available:
-            await self._handle_external_source_transition()
+            await self._leave_to_solo_group()
 
-    async def _handle_external_source_transition(self) -> None:
-        """Move the client out of any shared group when it switches to external_source.
+    async def handle_leave(self) -> None:
+        """Handle `client/leave`: move to a stopped solo group, keeping availability."""
+        await self._leave_to_solo_group()
+
+    async def _leave_to_solo_group(self) -> None:
+        """Move the client out of any shared group when it becomes unavailable or leaves.
 
         - Multi-client group: remember the previous group and move to a solo group.
         - Solo group: stop playback so the client is no longer streaming.
         """
         previous_group_id = await self.quiesce_to_solo_stopped()
         if previous_group_id is None:
-            self._logger.debug("Client already in solo group, stopped playback for external_source")
+            self._logger.debug("Client already in solo group, stopped playback")
             return
         self._previous_group_id = previous_group_id
-        self._external_source_solo_group_id = self.group.group_id
-        self._logger.debug("Stored previous group %s for external_source", previous_group_id)
+        self._leave_solo_group_id = self.group.group_id
+        self._logger.debug("Stored previous group %s", previous_group_id)
 
     async def handle_switch_command(self) -> None:
         """Cycle this client through available groups."""
@@ -324,7 +334,7 @@ class SendspinClient:
             self._logger.debug("Ignoring switch command while client is in external_source state")
             return
 
-        # External-source recovery takes priority over the normal cycle.
+        # Previous-group recovery takes priority over the normal cycle.
         if await self._try_rejoin_previous_group():
             return
 
@@ -403,15 +413,15 @@ class SendspinClient:
         return [*multi_client_playing, *single_client]
 
     def _should_rejoin_previous_group(self) -> bool:
-        """Return True when switch should rejoin the pre-external-source group.
+        """Return True when switch should rejoin the group the client was moved out of.
 
-        Per spec: if the client is still in the solo group created by its
-        ``external_source`` transition, switch prioritizes rejoining that group.
+        Per spec: if the client is still in the solo group it was moved to on becoming
+        unavailable or on ``client/leave``, switch prioritizes rejoining that group.
         """
         return (
             self._previous_group_id is not None
             and self._available
-            and self._external_source_solo_group_id == self.group.group_id
+            and self._leave_solo_group_id == self.group.group_id
             and len(self.group.clients) == 1
         )
 
@@ -420,15 +430,13 @@ class SendspinClient:
             return False
 
         previous_group_id = self._previous_group_id
-        # Clear external_source tracking after attempt, regardless of outcome.
+        # Clear previous-group tracking after attempt, regardless of outcome.
         self._previous_group_id = None
-        self._external_source_solo_group_id = None
+        self._leave_solo_group_id = None
 
         previous_group = self._find_group_by_id(previous_group_id)
         if previous_group is not None and previous_group != self.group:
-            self._logger.info(
-                "Rejoining previous group %s after external_source", previous_group_id
-            )
+            self._logger.info("Rejoining previous group %s", previous_group_id)
             await self.group.remove_client(self)
             await previous_group.add_client(self)
             return True
@@ -479,6 +487,7 @@ class SendspinClient:
 
         self._connection = connection
         self._connected = False  # set True once initial state is received (spec)
+        self._roles_awaiting_state.clear()
         self._cleanup_on_mdns_removal = False
         on_transport_attached = getattr(self._server, "on_client_transport_attached", None)
         if callable(on_transport_attached):
@@ -547,26 +556,66 @@ class SendspinClient:
                 self._rebuild_binary_handling_cache()
             return
 
-        # Tear down in reverse attach order: the controller unwinds before the player it reads.
-        for role_id in reversed(list(self._roles)):
-            if role_id not in desired_set:
-                deactivated_role = self._roles.pop(role_id)
-                deactivated_role.on_deactivate()
-                self.group.on_role_deactivated(deactivated_role)
+        self.deactivate_roles(active_role_ids)
 
         roles: dict[str, Role] = {}
+        activated: list[Role] = []
         for role_id in active_role_ids:
             role = self._roles.get(role_id)
             if role is None:
                 role = create_role(role_id, self)
                 if role is None:
                     continue
+                if role.requires_activation_state():
+                    self._roles_awaiting_state.add(role.role_family)
                 role.on_connect()
-                self.group.on_role_activated(role)
+                activated.append(role)
             roles[role.role_id] = role
         self._roles = roles
 
         self._rebuild_binary_handling_cache()
+        for role in activated:
+            self.join_active_stream(role)
+
+    def deactivate_roles(self, active_role_ids: list[str]) -> None:
+        """Deactivate every active role missing from ``active_role_ids``."""
+        desired_set = set(active_role_ids)
+        deactivated = False
+        # Tear down in reverse attach order: the controller unwinds before the player it reads.
+        for role_id in reversed(list(self._roles)):
+            if role_id not in desired_set:
+                deactivated_role = self._roles.pop(role_id)
+                self._roles_awaiting_state.discard(deactivated_role.role_family)
+                deactivated_role.on_deactivate()
+                self.group.on_role_deactivated(deactivated_role)
+                deactivated = True
+        if deactivated:
+            self._rebuild_binary_handling_cache()
+
+    def awaits_role_state(self, role_family: str) -> bool:
+        """Whether an activated role's stream and binary wait for its client/state object."""
+        return role_family in self._roles_awaiting_state
+
+    def release_role_hold(self, role_family: str) -> None:
+        """Stop holding a role whose client/state object has arrived."""
+        self._roles_awaiting_state.discard(role_family)
+
+    def release_all_role_holds(self) -> None:
+        """Stop holding every role."""
+        self._roles_awaiting_state.clear()
+
+    def join_active_stream(self, role: Role) -> None:
+        """Join an active, released role to its group's running stream.
+
+        Does nothing until the client is connected or while the role awaits its
+        client/state object.
+        """
+        if (
+            self._connected
+            and self._roles.get(role.role_id) is role
+            and not self.awaits_role_state(role.role_family)
+        ):
+            self.group.on_role_activated(role)
 
     def refresh_identity_from_hello(
         self, client_info: ClientHelloPayload, *, negotiated_roles: list[str]
@@ -730,6 +779,7 @@ class SendspinClient:
             for role in reversed(self._roles.values()):
                 role.on_disconnect()
         self._roles.clear()
+        self._roles_awaiting_state.clear()
         self._active_roles = None
         self._binary_handling_cache.clear()
         self._roles_cold_preinitialized = False
@@ -743,10 +793,17 @@ class SendspinClient:
     ) -> None:
         """Store hello identity/capabilities with optional explicit negotiated roles."""
         self._info = client_info
+        self._description = describe_client(client_info, self._client_id)
+        # A group with no name of its own reports its founding member's, so this device
+        # learning its own name can change what its whole group is called.
+        group = self._group
+        previous_group_name = group.group_name if group is not None else None
         self._name = client_info.name
+        if group is not None and previous_group_name is not None:
+            group._publish_if_name_changed(previous_group_name)  # noqa: SLF001
         if negotiated_roles is None:
             self._negotiated_role_ids = negotiate_roles(
-                client_info.supported_roles, strict=not self._server.allow_noncompliant_clients
+                client_info.activatable_roles, strict=not self._server.allow_noncompliant_clients
             )
         else:
             self._negotiated_role_ids = negotiated_roles
@@ -790,8 +847,17 @@ class SendspinClient:
         buffer_end_time_us: int | None = None,
         buffer_byte_count: int | None = None,
         duration_us: int | None = None,
+        player_audio_header: bool = False,
+        epoch_exempt: bool = False,
     ) -> None:
-        """Enqueue a binary payload for this client, or no-op when disconnected."""
+        """
+        Enqueue a binary message for this client, or no-op when disconnected.
+
+        `data` is the full frame, or only the audio payload when `player_audio_header`
+        is set; the connection then prepends the player audio header at send time.
+        An `epoch_exempt` message is sent even after a stream boundary drops the
+        role's other queued binary.
+        """
         if self._connection is None:
             return
         self._connection.send_binary(
@@ -802,7 +868,15 @@ class SendspinClient:
             buffer_end_time_us=buffer_end_time_us,
             buffer_byte_count=buffer_byte_count,
             duration_us=duration_us,
+            player_audio_header=player_audio_header,
+            epoch_exempt=epoch_exempt,
         )
+
+    async def wait_role_drained(self, role_family: str) -> None:
+        """Return once nothing is queued for `role_family`, or at once when disconnected."""
+        if self._connection is None:
+            return
+        await self._connection.wait_role_drained(role_family)
 
     def drop_pending_binary(self, roles: list[str] | None) -> None:
         """Drop queued binary payloads for the given role families, if connected."""

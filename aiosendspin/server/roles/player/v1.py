@@ -2,7 +2,7 @@
 
 This PlayerV1Role implementation uses hook-based streaming:
 - on_stream_start(): Send stream/start message
-- on_audio_chunk(): Pack and send binary audio
+- on_audio_chunk(): Send binary audio; the connection adds the header
 - on_stream_clear(): Send stream/clear message
 - on_stream_end(): Send stream/end message
 """
@@ -27,7 +27,13 @@ from aiosendspin.models.core import (
     StreamStartMessage,
     StreamStartPayload,
 )
-from aiosendspin.models.player import PlayerCommandPayload, StreamStartPlayer, SupportedAudioFormat
+from aiosendspin.models.player import (
+    PLAYER_AUDIO_HEADER_SIZE,
+    PlayerCommandPayload,
+    PlayerStatePayload,
+    StreamStartPlayer,
+    SupportedAudioFormat,
+)
 from aiosendspin.models.types import PlayerCommand
 from aiosendspin.server.audio import AudioFormat, BufferTracker
 from aiosendspin.server.roles.base import (
@@ -45,8 +51,8 @@ from aiosendspin.server.roles.player.audio_transformers import (
 from aiosendspin.server.roles.player.capabilities import can_encode_format, filter_encodable_formats
 from aiosendspin.server.roles.player.events import (
     MinBufferChangedEvent,
+    OutputDelayChangedEvent,
     RequiredLeadTimeChangedEvent,
-    StaticDelayChangedEvent,
     VolumeChangedEvent,
 )
 from aiosendspin.util import create_task
@@ -56,6 +62,8 @@ if TYPE_CHECKING:
 
 
 BUFFER_TRACKER_RESET_DELAY_S = 2.0
+# Largest required_lead_time_ms / min_buffer_ms the server honours; larger values are clamped.
+MAX_TIMING_PARAMETER_MS = 30_000
 
 
 @dataclass
@@ -69,7 +77,7 @@ class PlayerPersistentState:
     max_duration_us: int = 30_000_000
     disconnect_time_us: int | None = None
     buffer_reset_handle: asyncio.TimerHandle | None = None
-    static_delay_ms: int = 0
+    output_delay_ms: int = 0
     required_lead_time_ms: int = 250
     min_buffer_ms: int = 1000
     state_supported_commands: list[PlayerCommand] = field(default_factory=list)
@@ -82,7 +90,7 @@ class PlayerV1Role(Role):
 
     Hook-based streaming:
     - on_stream_start(): Send stream/start message
-    - on_audio_chunk(): Pack and send binary audio
+    - on_audio_chunk(): Send binary audio; the connection adds the header
     - on_stream_clear(): Send stream/clear message
     - on_stream_end(): Send stream/end message
     """
@@ -108,6 +116,11 @@ class PlayerV1Role(Role):
         self._preferred_format_override = preferred_format
         self._preferred_format: AudioFormat | None = None
         self._preferred_codec: AudioCodec | None = None
+        # Format the client prefers via client/state, for this connection only.
+        self._client_format: SupportedAudioFormat | None = None
+        # DEPRECATED(spec-pr-195): remove in aiosendspin <version>
+        # Set when the slot came from stream/request-format, whose senders omit `format`.
+        self._client_format_legacy = False
         self._audio_requirements = audio_requirements
         self._stream_started = False
         self._buffer_tracker = None
@@ -121,6 +134,8 @@ class PlayerV1Role(Role):
         self._pending_stream_start = False
         # Last format announced to the client via stream/start.
         self._last_sent_format: tuple[AudioCodec, int, int, int, str | None] | None = None
+        # End timestamp of the last audio chunk sent in the current stream.
+        self._sent_end_us: int | None = None
 
     @property
     def role_id(self) -> str:
@@ -198,10 +213,16 @@ class PlayerV1Role(Role):
 
     def on_connect(self) -> None:
         """Reset stream state and subscribe to PlayerGroupRole."""
+        state = self._state()
+        # No command may be sent until this connection's client/state declares it;
+        # cleared before subscribing so the group recomputes without the old commands.
+        state.state_supported_commands = []
         self._subscribe_to_group_role()
         self._stream_started = False
         self._last_sent_format = None
-        state = self._state()
+        self._sent_end_us = None
+        self._client_format = None
+        self._client_format_legacy = False
         if state.buffer_reset_handle is not None:
             state.buffer_reset_handle.cancel()
             state.buffer_reset_handle = None
@@ -252,6 +273,15 @@ class PlayerV1Role(Role):
         """Player role requires initial state with volume/mute info."""
         return True
 
+    def on_availability_changed(
+        self,
+        old_available: bool,  # noqa: FBT001
+        new_available: bool,  # noqa: FBT001
+    ) -> None:
+        """Rejoin the running stream at the playhead once a held stream/start may be sent."""
+        if new_available and not old_available and self._pending_stream_start:
+            self._client.join_active_stream(self)
+
     def on_group_changed(self, group: object) -> None:
         """Refresh transformer selection when group changes."""
         super().on_group_changed(group)
@@ -264,6 +294,7 @@ class PlayerV1Role(Role):
         self._stream_started = False
         self._pending_stream_start = False
         self._last_sent_format = None
+        self._sent_end_us = None
         self.reset_binary_timing()
         self._ensure_audio_requirements(force=True)
 
@@ -333,9 +364,13 @@ class PlayerV1Role(Role):
         self._last_sent_format = current_format
 
     def on_audio_chunk(self, chunk: AudioChunk) -> None:
-        """Pack and send binary audio. Late audio is discarded by connection."""
+        """Send binary audio; the connection adds the header. Late audio is discarded there."""
         # Send deferred stream/start on first chunk (ensures encoder header is available)
         if self._pending_stream_start:
+            if not self._client.available:
+                # No stream/start, and so no audio, until the latest client/state
+                # reports the client available.
+                return
             self._send_stream_start_message()
             self._pending_stream_start = False
 
@@ -348,46 +383,44 @@ class PlayerV1Role(Role):
                 )
             return
 
-        # Reuse the frame packed once and shared across subscribers.
-        message_type = BinaryMessageType.AUDIO_CHUNK.value
-        # Compute the wall-clock buffer horizon (effective play time) by shifting
-        # the chunk's end time earlier by the configured static delay.
-        static_delay_us = self.static_delay_ms * 1_000
-        chunk_end_us = chunk.timestamp_us + chunk.duration_us - static_delay_us
-
         self._client.send_binary(
-            chunk.packed,
+            chunk.data,
             role_family=self.role_family,
             timestamp_us=chunk.timestamp_us,
-            message_type=message_type,
-            buffer_end_time_us=chunk_end_us,
-            buffer_byte_count=chunk.byte_count,
+            message_type=BinaryMessageType.AUDIO_CHUNK.value,
+            buffer_end_time_us=chunk.timestamp_us + chunk.duration_us,
+            # The buffer accounting counts the audio chunk header with the payload.
+            buffer_byte_count=PLAYER_AUDIO_HEADER_SIZE + chunk.byte_count,
             duration_us=chunk.duration_us,
+            player_audio_header=True,
         )
+        self._sent_end_us = chunk.timestamp_us + chunk.duration_us
 
     def on_stream_clear(self) -> None:
-        """Send stream/clear and reset buffer-tracking state."""
+        """Send stream/clear for an active stream and reset buffer-tracking state."""
         if not self.has_connection():
             return
 
-        stream_clear = StreamClearMessage(payload=StreamClearPayload(roles=["player"]))
-        self.send_message(stream_clear)
+        if self._stream_started:
+            self.send_message(StreamClearMessage(payload=StreamClearPayload(roles=["player"])))
         self._pending_stream_start = False
+        self._sent_end_us = None
         self.reset_binary_timing()
 
         if self._buffer_tracker is not None:
             self._buffer_tracker.reset()
 
     def on_stream_end(self) -> None:
-        """Send stream/end and reset state."""
+        """Send stream/end for an active stream and reset state."""
         if not self.has_connection():
             return
 
-        stream_end = StreamEndMessage(payload=StreamEndPayload(roles=["player"]))
-        self.send_message(stream_end)
+        if self._stream_started:
+            self.send_message(StreamEndMessage(payload=StreamEndPayload(roles=["player"])))
         self._stream_started = False
         self._pending_stream_start = False
         self._last_sent_format = None
+        self._sent_end_us = None
         self.reset_binary_timing()
 
         if self._buffer_tracker is not None:
@@ -419,13 +452,13 @@ class PlayerV1Role(Role):
         self._state().muted = value
 
     @property
-    def static_delay_ms(self) -> int:
-        """Current static delay of this player in milliseconds (0-5000)."""
-        return self._state().static_delay_ms
+    def output_delay_ms(self) -> int:
+        """Current output delay of this player in milliseconds (0-5000)."""
+        return self._state().output_delay_ms
 
-    @static_delay_ms.setter
-    def static_delay_ms(self, value: int) -> None:
-        self._state().static_delay_ms = value
+    @output_delay_ms.setter
+    def output_delay_ms(self, value: int) -> None:
+        self._state().output_delay_ms = value
 
     @property
     def required_lead_time_ms(self) -> int:
@@ -447,7 +480,7 @@ class PlayerV1Role(Role):
 
     @property
     def state_supported_commands(self) -> list[PlayerCommand]:
-        """Commands supported via client/state (e.g., set_static_delay)."""
+        """Commands the server may currently send this player, from its latest client/state."""
         return self._state().state_supported_commands
 
     @state_supported_commands.setter
@@ -455,11 +488,15 @@ class PlayerV1Role(Role):
         self._state().state_supported_commands = value
 
     def get_player_volume(self) -> int | None:
-        """Return current volume for group aggregation."""
+        """Return current volume for group aggregation, or None when volume is not settable."""
+        if PlayerCommand.VOLUME not in self.state_supported_commands:
+            return None
         return self.volume
 
     def get_player_muted(self) -> bool | None:
-        """Return current mute state for group aggregation."""
+        """Return current mute state for group aggregation, or None when mute is not settable."""
+        if PlayerCommand.MUTE not in self.state_supported_commands:
+            return None
         return self.muted
 
     def set_player_volume(self, volume: int) -> None:
@@ -470,33 +507,42 @@ class PlayerV1Role(Role):
         """Set player mute via role API."""
         self.set_mute(muted)
 
-    def get_static_delay_us(self) -> int:
+    def get_output_delay_us(self) -> int:
         """Return transport delay in microseconds for timestamp offsetting."""
-        return max(self.static_delay_ms, 0) * 1_000
+        return max(self.output_delay_ms, 0) * 1_000
 
     def get_required_lead_time_us(self) -> int:
-        """Return reported startup lead time in microseconds."""
-        return max(self.required_lead_time_ms, 0) * 1_000
+        """Return reported startup lead time in microseconds, clamped to the server maximum."""
+        return min(max(self.required_lead_time_ms, 0), MAX_TIMING_PARAMETER_MS) * 1_000
 
     def get_min_buffer_us(self) -> int:
-        """Return reported minimum ongoing buffer duration in microseconds."""
-        return max(self.min_buffer_ms, 0) * 1_000
+        """Return reported minimum buffer in microseconds, clamped to the server maximum."""
+        return min(max(self.min_buffer_ms, 0), MAX_TIMING_PARAMETER_MS) * 1_000
 
-    def get_static_delay_ms(self) -> int:
-        """Return static delay for protocol API."""
-        return self.static_delay_ms
+    def get_output_delay_ms(self) -> int:
+        """Return output delay for protocol API."""
+        return self.output_delay_ms
 
-    def set_static_delay(self, delay_ms: int) -> None:
-        """Send set_static_delay command to client."""
-        if PlayerCommand.SET_STATIC_DELAY not in self.state_supported_commands:
+    def set_output_delay(self, delay_ms: int) -> None:
+        """Send set_output_delay command to client.
+
+        Addresses the client using whichever spelling it declared support for
+        — a client that only declared the pre-rename 'set_static_delay' still
+        receives a delay command it can act on.
+        """
+        if PlayerCommand.SET_OUTPUT_DELAY in self.state_supported_commands:
+            command = PlayerCommand.SET_OUTPUT_DELAY
+        elif PlayerCommand.SET_STATIC_DELAY in self.state_supported_commands:
+            command = PlayerCommand.SET_STATIC_DELAY
+        else:
             return
 
         self._client.send_message(
             ServerCommandMessage(
                 payload=ServerCommandPayload(
                     player=PlayerCommandPayload(
-                        command=PlayerCommand.SET_STATIC_DELAY,
-                        static_delay_ms=delay_ms,
+                        command=command,
+                        output_delay_ms=delay_ms,
                     )
                 )
             )
@@ -543,11 +589,7 @@ class PlayerV1Role(Role):
                 state = self._state()
                 state.preferred_format_override = None
                 state.preferred_codec_override = None
-                before = self._effective_format()
-                self._ensure_preferred_format()
-                self._ensure_audio_requirements(force=True)
-                if self._client.group.has_active_stream and self._effective_format() != before:
-                    self._begin_format_transition()
+                self._apply_preferred_format()
                 return True
 
         if codec is None:
@@ -582,25 +624,12 @@ class PlayerV1Role(Role):
         state = self._state()
         state.preferred_format_override = audio_format
         state.preferred_codec_override = codec
-
-        # Set the preferred format for current session.
-        self._preferred_format = audio_format
-        self._preferred_codec = codec
-
-        before = self._effective_format()
-
-        # Rebuild audio requirements with the new format
-        self._ensure_audio_requirements(force=True)
-
-        if self._client.group.has_active_stream and self._effective_format() != before:
-            self._begin_format_transition()
-
+        self._apply_preferred_format()
         return True
 
     def set_volume(self, volume: int) -> None:
         """Set the volume of this player."""
-        support = self._client.info.player_support
-        if not support or PlayerCommand.VOLUME not in support.supported_commands:
+        if PlayerCommand.VOLUME not in self.state_supported_commands:
             return
 
         self._client.send_message(
@@ -616,8 +645,7 @@ class PlayerV1Role(Role):
 
     def set_mute(self, muted: bool) -> None:  # noqa: FBT001
         """Set the mute state of this player."""
-        support = self._client.info.player_support
-        if not support or PlayerCommand.MUTE not in support.supported_commands:
+        if PlayerCommand.MUTE not in self.state_supported_commands:
             return
 
         self._client.send_message(
@@ -640,13 +668,20 @@ class PlayerV1Role(Role):
             return ["has an active player role but no player state"]
         reasons: list[str] = []
         if (
-            player.static_delay_ms is None
+            player.output_delay_ms is None
             or player.required_lead_time_ms is None
             or player.min_buffer_ms is None
         ):
             reasons.append("omitted required player timing fields")
-        support = self._client.info.player_support
-        commands = support.supported_commands if support else []
+        commands = player.supported_commands
+        # DEPRECATED(spec-pr-177): remove in aiosendspin <version>
+        # A pre-#177 hello's commands count as declared; that client is already flagged.
+        legacy_commands = self._legacy_hello_commands()
+        if legacy_commands is not None:
+            commands = [*legacy_commands, *(commands or [])]
+        elif commands is None:
+            reasons.append("omitted required supported_commands")
+            commands = []
         if PlayerCommand.VOLUME in commands and player.volume is None:
             reasons.append("omitted volume despite declaring the volume command")
         if PlayerCommand.MUTE in commands and player.muted is None:
@@ -658,15 +693,19 @@ class PlayerV1Role(Role):
         state = payload.player
         if state is None:
             return []
-        support = self._client.info.player_support
-        commands = support.supported_commands if support else []
         reasons: list[str] = []
         if state.state is not None:
             reasons.append("used legacy player.state instead of top-level available")
-        if state.volume is not None and PlayerCommand.VOLUME not in commands:
-            reasons.append("sent volume without declaring the volume command")
-        if state.muted is not None and PlayerCommand.MUTE not in commands:
-            reasons.append("sent muted without declaring the mute command")
+        if state.legacy_delay_key:
+            reasons.append(f"used the pre-rename '{state.legacy_delay_key}' key")
+        if state.ignored_commands:
+            reasons.append(
+                "declared unrecognized supported_commands: " + ", ".join(state.ignored_commands)
+            )
+        if state.supported_commands and PlayerCommand.SET_STATIC_DELAY in state.supported_commands:
+            reasons.append("declared the pre-rename 'set_static_delay' command")
+        if state.format is not None and not self._is_declared_format(state.format):
+            reasons.append("preferred a format not in the client's declared supported_formats")
         return reasons
 
     def on_client_state(self, payload: ClientStatePayload) -> None:
@@ -682,47 +721,49 @@ class PlayerV1Role(Role):
                 self._client.handle_availability_change(available=state.state != "external_source")
             )
 
-        support = self._client.info.player_support
-        commands = support.supported_commands if support else []
+        group_values = (self.get_player_volume(), self.get_player_muted())
+
+        # Applied before any event so listeners gate commands on this state.
+        commands = state.supported_commands
+        legacy_commands = self._legacy_hello_commands()
+        if legacy_commands is not None:
+            # DEPRECATED(spec-pr-177): remove in aiosendspin <version>
+            # A pre-#177 state list carries only delay commands, so it extends the
+            # hello's volume/mute rather than replacing them, from the first state on.
+            current = self.state_supported_commands if commands is None else commands
+            commands = list(dict.fromkeys([*legacy_commands, *current]))
+        if commands is not None:
+            self.state_supported_commands = list(commands)
+
+        # Reported volume and mute apply even when not settable: supported_commands
+        # only governs which commands the server may send.
         changed = False
 
-        if (
-            state.volume is not None
-            and PlayerCommand.VOLUME in commands
-            and self.volume != state.volume
-        ):
+        if state.volume is not None and self.volume != state.volume:
             self.volume = state.volume
             changed = True
 
-        if state.muted is not None and PlayerCommand.MUTE in commands and self.muted != state.muted:
+        if state.muted is not None and self.muted != state.muted:
             self.muted = state.muted
             changed = True
 
-        if changed:
+        # A volume/mute support change alters the group aggregation even when the
+        # reported values stay the same.
+        if changed or group_values != (self.get_player_volume(), self.get_player_muted()):
             self.emit_client_event(VolumeChangedEvent(volume=self.volume, muted=self.muted))
 
-        if state.supported_commands is not None:
-            self.state_supported_commands = state.supported_commands
+        self._apply_state_timing(state)
+        self._apply_state_format(state)
 
-        if state.static_delay_ms is not None and self.static_delay_ms != state.static_delay_ms:
-            self.static_delay_ms = state.static_delay_ms
-            self.emit_client_event(StaticDelayChangedEvent(static_delay_ms=state.static_delay_ms))
+    def on_initial_client_state(self, payload: ClientStatePayload) -> None:
+        """Apply the timing and preferred format the stream join schedules and announces with."""
+        if payload.player is not None:
+            self._apply_state_timing(payload.player)
+            self._apply_state_format(payload.player)
 
-        if (
-            state.required_lead_time_ms is not None
-            and self.required_lead_time_ms != state.required_lead_time_ms
-        ):
-            self.required_lead_time_ms = state.required_lead_time_ms
-            self.emit_client_event(
-                RequiredLeadTimeChangedEvent(required_lead_time_ms=state.required_lead_time_ms)
-            )
-
-        if state.min_buffer_ms is not None and self.min_buffer_ms != state.min_buffer_ms:
-            self.min_buffer_ms = state.min_buffer_ms
-            self.emit_client_event(MinBufferChangedEvent(min_buffer_ms=state.min_buffer_ms))
-
+    # DEPRECATED(spec-pr-195): remove in aiosendspin <version>
     def on_stream_request_format(self, payload: StreamRequestFormatPayload) -> None:
-        """Handle stream/request-format for player role."""
+        """Apply a pre-#195 player format request as the client's format preference."""
         player_req = payload.player
         if player_req is None:
             return
@@ -764,49 +805,22 @@ class PlayerV1Role(Role):
         )
         base_codec = self.preferred_codec or preferred_supported.codec
 
-        requested_codec = player_req.codec or base_codec
-        requested_format = AudioFormat(
+        requested = SupportedAudioFormat(
+            codec=player_req.codec or base_codec,
             sample_rate=player_req.sample_rate or base_format.sample_rate,
             bit_depth=player_req.bit_depth or base_format.bit_depth,
             channels=player_req.channels or base_format.channels,
         )
-
-        if not any(
-            fmt.codec == requested_codec
-            and fmt.sample_rate == requested_format.sample_rate
-            and fmt.bit_depth == requested_format.bit_depth
-            and fmt.channels == requested_format.channels
-            for fmt in supported
-        ):
+        if not any(requested.matches(fmt) for fmt in supported):
             self._client._logger.warning(  # noqa: SLF001
-                "Client %s requested unsupported format %s codec=%s, falling back to %s",
+                "Client %s requested unsupported format %s, ignoring",
                 self._client.client_id,
-                requested_format,
-                requested_codec,
-                base_format,
+                requested,
             )
-            requested_format = base_format
-            requested_codec = base_codec
-
-        self.preferred_format = requested_format
-        self.preferred_codec = requested_codec
-
-        current_format = self._effective_format()
-        if current_format is not None and current_format == (requested_codec, requested_format):
-            # Already on the requested format. Running the boundary would evict
-            # valid audio while the announcement's identity guard suppresses
-            # the stream/start that would justify it.
             return
 
-        stream_active = self._client.group.has_active_stream
-        if stream_active:
-            self._ensure_audio_requirements(force=True)
-            self._begin_format_transition()
-        else:
-            # No active stream: also defer stream/start via _pending_stream_start
-            # so codec header is included when the first chunk arrives.
-            self._ensure_audio_requirements(force=True)
-            self._pending_stream_start = True
+        self._client_format_legacy = True
+        self._set_client_format(requested)
 
     def _effective_format(self) -> tuple[AudioCodec, AudioFormat] | None:
         """Return the current negotiated (codec, format), or None without requirements."""
@@ -830,26 +844,92 @@ class PlayerV1Role(Role):
         )
 
     def _begin_format_transition(self) -> None:
-        """Start a mid-stream format change at a clean boundary.
-
-        Frames queued under the old format must never reach the client after
-        the new stream/start; the announcement itself waits for the next
-        chunk so it can carry the new codec header.
-        """
-        self._client.drop_pending_binary([self.role_family])
-        # Everything the buffer tracker and binary timing know about was just
-        # invalidated with the old format; without resetting them the writer
-        # paces the replacement audio against a buffer the client flushed.
-        self.reset_binary_timing()
-        if self._buffer_tracker is not None:
-            self._buffer_tracker.reset()
+        """Switch the active stream to the new format, announced with the next chunk."""
         self._pending_stream_start = True
-        # The client flushes its invalidated buffer only on a stream/start, so a
-        # flip-flop back to the announced format must not suppress one.
-        self._last_sent_format = None
-        self._client.group.on_role_format_changed(self)
+        self._client.group.on_role_format_changed(self, resume_at_us=self._sent_end_us)
 
     # ---- Internal helpers ----
+
+    def _is_declared_format(self, audio_format: SupportedAudioFormat) -> bool:
+        """Return whether `audio_format` is one of the client's hello supported_formats."""
+        support = self._client.info.player_support
+        return support is not None and any(
+            audio_format.matches(fmt) for fmt in support.supported_formats
+        )
+
+    def _apply_state_timing(self, state: PlayerStatePayload) -> None:
+        """Store the timing fields of a client/state player object, emitting their changes."""
+        if state.output_delay_ms is not None and self.output_delay_ms != state.output_delay_ms:
+            self.output_delay_ms = state.output_delay_ms
+            if self._buffer_tracker is not None:
+                self._buffer_tracker.output_delay_us = self.get_output_delay_us()
+            self.emit_client_event(OutputDelayChangedEvent(output_delay_ms=state.output_delay_ms))
+
+        if (
+            state.required_lead_time_ms is not None
+            and self.required_lead_time_ms != state.required_lead_time_ms
+        ):
+            self.required_lead_time_ms = state.required_lead_time_ms
+            self._log_if_clamped("required_lead_time_ms", state.required_lead_time_ms)
+            self.emit_client_event(
+                RequiredLeadTimeChangedEvent(required_lead_time_ms=state.required_lead_time_ms)
+            )
+
+        if state.min_buffer_ms is not None and self.min_buffer_ms != state.min_buffer_ms:
+            self.min_buffer_ms = state.min_buffer_ms
+            self._log_if_clamped("min_buffer_ms", state.min_buffer_ms)
+            self.emit_client_event(MinBufferChangedEvent(min_buffer_ms=state.min_buffer_ms))
+
+    def _apply_state_format(self, state: PlayerStatePayload) -> None:
+        """Store the `format` of a client/state player object as the client's preference."""
+        if state.format is None:
+            # DEPRECATED(spec-pr-195): remove in aiosendspin <version>
+            # A pre-#195 client never sends `format`; keep what it requested instead.
+            if not self._client_format_legacy:
+                self._set_client_format(None)
+        else:
+            # Sending `format` at all marks a current client, even when the value is invalid.
+            self._client_format_legacy = False
+            # An undeclared format was flagged by client_state_deviations and keeps the slot.
+            if self._is_declared_format(state.format):
+                self._set_client_format(state.format)
+
+    def _set_client_format(self, audio_format: SupportedAudioFormat | None) -> None:
+        """Store the client's format preference and apply it when it changed."""
+        if audio_format == self._client_format:
+            return
+        self._client_format = audio_format
+        self._apply_preferred_format()
+
+    def _apply_preferred_format(self) -> None:
+        """Re-derive the stream format; restart an active stream only when it changed."""
+        # An unchanged format keeps its running encoder instead of rejoining the stream.
+        before = self._effective_format()
+        self._ensure_preferred_format()
+        self._ensure_audio_requirements(force=True)
+        # A role still awaiting its client/state (initial or after activation) has not
+        # joined the stream; the join picks up the new requirements.
+        joining = self._client.connection is not None and (
+            not self._client.is_connected or self._client.awaits_role_state(self.role_family)
+        )
+        if (
+            not joining
+            and self._client.group.has_active_stream
+            and self._effective_format() != before
+        ):
+            self._begin_format_transition()
+
+    def _log_if_clamped(self, name: str, value: int) -> None:
+        if value > MAX_TIMING_PARAMETER_MS:
+            self._client._logger.debug(  # noqa: SLF001
+                "Clamping %s=%s to %s ms", name, value, MAX_TIMING_PARAMETER_MS
+            )
+
+    def _legacy_hello_commands(self) -> list[PlayerCommand] | None:
+        """Return the commands a pre-#177 hello declared, or None when it declared none."""
+        # DEPRECATED(spec-pr-177): remove in aiosendspin <version>
+        support = self._client.info.player_support
+        return support.supported_commands if support is not None else None
 
     def _state(self) -> PlayerPersistentState:
         if self._cached_state is None:
@@ -878,6 +958,7 @@ class PlayerV1Role(Role):
         else:
             state.buffer_tracker.capacity_bytes = capacity
             state.buffer_tracker.max_duration_us = max_duration_us
+        state.buffer_tracker.output_delay_us = self.get_output_delay_us()
         self._buffer_tracker = state.buffer_tracker
 
     def _ensure_preferred_format(self) -> None:
@@ -894,13 +975,16 @@ class PlayerV1Role(Role):
             )
             return
 
-        # The spec defines supported_formats as "in priority order (first is preferred)".
-        # On every (re)connect the client sends a fresh client/hello with its current
-        # priority, so compatible[0] represents the client's authoritative preference
-        # for this connection.
-        # If a server-side override was explicitly set, keep it sticky across reconnects
-        # while still validating it against the latest client capabilities.
-        preferred_supported = compatible[0]
+        # Selection order: the operator override, then the client/state format, then the
+        # hello supported_formats priority ("first is preferred"), which the client resends
+        # on every (re)connect.
+        # The operator override stays sticky across reconnects while still being validated
+        # against the latest client capabilities.
+        client_format = self._client_format
+        preferred_supported = next(
+            (fmt for fmt in compatible if client_format is not None and client_format.matches(fmt)),
+            compatible[0],
+        )
         state = self._state()
         persistent_format = state.preferred_format_override
         persistent_codec = state.preferred_codec_override

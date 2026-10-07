@@ -1,10 +1,16 @@
 """Public interface for the Sendspin client package."""
 
+from aiosendspin.models.types import SECRET_LOCATIONS
+from aiosendspin.noise.pairing_code import format_pairing_code
+
 from .client import (
     AudioChunkCallback,
     DisconnectCallback,
     GroupUpdateCallback,
     MetadataCallback,
+    OutputDelayCallback,
+    ScheduledColorCallback,
+    ScheduledMetadataCallback,
     SendspinClient,
     StreamEndCallback,
     StreamStartCallback,
@@ -12,7 +18,6 @@ from .client import (
 )
 from .listener import ClientListener
 from .models import (
-    SECRET_LOCATIONS,
     AudioFormat,
     PairingCodeDisplay,
     PairingCodeSpeaker,
@@ -32,11 +37,14 @@ __all__ = [
     "DisconnectCallback",
     "GroupUpdateCallback",
     "MetadataCallback",
+    "OutputDelayCallback",
     "PCMFormat",
     "PairingCodeDisplay",
     "PairingCodeSpeaker",
     "PairingSupport",
     "QRCodeDisplay",
+    "ScheduledColorCallback",
+    "ScheduledMetadataCallback",
     "SendspinClient",
     "SendspinTimeFilter",
     "ServerInfo",
@@ -44,4 +52,5 @@ __all__ = [
     "StreamEndCallback",
     "StreamStartCallback",
     "VisualizerCallback",
+    "format_pairing_code",
 ]

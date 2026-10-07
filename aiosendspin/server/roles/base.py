@@ -12,11 +12,8 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass
-from functools import cached_property
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
-
-from aiosendspin.models import BinaryMessageType, pack_binary_header_raw
 
 if TYPE_CHECKING:
     from collections.abc import Coroutine
@@ -84,12 +81,6 @@ class AudioChunk:
     byte_count: int
     """Size of data (for buffer tracking)."""
 
-    @cached_property
-    def packed(self) -> bytes:
-        """Binary AUDIO_CHUNK frame, memoized so subscribers reuse one copy."""
-        header = pack_binary_header_raw(BinaryMessageType.AUDIO_CHUNK.value, self.timestamp_us)
-        return header + self.data
-
 
 class GroupRole(ABC):
     """Group-level role coordination.
@@ -144,6 +135,9 @@ class GroupRole(ABC):
     def on_client_removed(self, client: SendspinClient) -> None:  # noqa: B027
         """Handle a client being removed from this group."""
 
+    def on_group_deleted(self) -> None:  # noqa: B027
+        """Handle the group being deleted after its last client left."""
+
     def emit_group_event(self, event: GroupRoleEvent) -> None:
         """Emit a GroupRole event on the owning group's event stream."""
         self._group._signal_event(event)  # noqa: SLF001
@@ -163,6 +157,10 @@ class GroupRole(ABC):
     def set_group_muted(self, _muted: bool) -> bool | None:  # noqa: FBT001
         """Set group mute state if supported, return True/False or None if unsupported."""
         return None
+
+    def _now_us(self) -> int:
+        """Return the server clock time in microseconds."""
+        return self._group._server.clock.now_us()  # noqa: SLF001
 
 
 @dataclass(frozen=True)
@@ -297,7 +295,7 @@ class Role(ABC):
         """Return the role-owned buffer tracker, if any."""
         return self._buffer_tracker
 
-    def get_static_delay_us(self) -> int:
+    def get_output_delay_us(self) -> int:
         """Return transport delay in microseconds applied by this role (default: 0)."""
         return 0
 
@@ -358,6 +356,18 @@ class Role(ABC):
         if not self.has_connection():
             return
         self._client.send_role_message(self.role_family, message)
+
+    # DEPRECATED(spec-pr-275): remove in aiosendspin <version>
+    def clears_state_with_null(self) -> bool:
+        """Whether the client clears this role's server/state object only on a null object."""
+        connection = self._client.connection
+        return connection is not None and connection.clears_role_state_with_null
+
+    # DEPRECATED(spec-pr-135): remove in aiosendspin <version>
+    def supports_scheduled_updates(self) -> bool:
+        """Whether the client holds this role's server/state object until its timestamp."""
+        connection = self._client.connection
+        return connection is None or connection.supports_scheduled_updates
 
     def emit_client_event(self, event: ClientRoleEvent) -> None:
         """Emit a role event on the owning client's event stream."""
@@ -422,6 +432,20 @@ class Role(ABC):
         """
         return False
 
+    def requires_activation_state(self) -> bool:
+        """Whether this role, activated mid-connection, waits for its client/state object.
+
+        Until that object arrives the role gets no stream and no binary.
+        """
+        return self.requires_initial_state()
+
+    def on_hold_released(self) -> None:  # noqa: B027
+        """Handle the release of a role activated mid-connection, before its stream join.
+
+        Called once the client/state object the activation awaited arrives, or its timeout
+        expires; roles released by the initial client/state get `on_client_state` instead.
+        """
+
     def initial_state_deviations(self, payload: ClientStatePayload) -> list[str]:  # noqa: ARG002
         """Spec requirements this role's part of the initial client/state does not meet."""
         return []
@@ -455,6 +479,13 @@ class Role(ABC):
     def on_client_state(self, payload: ClientStatePayload) -> None:  # noqa: B027
         """Handle client/state payload."""
 
+    def on_initial_client_state(self, payload: ClientStatePayload) -> None:  # noqa: B027
+        """Apply the initial client/state fields an active stream join depends on.
+
+        Called before the client is marked connected and joins its group's active
+        stream; `on_client_state` still receives the same payload afterwards.
+        """
+
     def on_stream_request_format(  # noqa: B027
         self,
         payload: StreamRequestFormatPayload,
@@ -468,7 +499,7 @@ class Role(ABC):
         """
 
     def on_client_stream_start(self, payload: ClientStreamStartPayload) -> None:  # noqa: B027
-        """Handle client_stream/start."""
+        """Handle client-stream/start."""
 
     def on_client_stream_end(self) -> None:  # noqa: B027
-        """Handle client_stream/end."""
+        """Handle client-stream/end."""

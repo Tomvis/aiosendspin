@@ -7,20 +7,38 @@ from dataclasses import dataclass
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import orjson
 import pytest
 
+from aiosendspin.models.artwork import (
+    ArtworkChannel,
+    ClientStateArtwork,
+    StreamRequestFormatArtwork,
+)
+from aiosendspin.models.controller import ControllerCommandPayload
 from aiosendspin.models.core import (
+    ClientCommandMessage,
+    ClientCommandPayload,
     ClientHelloMessage,
     ClientHelloPayload,
     ClientStateMessage,
     ClientStatePayload,
+    StreamRequestFormatMessage,
+    StreamRequestFormatPayload,
 )
 from aiosendspin.models.management import ManagementResultMessage, ManagementResultPayload
-from aiosendspin.models.player import PlayerStatePayload
-from aiosendspin.models.types import ManagementResult
+from aiosendspin.models.player import PlayerStatePayload, StreamRequestFormatPlayer
+from aiosendspin.models.types import ArtworkSource, ManagementResult, MediaCommand, PlayerCommand
+from aiosendspin.models.visualizer import (
+    ClientHelloVisualizerSupport,
+    StreamRequestFormatVisualizer,
+    VisualizerStatePayload,
+)
 from aiosendspin.server.clock import LoopClock
 from aiosendspin.server.compliance import ClientComplianceError
 from aiosendspin.server.connection import SendspinConnection
+from aiosendspin.server.roles import PlayerV1Role
+from aiosendspin.server.roles.visualizer.v1 import VisualizerV1Role
 
 
 @dataclass(slots=True)
@@ -36,7 +54,7 @@ class _DummyServer:
 
 @pytest.mark.asyncio
 async def test_available_false_drives_external_source_transition() -> None:
-    """A new client's `available: false` must trigger the external-source transition."""
+    """A later `available: false` must trigger the external-source transition."""
     loop = asyncio.get_running_loop()
     conn = SendspinConnection(
         _DummyServer(loop=loop, clock=LoopClock(loop)), wsock_client=MagicMock()
@@ -48,6 +66,7 @@ async def test_available_false_drives_external_source_transition() -> None:
     client.active_roles = []
     conn._client = client  # noqa: SLF001
     conn._initial_state_received = True  # noqa: SLF001
+    conn._client_state_received = True  # noqa: SLF001
 
     await conn._handle_message(  # noqa: SLF001
         ClientStateMessage(payload=ClientStatePayload(available=False)), timestamp_us=0
@@ -62,6 +81,7 @@ def _conn_with_client() -> tuple[SendspinConnection, MagicMock]:
         _DummyServer(loop=loop, clock=LoopClock(loop)), wsock_client=MagicMock()
     )
     client = MagicMock()
+    client.awaits_role_state.return_value = False
     conn._client = client  # noqa: SLF001
     return conn, client
 
@@ -86,7 +106,72 @@ async def test_unsolicited_management_result_is_flagged() -> None:
         ManagementResultMessage(payload=ManagementResultPayload(result=ManagementResult.OK)),
         timestamp_us=0,
     )
-    client.flag_noncompliance.assert_called_once()
+    client.flag_noncompliance.assert_called_once_with("sent an unsolicited management/result")
+
+
+@pytest.mark.asyncio
+async def test_state_before_the_initial_gate_opens_is_not_initial() -> None:
+    """A client/state read before any activation needs one (connect-time pairing) is ordinary."""
+    conn, client = _conn_with_client()
+    client.active_roles = []
+    client.available = True
+
+    await conn._handle_client_state(ClientStatePayload(available=True))  # noqa: SLF001
+
+    client.mark_connected.assert_not_called()
+    assert conn._initial_state_received is False  # noqa: SLF001
+
+
+# DEPRECATED(spec-pr-175): remove in aiosendspin <version>
+@pytest.mark.asyncio
+async def test_non_initial_state_without_available_is_flagged_and_applied() -> None:
+    """A lenient server flags a later client/state without `available` and still applies it."""
+    conn, client = _conn_with_client()
+    role = _role("player")
+    role.client_state_deviations.return_value = []
+    client.active_roles = [role]
+    client.available = True
+    client.handle_availability_change = AsyncMock()
+    conn._initial_state_received = True  # noqa: SLF001
+    payload = ClientStatePayload(player=PlayerStatePayload(volume=10))
+
+    await conn._handle_client_state(payload)  # noqa: SLF001
+
+    client.flag_noncompliance.assert_called_once_with(
+        "client/state omitted the required 'available' field"
+    )
+    client.handle_availability_change.assert_not_called()
+    role.on_client_state.assert_called_once_with(payload)
+
+
+# DEPRECATED(spec-pr-175): remove in aiosendspin <version>
+@pytest.mark.asyncio
+async def test_strict_rejects_non_initial_state_without_available() -> None:
+    """A strict server rejects a later client/state without `available` before applying it."""
+    conn, client = _conn_with_client()
+    client.flag_noncompliance.side_effect = ClientComplianceError("nope")
+    role = _role("player")
+    client.active_roles = [role]
+    conn._initial_state_received = True  # noqa: SLF001
+
+    with pytest.raises(ClientComplianceError):
+        await conn._handle_client_state(  # noqa: SLF001
+            ClientStatePayload(player=PlayerStatePayload(volume=10))
+        )
+    role.on_client_state.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_non_initial_state_with_available_is_not_flagged() -> None:
+    """A later client/state carrying `available` passes the check."""
+    conn, client = _conn_with_client()
+    client.active_roles = []
+    client.available = True
+    conn._initial_state_received = True  # noqa: SLF001
+
+    await conn._handle_client_state(ClientStatePayload(available=True))  # noqa: SLF001
+
+    client.flag_noncompliance.assert_not_called()
 
 
 def _role_mock(deviations: list[str]) -> MagicMock:
@@ -178,17 +263,22 @@ async def test_pending_binary_dropped_when_stream_boundary_intervenes() -> None:
 
 
 @pytest.mark.asyncio
-async def test_client_state_player_object_for_inactive_role_is_flagged() -> None:
-    """A player state object with no active player role is flagged."""
+async def test_pending_epoch_exempt_binary_survives_stream_boundary() -> None:
+    """Epoch-exempt binary buffered before the initial state is still flushed after a boundary."""
     conn, client = _conn_with_client()
-    client.active_roles = [_role("controller")]
+    role = _role("artwork")
+    role.requires_initial_state.return_value = True
+    client.active_roles = [role]
+
+    conn.send_binary(b"snapshot", role="artwork", timestamp_us=0, message_type=30)
+    conn.send_binary(b"cancel", role="artwork", timestamp_us=0, message_type=30, epoch_exempt=True)
+    conn.drop_pending_binary(["artwork"])
     conn._initial_state_received = True  # noqa: SLF001
-    client.available = None
-    await conn._handle_message(  # noqa: SLF001
-        ClientStateMessage(payload=ClientStatePayload(player=PlayerStatePayload())), timestamp_us=0
-    )
-    flagged = [call.args[0] for call in client.flag_noncompliance.call_args_list]
-    assert any("player" in r and "inactive role" in r for r in flagged)
+    conn._flush_pending_binary()  # noqa: SLF001
+
+    queued = conn._role_queues.get("artwork")  # noqa: SLF001
+    assert queued is not None
+    assert [entry.binary.data for _, _, entry in queued if entry.binary] == [b"cancel"]
 
 
 @pytest.mark.asyncio
@@ -197,11 +287,29 @@ async def test_client_state_player_object_for_active_role_is_not_flagged() -> No
     conn, client = _conn_with_client()
     client.active_roles = [_role("player")]
     conn._initial_state_received = True  # noqa: SLF001
-    client.available = None
+    client.available = True
     await conn._handle_message(  # noqa: SLF001
-        ClientStateMessage(payload=ClientStatePayload(player=PlayerStatePayload())), timestamp_us=0
+        ClientStateMessage(payload=ClientStatePayload(available=True, player=PlayerStatePayload())),
+        timestamp_us=0,
     )
     client.flag_noncompliance.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_client_state_timing_fields_above_30s_are_accepted() -> None:
+    """Timing fields above 30 s parse from the wire and reach the role unflagged."""
+    conn, client = _conn_with_client()
+    player = _role("player")
+    client.active_roles = [player]
+    conn._initial_state_received = True  # noqa: SLF001
+    client.available = True
+    message = SendspinConnection._deserialize_client_message(  # noqa: SLF001
+        '{"type": "client/state", "payload": {"available": true, '
+        '"player": {"required_lead_time_ms": 45000, "min_buffer_ms": 60000}}}'
+    )
+    await conn._handle_message(message, timestamp_us=0)  # noqa: SLF001
+    client.flag_noncompliance.assert_not_called()
+    player.on_client_state.assert_called_once_with(message.payload)
 
 
 @pytest.mark.asyncio
@@ -211,12 +319,10 @@ async def test_strict_rejection_applies_no_side_effects() -> None:
     conn._initial_state_received = True  # noqa: SLF001
     client.flag_noncompliance.side_effect = ClientComplianceError("nope")
     client.handle_availability_change = AsyncMock()
-    client.active_roles = [_role("controller")]  # player object below is for an inactive role
+    client.active_roles = [_role("controller")]
     with pytest.raises(ClientComplianceError):
         await conn._handle_message(  # noqa: SLF001
-            ClientStateMessage(
-                payload=ClientStatePayload(available=False, player=PlayerStatePayload())
-            ),
+            ClientStateMessage(payload=ClientStatePayload(available=False, legacy_state_used=True)),
             timestamp_us=0,
         )
     client.mark_connected.assert_not_called()
@@ -238,3 +344,264 @@ async def test_role_client_state_deviation_flagged_before_side_effects() -> None
             ClientStateMessage(payload=ClientStatePayload(available=False)), timestamp_us=0
         )
     client.handle_availability_change.assert_not_called()
+
+
+# DEPRECATED(spec-pr-195): remove in aiosendspin <version>
+@pytest.mark.asyncio
+async def test_player_request_format_is_flagged_and_still_routed() -> None:
+    """A pre-#195 player format request is flagged, then handed to the roles."""
+    conn, client = _conn_with_client()
+    role = _role("player")
+    client.active_roles = [role]
+    payload = StreamRequestFormatPayload(player=StreamRequestFormatPlayer(sample_rate=44100))
+
+    await conn._handle_message(  # noqa: SLF001
+        StreamRequestFormatMessage(payload=payload), timestamp_us=0
+    )
+
+    flagged = [call.args[0] for call in client.flag_noncompliance.call_args_list]
+    assert flagged == [
+        "sent a stream/request-format player object, superseded by the client/state player format"
+    ]
+    role.on_stream_request_format.assert_called_once_with(payload)
+
+
+# DEPRECATED(spec-pr-195): remove in aiosendspin <version>
+@pytest.mark.asyncio
+async def test_strict_rejection_of_player_request_format_skips_roles() -> None:
+    """A strict server rejects a player format request before any role applies it."""
+    conn, client = _conn_with_client()
+    client.flag_noncompliance.side_effect = ClientComplianceError("nope")
+    role = _role("player")
+    client.active_roles = [role]
+
+    with pytest.raises(ClientComplianceError):
+        await conn._handle_message(  # noqa: SLF001
+            StreamRequestFormatMessage(
+                payload=StreamRequestFormatPayload(player=StreamRequestFormatPlayer())
+            ),
+            timestamp_us=0,
+        )
+    role.on_stream_request_format.assert_not_called()
+
+
+# DEPRECATED(spec-pr-195): remove in aiosendspin <version>
+@pytest.mark.asyncio
+async def test_visualizer_request_format_is_flagged_and_still_routed() -> None:
+    """A pre-#195 visualizer format request is flagged, then handed to the roles."""
+    conn, client = _conn_with_client()
+    role = _role("visualizer")
+    client.active_roles = [role]
+    payload = StreamRequestFormatPayload(visualizer=StreamRequestFormatVisualizer(rate_max=15))
+
+    await conn._handle_message(  # noqa: SLF001
+        StreamRequestFormatMessage(payload=payload), timestamp_us=0
+    )
+
+    flagged = [call.args[0] for call in client.flag_noncompliance.call_args_list]
+    assert flagged == [
+        (
+            "sent a stream/request-format visualizer object, "
+            "superseded by the client/state visualizer object"
+        )
+    ]
+    role.on_stream_request_format.assert_called_once_with(payload)
+
+
+_VISUALIZER_STATE = VisualizerStatePayload(types=["loudness", "spectrum"], rate_max=30)
+
+
+@pytest.mark.asyncio
+async def test_client_state_objects_for_inactive_roles_are_ignored() -> None:
+    """Role objects in client/state with no active role are not flagged."""
+    conn, client = _conn_with_client()
+    controller = _role("controller")
+    client.active_roles = [controller]
+    conn._initial_state_received = True  # noqa: SLF001
+    client.available = True
+    payload = ClientStatePayload(
+        available=True,
+        player=PlayerStatePayload(),
+        artwork=ClientStateArtwork(channels=[ArtworkChannel(source=ArtworkSource.NONE)]),
+        visualizer=_VISUALIZER_STATE,
+    )
+    await conn._handle_message(ClientStateMessage(payload=payload), timestamp_us=0)  # noqa: SLF001
+    client.flag_noncompliance.assert_not_called()
+    controller.on_client_state.assert_called_once_with(payload)
+
+
+@pytest.mark.asyncio
+async def test_client_command_controller_object_for_inactive_role_is_ignored() -> None:
+    """A controller object in client/command with no active controller role is not flagged."""
+    conn, client = _conn_with_client()
+    client.active_roles = [_role("player")]
+    await conn._handle_message(  # noqa: SLF001
+        ClientCommandMessage(
+            payload=ClientCommandPayload(
+                controller=ControllerCommandPayload(command=MediaCommand.PLAY)
+            )
+        ),
+        timestamp_us=0,
+    )
+    client.flag_noncompliance.assert_not_called()
+
+
+def _visualizer_client(conn: SendspinConnection, client: MagicMock) -> VisualizerV1Role:
+    client.info.visualizer_support = ClientHelloVisualizerSupport(buffer_capacity=65_536)
+    client.available = True
+    role = VisualizerV1Role(client=client)
+    role.on_connect()
+    client.active_roles = [role]
+    conn._initial_state_received = True  # noqa: SLF001
+    return role
+
+
+@pytest.mark.asyncio
+async def test_strict_rejects_visualizer_spectrum_without_config() -> None:
+    """Requesting `spectrum` without its configuration rejects a strict client."""
+    conn, client = _conn_with_client()
+    client.flag_noncompliance.side_effect = ClientComplianceError("nope")
+    role = _visualizer_client(conn, client)
+
+    with pytest.raises(ClientComplianceError):
+        await conn._handle_message(  # noqa: SLF001
+            ClientStateMessage(payload=ClientStatePayload(visualizer=_VISUALIZER_STATE)),
+            timestamp_us=0,
+        )
+    client.join_active_stream.assert_not_called()
+    role.on_stream_start()
+    client.send_role_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_lenient_keeps_client_but_omits_spectrum_without_config() -> None:
+    """A lenient server flags the missing configuration and streams the other types."""
+    conn, client = _conn_with_client()
+    role = _visualizer_client(conn, client)
+
+    await conn._handle_message(  # noqa: SLF001
+        ClientStateMessage(
+            payload=ClientStatePayload(available=True, visualizer=_VISUALIZER_STATE)
+        ),
+        timestamp_us=0,
+    )
+
+    flagged = [call.args[0] for call in client.flag_noncompliance.call_args_list]
+    assert flagged == [
+        "client/state requested visualizer 'spectrum' without a spectrum configuration"
+    ]
+    role.on_stream_start()
+    start = client.send_role_message.call_args.args[1]
+    assert start.payload.visualizer.types == ("loudness",)
+
+
+@pytest.mark.asyncio
+async def test_strict_rejects_nonpositive_visualizer_rate_max() -> None:
+    """A non-positive visualizer rate_max rejects a strict client."""
+    conn, client = _conn_with_client()
+    client.flag_noncompliance.side_effect = ClientComplianceError("nope")
+    _visualizer_client(conn, client)
+
+    with pytest.raises(ClientComplianceError):
+        await conn._handle_message(  # noqa: SLF001
+            ClientStateMessage(
+                payload=ClientStatePayload(
+                    visualizer=VisualizerStatePayload(types=["loudness"], rate_max=0)
+                )
+            ),
+            timestamp_us=0,
+        )
+
+
+# DEPRECATED(spec-pr-195): remove in aiosendspin <version>
+@pytest.mark.asyncio
+async def test_artwork_request_format_is_flagged_and_still_routed() -> None:
+    """A pre-#195 artwork format request is flagged, then handed to the roles."""
+    conn, client = _conn_with_client()
+    role = _role("artwork")
+    client.active_roles = [role]
+    payload = StreamRequestFormatPayload(artwork=StreamRequestFormatArtwork(channel=0))
+
+    await conn._handle_message(  # noqa: SLF001
+        StreamRequestFormatMessage(payload=payload), timestamp_us=0
+    )
+
+    flagged = [call.args[0] for call in client.flag_noncompliance.call_args_list]
+    assert flagged == [
+        "sent a stream/request-format artwork object, superseded by the client/state artwork object"
+    ]
+    role.on_stream_request_format.assert_called_once_with(payload)
+
+
+# DEPRECATED(spec-pr-195): remove in aiosendspin <version>
+@pytest.mark.asyncio
+async def test_strict_rejection_of_artwork_request_format_skips_roles() -> None:
+    """A strict server rejects an artwork format request before any role applies it."""
+    conn, client = _conn_with_client()
+    client.flag_noncompliance.side_effect = ClientComplianceError("nope")
+    role = _role("artwork")
+    client.active_roles = [role]
+
+    with pytest.raises(ClientComplianceError):
+        await conn._handle_message(  # noqa: SLF001
+            StreamRequestFormatMessage(
+                payload=StreamRequestFormatPayload(artwork=StreamRequestFormatArtwork(channel=0))
+            ),
+            timestamp_us=0,
+        )
+    role.on_stream_request_format.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_unrecognized_player_command_is_flagged_and_state_still_applies() -> None:
+    """An unrecognized player command is dropped and flagged; the rest of the state applies."""
+    conn, client = _conn_with_client()
+    conn._initial_state_received = True  # noqa: SLF001
+    conn._client_state_received = True  # noqa: SLF001
+    client.available = True
+    client.handle_availability_change = AsyncMock()
+    role = _role("player")
+    role.client_state_deviations.side_effect = PlayerV1Role(
+        client=MagicMock()
+    ).client_state_deviations
+    client.active_roles = [role]
+    message = SendspinConnection._deserialize_client_message(  # noqa: SLF001
+        orjson.dumps(
+            {
+                "type": "client/state",
+                "payload": {
+                    "available": False,
+                    "player": {"volume": 40, "supported_commands": ["volume", "teleport"]},
+                },
+            }
+        ).decode()
+    )
+
+    await conn._handle_message(message, timestamp_us=0)  # noqa: SLF001
+
+    flagged = [call.args[0] for call in client.flag_noncompliance.call_args_list]
+    assert flagged == ["client/state declared unrecognized supported_commands: teleport"]
+    client.handle_availability_change.assert_awaited_once_with(available=False)
+    (applied,) = role.on_client_state.call_args.args
+    assert applied.player.volume == 40
+    assert applied.player.supported_commands == [PlayerCommand.VOLUME]
+
+
+@pytest.mark.asyncio
+async def test_unrecognized_player_command_rejected_when_strict() -> None:
+    """A strict server rejects a client/state declaring an unrecognized player command."""
+    conn, client = _conn_with_client()
+    conn._initial_state_received = True  # noqa: SLF001
+    client.flag_noncompliance.side_effect = ClientComplianceError("nope")
+    role = _role("player")
+    role.client_state_deviations.side_effect = PlayerV1Role(
+        client=MagicMock()
+    ).client_state_deviations
+    client.active_roles = [role]
+    payload = ClientStatePayload.from_dict({"player": {"supported_commands": ["teleport"]}})
+
+    with pytest.raises(ClientComplianceError):
+        await conn._handle_message(  # noqa: SLF001
+            ClientStateMessage(payload=payload), timestamp_us=0
+        )
+    role.on_client_state.assert_not_called()

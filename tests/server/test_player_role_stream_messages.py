@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
-from aiosendspin.models import AudioCodec, unpack_binary_header
+from aiosendspin.models import AudioCodec
 from aiosendspin.models.core import StreamClearMessage, StreamEndMessage, StreamStartMessage
 from aiosendspin.models.types import BinaryMessageType
 from aiosendspin.server.roles import AudioChunk, AudioRequirements, PlayerV1Role
@@ -19,6 +19,7 @@ def test_player_role_on_stream_clear_uses_role_family() -> None:
     role = PlayerV1Role(client=client)
     role._client.connection = MagicMock()  # noqa: SLF001
     role._buffer_tracker = None  # noqa: SLF001
+    role._stream_started = True  # noqa: SLF001
     role.on_stream_clear()
 
     _role, msg = client.send_role_message.call_args.args
@@ -34,6 +35,7 @@ def test_player_role_on_stream_end_uses_role_family() -> None:
     role = PlayerV1Role(client=client)
     role._client.connection = MagicMock()  # noqa: SLF001
     role._buffer_tracker = None  # noqa: SLF001
+    role._stream_started = True  # noqa: SLF001
     role.on_stream_end()
 
     _role, msg = client.send_role_message.call_args.args
@@ -62,8 +64,8 @@ def test_player_role_on_deactivate_ends_active_stream() -> None:
     client.send_role_message.assert_not_called()
 
 
-def test_player_role_on_audio_chunk_packs_header_and_tracks_duration() -> None:
-    """on_audio_chunk uses role-controlled header packing and accurate duration tracking."""
+def test_player_role_on_audio_chunk_defers_header_and_tracks_duration() -> None:
+    """on_audio_chunk defers the header to the connection and tracks duration accurately."""
 
     class _Tracker:
         def __init__(self) -> None:
@@ -77,7 +79,7 @@ def test_player_role_on_audio_chunk_packs_header_and_tracks_duration() -> None:
 
     tracker = _Tracker()
 
-    sent: list[bytes] = []
+    sent: list[tuple[bytes, int, int, bool]] = []
     client = MagicMock()
     state_store: dict[str, object] = {}
 
@@ -91,13 +93,14 @@ def test_player_role_on_audio_chunk_packs_header_and_tracks_duration() -> None:
         data: bytes,
         *,
         role_family: str,  # noqa: ARG001
-        timestamp_us: int,  # noqa: ARG001
-        message_type: int,  # noqa: ARG001
+        timestamp_us: int,
+        message_type: int,
         buffer_end_time_us: int | None = None,
         buffer_byte_count: int | None = None,
         duration_us: int | None = None,  # noqa: ARG001
+        player_audio_header: bool = False,
     ) -> bool:
-        sent.append(data)
+        sent.append((data, timestamp_us, message_type, player_audio_header))
         if buffer_end_time_us is not None and buffer_byte_count is not None:
             tracker.register(buffer_end_time_us, buffer_byte_count)
         return True
@@ -118,12 +121,10 @@ def test_player_role_on_audio_chunk_packs_header_and_tracks_duration() -> None:
     assert role.on_audio_chunk(chunk) is None
     assert sent, "Expected a binary send"
 
-    header = unpack_binary_header(sent[0])
-    assert header.message_type == BinaryMessageType.AUDIO_CHUNK.value
-    assert header.timestamp_us == timestamp_us
-    assert sent[0][9:] == payload
+    # The connection prepends the header at send time.
+    assert sent == [(payload, timestamp_us, BinaryMessageType.AUDIO_CHUNK.value, True)]
 
-    assert tracker.calls == [(timestamp_us + duration_us, byte_count)]
+    assert tracker.calls == [(timestamp_us + duration_us, 13 + byte_count)]
 
 
 def test_player_role_on_stream_start_drops_without_transport() -> None:

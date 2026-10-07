@@ -54,6 +54,8 @@ class _DummyConnection:
         buffer_end_time_us: int | None = None,  # noqa: ARG002
         buffer_byte_count: int | None = None,  # noqa: ARG002
         duration_us: int | None = None,  # noqa: ARG002
+        player_audio_header: bool = False,  # noqa: ARG002
+        epoch_exempt: bool = False,  # noqa: ARG002
     ) -> bool:
         return True
 

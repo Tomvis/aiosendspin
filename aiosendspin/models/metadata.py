@@ -8,10 +8,9 @@ receive state updates with track details.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from .base import SendspinConfig, SendspinModel
-from .types import RepeatMode, UndefinedField, undefined_field
 
 
 @dataclass
@@ -52,59 +51,34 @@ class SessionUpdateMetadata(SendspinModel):
 
     timestamp: int
     """Server clock time in microseconds for when this metadata is valid."""
-    title: str | None | UndefinedField = field(default_factory=undefined_field)
-    artist: str | None | UndefinedField = field(default_factory=undefined_field)
-    album_artist: str | None | UndefinedField = field(default_factory=undefined_field)
-    album: str | None | UndefinedField = field(default_factory=undefined_field)
-    artwork_url: str | None | UndefinedField = field(default_factory=undefined_field)
-    year: int | None | UndefinedField = field(default_factory=undefined_field)
-    album_track: int | None | UndefinedField = field(default_factory=undefined_field)
-    queue_track: int | None | UndefinedField = field(default_factory=undefined_field)
-    total_tracks: int | None | UndefinedField = field(default_factory=undefined_field)
-    progress: Progress | None | UndefinedField = field(default_factory=undefined_field)
+    title: str | None = None
+    artist: str | None = None
+    album_artist: str | None = None
+    album: str | None = None
+    artwork_url: str | None = None
+    year: int | None = None
+    album_track: int | None = None
+    queue_track: int | None = None
+    total_tracks: int | None = None
+    progress: Progress | None = None
     """
     Playback progress information.
 
-    The server must send this object whenever playback state changes.
+    Omitting it clears the client's playback position.
     """
-    repeat: RepeatMode | None | UndefinedField = field(default_factory=undefined_field)
-    shuffle: bool | None | UndefinedField = field(default_factory=undefined_field)
 
     def __post_init__(self) -> None:
         """Validate field values."""
-        # Validate year is reasonable (between 1000 and current year + 10)
-        if (
-            not isinstance(self.year, UndefinedField)
-            and self.year is not None
-            and not (1000 <= self.year <= 2040)
-        ):
-            raise ValueError(f"year must be between 1000 and 2040, got {self.year}")
+        if self.year is not None and self.year < 0:
+            raise ValueError(f"year must be non-negative, got {self.year}")
 
-        # Validate album_track number is positive
-        if (
-            not isinstance(self.album_track, UndefinedField)
-            and self.album_track is not None
-            and self.album_track <= 0
-        ):
-            raise ValueError(f"album_track must be positive, got {self.album_track}")
-
-        # Validate queue_track number is positive
-        if (
-            not isinstance(self.queue_track, UndefinedField)
-            and self.queue_track is not None
-            and self.queue_track <= 0
-        ):
-            raise ValueError(f"queue_track must be positive, got {self.queue_track}")
-
-        # Validate total_tracks is positive
-        if (
-            not isinstance(self.total_tracks, UndefinedField)
-            and self.total_tracks is not None
-            and self.total_tracks <= 0
-        ):
-            raise ValueError(f"total_tracks must be positive, got {self.total_tracks}")
+        # Validate track numbers are positive
+        for name in ("album_track", "queue_track", "total_tracks"):
+            value = getattr(self, name)
+            if value is not None and value <= 0:
+                raise ValueError(f"{name} must be positive, got {value}")
 
     class Config(SendspinConfig):
         """Config for parsing json messages."""
 
-        omit_default = True
+        omit_none = True

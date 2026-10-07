@@ -5,20 +5,27 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
-from aiosendspin.models.types import AudioCodec
+from aiosendspin.models.types import SECRET_LOCATIONS, AudioCodec
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
-
-# Places a static pairing secret may be found, per the spec's pair-method descriptor.
-SECRET_LOCATIONS: frozenset[str] = frozenset({"device", "leaflet", "operator"})
-
-# Visual out-channel for a derived dynamic pairing code, cleared by a ``None`` call.
-type PairingCodeDisplay = Callable[[str | None], Awaitable[None]]
+# Longest operator message a client/pair-pending may carry.
+_PAIR_PENDING_MESSAGE_MAX_LENGTH = 200
 
 # Renders a dynamic pairing token as a QR code, cleared by a ``None`` call.
 type QRCodeDisplay = Callable[[str | None], Awaitable[None]]
+
+
+class PairingCodeDisplay(Protocol):
+    """Shows a derived dynamic pairing code on the device's visual out-channel."""
+
+    def __call__(self, pairing_code: str | None, *, grouped: str | None) -> Awaitable[None]:
+        """Show ``pairing_code``, or clear the display when it is ``None``.
+
+        ``grouped`` is the same code in its presentation form (``123-456``), which the
+        display should show; it is ``None`` exactly when ``pairing_code`` is.
+        """
 
 
 class PairingCodeSpeaker(Protocol):
@@ -39,8 +46,9 @@ class PairingSupport:
 
     The gesture itself is reported by calling ``SendspinClient.open_pairing_window``.
     Its presence enables offering ``static_pairing_code``, unless
-    ``offer_static_pairing_code`` declines it. Any pairing-code out-channel
-    additionally enables ``dynamic_pairing_code``.
+    ``offer_static_pairing_code`` declines it. Any pairing-code out-channel enables
+    ``dynamic_pairing_code``, which supersedes ``static_pairing_code``: the client offers
+    only one pairing-code method.
     """
 
     gesture_prompt: Callable[[bool], Awaitable[None]] | None = None
@@ -49,16 +57,18 @@ class PairingSupport:
     pairing_code_display: PairingCodeDisplay | None = None
     """Visual out-channel for the derived dynamic pairing code (``digits`` format).
 
-    Called with ``None`` when the pairing exchange ends so the channel can clear.
+    Called with the same code and its grouped presentation form at the start of every round,
+    and with ``None`` for both when the pairing exchange ends so the channel can clear.
     """
     pairing_code_speaker: PairingCodeSpeaker | None = None
     """Spoken out-channel for the derived dynamic pairing code, which also receives the operator's
-    language preferences."""
+    language preferences. Called with the same code at the start of every round."""
     qr_code_display: QRCodeDisplay | None = None
     """Display able to render the dynamic pairing token as a QR code (``qr_code`` format).
 
-    Its presence offers the ``qr_code`` emission format. Called with ``None`` when the
-    pairing exchange ends so the display can clear.
+    Its presence offers the ``qr_code`` emission format. Called with the same token at the
+    start of every round, and with ``None`` when the pairing exchange ends so the display
+    can clear.
     """
     offer_static_pairing_code: bool = True
     """Whether to offer ``static_pairing_code`` for a device without a per-device code."""
@@ -67,13 +77,35 @@ class PairingSupport:
 
     Applies to every static-secret method the client offers.
     """
+    out_channel_suspend: Callable[[bool], Awaitable[None]] | None = None
+    """Optional hook for an out-channel that is also a role's output (the speaker playing the
+    stream, the display showing artwork): awaited with ``True`` before a dynamic pairing code is
+    first emitted, and with ``False`` when the attempt ends.
+
+    Suspend that output locally meanwhile. Streams stay open and their timeline runs on, so a
+    player discards the audio scheduled while suspended and resumes in sync.
+    """
+
+    pair_pending_message: str | None = None
+    """Optional short plain-text sentence for the operator sent in ``client/pair-pending``,
+    such as naming the pairing gesture, at most 200 characters.
+
+    The server shows it as unauthenticated text attributed to the device, never as markup.
+    """
 
     def __post_init__(self) -> None:
-        """Reject a secret location the descriptor cannot carry."""
+        """Reject a secret location the descriptor cannot carry, or an overlong message."""
         unknown = sorted(set(self.secret_locations) - SECRET_LOCATIONS)
         if unknown:
             names = ", ".join(unknown)
             raise ValueError(f"unknown secret_locations: {names}")
+        if (
+            self.pair_pending_message is not None
+            and len(self.pair_pending_message) > _PAIR_PENDING_MESSAGE_MAX_LENGTH
+        ):
+            raise ValueError(
+                f"pair_pending_message exceeds {_PAIR_PENDING_MESSAGE_MAX_LENGTH} characters"
+            )
 
 
 @dataclass(slots=True)
@@ -120,3 +152,7 @@ class ServerInfo:
 
     server_id: str
     name: str
+    languages: tuple[str, ...] = ()
+    """The operator's BCP 47 language preferences in descending order, empty when undeclared."""
+    source_codecs: frozenset[AudioCodec] | None = None
+    """Codecs the server accepts from a source, or None when server/hello listed none."""

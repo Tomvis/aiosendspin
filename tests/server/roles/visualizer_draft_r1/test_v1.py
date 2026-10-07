@@ -1,7 +1,10 @@
 """Tests for VisualizerDraftR1Role draft visualizer implementation."""
 
+# DEPRECATED(spec-pr-86): remove in aiosendspin <version>
+
 from __future__ import annotations
 
+import logging
 import struct
 from unittest.mock import MagicMock
 
@@ -14,6 +17,7 @@ from aiosendspin.models.visualizer_draft_r1 import (
     ClientHelloVisualizerSupport,
 )
 from aiosendspin.server.roles.base import AudioChunk
+from aiosendspin.server.roles.visualizer_draft_r1 import role as draft_r1_role
 from aiosendspin.server.roles.visualizer_draft_r1.role import VisualizerDraftR1Role
 from tests.server.roles.visualizer_draft_r1.conftest import sine_pcm_16bit
 
@@ -43,6 +47,21 @@ def _make_client_stub() -> MagicMock:
     client._server.clock.now_us.return_value = 0  # noqa: SLF001
     client.connection = MagicMock()
     return client
+
+
+# DEPRECATED(spec-pr-86): remove in aiosendspin <version>
+def test_activation_logs_deprecation_warning_once(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Connecting draft_r1 roles logs the deprecation warning once per process."""
+    monkeypatch.setattr(draft_r1_role, "_deprecation_logged", False)
+    with caplog.at_level(logging.WARNING, logger=draft_r1_role.__name__):
+        VisualizerDraftR1Role(client=_make_client_stub()).on_connect()
+        VisualizerDraftR1Role(client=_make_client_stub()).on_connect()
+
+    warnings = [r for r in caplog.records if r.name == draft_r1_role.__name__]
+    assert len(warnings) == 1
+    assert "deprecated" in warnings[0].getMessage()
 
 
 def test_visualizer_role_has_role_id() -> None:
@@ -233,6 +252,7 @@ def test_visualizer_role_on_stream_clear_sends_clear_message() -> None:
     client = _make_client_stub()
     role = VisualizerDraftR1Role(client=client)
     role.on_connect()
+    role.on_stream_start()
     role.on_stream_clear()
 
     _family, message = client.send_role_message.call_args.args
@@ -245,6 +265,7 @@ def test_visualizer_role_on_stream_end_sends_end_message() -> None:
     client = _make_client_stub()
     role = VisualizerDraftR1Role(client=client)
     role.on_connect()
+    role.on_stream_start()
     role.on_stream_end()
 
     _family, message = client.send_role_message.call_args.args
@@ -406,3 +427,30 @@ def test_visualizer_role_audio_chunk_without_stream_start_is_noop() -> None:
     client.send_binary.assert_not_called()
     # Should not have self-initialized the extractor
     assert role._extractor is None  # noqa: SLF001
+
+
+def test_visualizer_role_holds_stream_start_until_available() -> None:
+    """An unavailable client gets no stream/start, and becoming available joins the stream."""
+    client = _make_client_stub()
+    client.available = False
+    role = VisualizerDraftR1Role(client=client)
+    role.on_connect()
+
+    role.on_stream_start()
+    assert not client.send_role_message.called
+
+    client.available = True
+    role.on_availability_changed(old_available=False, new_available=True)
+    client.join_active_stream.assert_called_once_with(role)
+
+
+def test_visualizer_role_sends_no_clear_or_end_without_stream() -> None:
+    """stream/clear and stream/end go only to a stream this role announced."""
+    client = _make_client_stub()
+    role = VisualizerDraftR1Role(client=client)
+    role.on_connect()
+
+    role.on_stream_clear()
+    role.on_stream_end()
+
+    assert not client.send_role_message.called

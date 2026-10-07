@@ -1,4 +1,4 @@
-"""Visualizer role implementation for draft visualizer streaming."""
+"""Deprecated visualizer role implementation for the `visualizer@_draft_r1` wire."""
 
 from __future__ import annotations
 
@@ -35,7 +35,11 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 
+# DEPRECATED(spec-pr-86): remove in aiosendspin <version>
+_deprecation_logged = False
 
+
+# DEPRECATED(spec-pr-86): remove in aiosendspin <version>
 class VisualizerDraftR1Role(Role):
     """Role implementation for draft visualizer streaming."""
 
@@ -107,6 +111,14 @@ class VisualizerDraftR1Role(Role):
 
     def on_connect(self) -> None:
         """Initialize stream config and subscribe to group role."""
+        # DEPRECATED(spec-pr-86): remove in aiosendspin <version>
+        global _deprecation_logged  # noqa: PLW0603
+        if not _deprecation_logged:
+            _deprecation_logged = True
+            _LOGGER.warning(
+                "The visualizer@_draft_r1 role is deprecated and will be removed in a "
+                "future release; clients should use visualizer@v1"
+            )
         self._init_stream_config()
         self._subscribe_to_group_role()
 
@@ -124,8 +136,8 @@ class VisualizerDraftR1Role(Role):
         self.reset_binary_timing()
 
     def on_stream_start(self) -> None:
-        """Start extractor state for a new audio stream."""
-        if self._stream_config is None:
+        """Start extractor state for a new audio stream, once the client is available."""
+        if self._stream_config is None or not self._client.available:
             return
         self.reset_binary_timing()
         # stream/end clears client-side visualizer config, so resend stream/start
@@ -140,6 +152,15 @@ class VisualizerDraftR1Role(Role):
         )
         self._stream_started = True
         self._ensure_buffer_tracker()
+
+    def on_availability_changed(
+        self,
+        old_available: bool,  # noqa: ARG002, FBT001
+        new_available: bool,  # noqa: FBT001
+    ) -> None:
+        """Join the group's running stream once the client becomes available."""
+        if new_available and not self._stream_started:
+            self._client.join_active_stream(self)
 
     def on_audio_chunk(self, chunk: AudioChunk) -> None:
         """Process audio chunk and emit visualizer binary frame."""
@@ -162,7 +183,8 @@ class VisualizerDraftR1Role(Role):
         """Reset visualizer state and notify client to clear buffered data."""
         if self._extractor is not None:
             self._extractor.reset()
-        self.send_message(StreamClearMessage(payload=StreamClearPayload(roles=["visualizer"])))
+        if self._stream_started:
+            self.send_message(StreamClearMessage(payload=StreamClearPayload(roles=["visualizer"])))
         self.reset_binary_timing()
         if self._buffer_tracker is not None:
             self._buffer_tracker.reset()
@@ -170,8 +192,9 @@ class VisualizerDraftR1Role(Role):
     def on_stream_end(self) -> None:
         """Reset visualizer state and notify client that stream has ended."""
         self._extractor = None
+        if self._stream_started:
+            self.send_message(StreamEndMessage(payload=StreamEndPayload(roles=["visualizer"])))
         self._stream_started = False
-        self.send_message(StreamEndMessage(payload=StreamEndPayload(roles=["visualizer"])))
         self.reset_binary_timing()
         if self._buffer_tracker is not None:
             self._buffer_tracker.reset()

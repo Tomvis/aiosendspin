@@ -27,7 +27,7 @@ description = "Async Python implementation of the Sendspin Protocol."
 license = { text = "Apache-2.0" }
 readme = "README.md"
 requires-python = ">=3.12"
-version = "9.1.1+trackfields"
+version = "10.0.0+trackfields"
 
 [project.optional-dependencies]
 server = [
@@ -57,7 +57,7 @@ dev = [
   "pytest-timeout==2.4.0",
   "pytest-xdist==3.8.0",
   "tomli==2.4.1",
-  "ruff==0.16.6",
+  "ruff==0.16.9",
 ]
 
 [tool.setuptools.packages.find]
@@ -126,6 +126,9 @@ line-ending = "lf"
 [tool.pytest.ini_options]
 addopts = "--cov -n auto --timeout=10"
 asyncio_mode = "auto"
+# A Noise handshake must never warn: the library warns on a pre-set ephemeral, which only
+# the credential-mismatch fork does, and only where reusing one replays a single exchange.
+filterwarnings = ["error::UserWarning:noise.noise_protocol"]
 
 [tool.ruff.lint]
 ignore = [

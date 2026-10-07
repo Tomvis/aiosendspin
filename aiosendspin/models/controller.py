@@ -9,8 +9,9 @@ between groups.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
-from .base import SendspinConfig, SendspinModel
+from .base import SendspinConfig, SendspinModel, split_enum_values
 from .types import MediaCommand, RepeatMode
 
 
@@ -98,19 +99,18 @@ class ControllerStatePayload(SendspinModel):
     seek_max_ms: int | None = None
     """Max absolute position (ms) a 'seek' may target. Set only when 'seek' is supported."""
 
+    @classmethod
+    def __pre_deserialize__(cls, d: dict[str, Any]) -> dict[str, Any]:
+        """Drop supported commands this implementation does not recognize."""
+        if "supported_commands" not in d:
+            return d
+        commands, _ = split_enum_values(d["supported_commands"], MediaCommand)
+        return d | {"supported_commands": commands}
+
     def __post_init__(self) -> None:
         """Validate field values."""
         if not 0 <= self.volume <= 100:
             raise ValueError(f"Volume must be in range 0-100, got {self.volume}")
-
-    @classmethod
-    def __pre_deserialize__(cls, d: dict[str, object]) -> dict[str, object]:
-        """Backfill repeat/shuffle for pre-spec servers."""
-        # Deprecated: drop with metadata dual-emit.
-        data = dict(d)
-        data.setdefault("repeat", RepeatMode.OFF.value)
-        data.setdefault("shuffle", False)
-        return data
 
     class Config(SendspinConfig):
         """Config for serializing state messages."""

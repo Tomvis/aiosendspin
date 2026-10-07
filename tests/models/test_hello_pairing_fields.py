@@ -3,41 +3,55 @@
 from __future__ import annotations
 
 import orjson
+import pytest
 
 from aiosendspin.models.core import (
     ActivatePairing,
     ClientHelloPayload,
+    DynamicPairMethodDescriptor,
+    LegacyServerActivateMessage,
     PairMethodDescriptor,
     ServerActivatePayload,
     ServerHelloPayload,
+    SupportedPairMethods,
     UnpairedAccess,
 )
-from aiosendspin.models.types import Activity, PairMethod, TrustLevel
+from aiosendspin.models.types import Activity, PairMethod
 
 
 def test_client_hello_pairing_fields_round_trip() -> None:
-    """client/hello carries trust, pairing methods, and unpaired-access flag."""
+    """client/hello carries pairing methods and the unpaired-access flag."""
     payload = ClientHelloPayload(
         client_id="c1",
         name="Client",
         version=1,
         supported_roles=["controller@v1"],
-        trust_level=TrustLevel.USER,
-        supported_pair_methods=[PairMethodDescriptor(method=PairMethod.PAIRING_PSK)],
+        supported_pair_methods=SupportedPairMethods(pairing_psk=PairMethodDescriptor()),
         unpaired_access=UnpairedAccess(enabled=True),
     )
     restored = ClientHelloPayload.from_json(payload.to_json())
     assert restored == payload
-    assert restored.trust_level is TrustLevel.USER
-    assert restored.supported_pair_methods == [PairMethodDescriptor(method=PairMethod.PAIRING_PSK)]
+    assert restored.supported_pair_methods == SupportedPairMethods(
+        pairing_psk=PairMethodDescriptor()
+    )
     assert restored.unpaired_access.enabled is True
+
+
+def test_client_hello_ignores_a_legacy_trust_level() -> None:
+    """A client still declaring its own trust is understood; the field carries no meaning."""
+    legacy = (
+        '{"client_id":"c1","name":"Client","version":1,'
+        '"supported_roles":["controller@v1"],"trust_level":"user"}'
+    )
+    payload = ClientHelloPayload.from_json(legacy)
+    assert payload.supported_roles == ["controller@v1"]
+    assert not hasattr(payload, "trust_level")
 
 
 def test_client_hello_defaults_when_pairing_fields_absent() -> None:
     """A hello without the new fields deserializes to spec-safe defaults (legacy clients)."""
     legacy = '{"client_id":"c1","name":"Client","version":1,"supported_roles":["controller@v1"]}'
     payload = ClientHelloPayload.from_json(legacy)
-    assert payload.trust_level is TrustLevel.NONE
     assert payload.supported_pair_methods is None
     assert payload.unpaired_access == UnpairedAccess(enabled=False)
 
@@ -74,16 +88,49 @@ def test_activate_pairing_omits_format_for_non_dynamic_methods() -> None:
     assert raw["pairing"] == {"method": "static_pairing_code"}
 
 
-def test_unrecognized_descriptor_format_still_parses() -> None:
-    """A hello advertising a format from a newer spec revision parses; the reader ignores it."""
+# DEPRECATED(spec-pr-130): remove in aiosendspin <version>
+@pytest.mark.parametrize(
+    ("pairing", "selected"),
+    [
+        (ActivatePairing(method=PairMethod.PAIRING_PSK), "pairing_psk"),
+        (ActivatePairing(method=PairMethod.STATIC_PAIRING_CODE), None),
+        (ActivatePairing(method=PairMethod.DYNAMIC_PAIRING_CODE), None),
+        # DEPRECATED(spec-pr-137): remove in aiosendspin <version>
+        (
+            ActivatePairing(method=PairMethod.STATIC_PAIRING_CODE, legacy_pin_wire=True),
+            "static_pin",
+        ),
+        (
+            ActivatePairing(method=PairMethod.DYNAMIC_PAIRING_CODE, legacy_pin_wire=True),
+            "dynamic_pin",
+        ),
+    ],
+)
+def test_legacy_activate_names_only_methods_old_clients_know(
+    pairing: ActivatePairing, selected: str | None
+) -> None:
+    """The legacy activate adds selected_pair_method only for Pairing PSK and PIN attempts."""
+    message = LegacyServerActivateMessage(
+        ServerActivatePayload(activities=[Activity.PAIRING], active_roles=[], pairing=pairing)
+    )
+    raw = orjson.loads(message.to_json())
+    assert raw["type"] == "server/activate"
+    assert raw["payload"]["pairing"] == orjson.loads(pairing.to_json())
+    assert raw["payload"].get("selected_pair_method") == selected
+
+
+def test_unrecognized_descriptor_format_is_dropped() -> None:
+    """A format from a newer spec revision is ignored rather than selected or rejected."""
     raw = (
         '{"client_id":"c1","name":"Client","version":1,"supported_roles":["controller@v1"],'
-        '"supported_pair_methods":[{"method":"dynamic_pairing_code",'
-        '"formats":["digits","holographic"]}]}'
+        '"supported_pair_methods":{"dynamic_pairing_code":'
+        '{"formats":["digits","holographic"],"out_channels":["display"]}}}'
     )
     payload = ClientHelloPayload.from_json(raw)
     assert payload.supported_pair_methods is not None
-    assert payload.supported_pair_methods[0].formats == ["digits", "holographic"]
+    dynamic = payload.supported_pair_methods.dynamic_pairing_code
+    assert dynamic is not None
+    assert dynamic.formats == ["digits"]
 
 
 def test_unrecognized_activate_format_still_parses() -> None:
@@ -97,6 +144,14 @@ def test_unrecognized_activate_format_still_parses() -> None:
     assert payload.pairing.format == "holographic"
 
 
+def test_server_hello_languages_round_trip() -> None:
+    """server/hello carries the operator language preferences, or omits them."""
+    payload = ServerHelloPayload(name="Server", languages=["ca", "es", "en"])
+    assert ServerHelloPayload.from_json(payload.to_json()) == payload
+    assert "languages" not in orjson.loads(ServerHelloPayload(name="Server").to_json())
+
+
+# DEPRECATED(spec-pr-241): remove in aiosendspin <version>
 def test_activate_pairing_languages_round_trip() -> None:
     """The dynamic pairing object carries the spoken-emission language hint, or omits it."""
     payload = ServerActivatePayload(
@@ -113,11 +168,226 @@ def test_activate_pairing_languages_round_trip() -> None:
 
 
 def test_pair_method_descriptor_locations_round_trip() -> None:
-    """A static-secret descriptor carries the locations hint, others omit it."""
-    descriptor = PairMethodDescriptor(
-        method=PairMethod.STATIC_PAIRING_CODE, locations=["device", "leaflet"]
-    )
+    """A static-secret descriptor carries the locations hint, or omits it entirely."""
+    descriptor = PairMethodDescriptor(locations=["device", "leaflet"])
     restored = PairMethodDescriptor.from_json(descriptor.to_json())
     assert restored.locations == ["device", "leaflet"]
-    bare = PairMethodDescriptor(method=PairMethod.PAIRING_PSK)
-    assert orjson.loads(bare.to_json()) == {"method": "pairing_psk"}
+    assert orjson.loads(PairMethodDescriptor().to_json()) == {}
+
+
+def test_supported_pair_methods_serializes_keyed_by_method() -> None:
+    """The advertisement goes on the wire as an object keyed by method identifier."""
+    payload = ClientHelloPayload(
+        client_id="c1",
+        name="Client",
+        version=1,
+        supported_roles=["controller@v1"],
+        supported_pair_methods=SupportedPairMethods(
+            pairing_psk=PairMethodDescriptor(locations=["device"]),
+            dynamic_pairing_code=DynamicPairMethodDescriptor(
+                out_channels=["display"], formats=["digits"]
+            ),
+        ),
+    )
+    raw = orjson.loads(payload.to_json())
+    assert raw["supported_pair_methods"] == {
+        "pairing_psk": {"locations": ["device"]},
+        "dynamic_pairing_code": {"out_channels": ["display"], "formats": ["digits"]},
+    }
+
+
+# DEPRECATED(spec-pr-179): remove in aiosendspin <version>
+def test_superseded_pair_methods_list_is_accepted() -> None:
+    """A client advertising the superseded list is understood, and the shape recorded."""
+    raw = (
+        '{"client_id":"c1","name":"Client","version":1,"supported_roles":["controller@v1"],'
+        '"supported_pair_methods":[{"method":"pairing_psk","locations":["device"]},'
+        '{"method":"dynamic_pairing_code","formats":["digits"],"out_channels":["speaker"]}]}'
+    )
+    payload = ClientHelloPayload.from_json(raw)
+    assert payload.legacy_pair_methods_list_used is True
+    assert payload.legacy_pin_methods_used is None
+    methods = payload.supported_pair_methods
+    assert methods is not None
+    assert methods.pairing_psk == PairMethodDescriptor(locations=["device"])
+    assert methods.dynamic_pairing_code == DynamicPairMethodDescriptor(
+        out_channels=["speaker"], formats=["digits"]
+    )
+
+
+# DEPRECATED(spec-pr-137): remove in aiosendspin <version>
+@pytest.mark.parametrize(
+    ("entry", "expected"),
+    [
+        pytest.param(
+            '{"method":"dynamic_pin","out_channels":["display"],"min_pin_length":6}',
+            SupportedPairMethods(
+                dynamic_pairing_code=DynamicPairMethodDescriptor(
+                    out_channels=["display"], formats=["digits"]
+                )
+            ),
+            id="dynamic",
+        ),
+        pytest.param(
+            '{"method":"static_pin","locations":["device"]}',
+            SupportedPairMethods(static_pairing_code=PairMethodDescriptor(locations=["device"])),
+            id="static",
+        ),
+        pytest.param(
+            '{"method":"dynamic_pin","out_channels":["display"],"min_pin_length":8}',
+            SupportedPairMethods(unusable_methods=["dynamic_pairing_code"]),
+            id="dynamic_longer_than_six",
+        ),
+    ],
+)
+def test_pre_rename_pin_methods_read_as_pairing_code_methods(
+    entry: str, expected: SupportedPairMethods
+) -> None:
+    """The pre-rename PIN methods map onto the pairing-code methods, six digits only."""
+    raw = (
+        '{"name":"Client","supported_roles":["controller@v1"],'
+        f'"supported_pair_methods":[{entry}]}}'
+    )
+    payload = ClientHelloPayload.from_json(raw)
+    assert payload.legacy_pin_methods_used is True
+    assert payload.supported_pair_methods == expected
+
+
+# DEPRECATED(spec-pr-137): remove in aiosendspin <version>
+@pytest.mark.parametrize(
+    ("pairing", "wire"),
+    [
+        pytest.param(
+            ActivatePairing(
+                method=PairMethod.DYNAMIC_PAIRING_CODE, format="digits", legacy_pin_wire=True
+            ),
+            {"method": "dynamic_pin", "pin_length": 6},
+            id="dynamic",
+        ),
+        pytest.param(
+            ActivatePairing(method=PairMethod.STATIC_PAIRING_CODE, legacy_pin_wire=True),
+            {"method": "static_pin"},
+            id="static",
+        ),
+    ],
+)
+def test_legacy_pin_activation_uses_the_pin_wire(
+    pairing: ActivatePairing, wire: dict[str, object]
+) -> None:
+    """An activation for a pre-rename PIN client carries the PIN method name and length."""
+    assert orjson.loads(pairing.to_json()) == wire
+
+
+def test_current_pair_methods_object_is_not_flagged_as_legacy() -> None:
+    """The keyed object is the current wire, so it sets no legacy record."""
+    raw = (
+        '{"client_id":"c1","name":"Client","version":1,"supported_roles":["controller@v1"],'
+        '"supported_pair_methods":{"pairing_psk":{}}}'
+    )
+    payload = ClientHelloPayload.from_json(raw)
+    assert payload.legacy_pair_methods_list_used is None
+    assert payload.supported_pair_methods == SupportedPairMethods(
+        pairing_psk=PairMethodDescriptor()
+    )
+
+
+def test_unrecognized_pair_method_is_ignored_not_rejected() -> None:
+    """An identifier from a newer revision is dropped, its value never validated."""
+    raw = (
+        '{"client_id":"c1","name":"Client","version":1,"supported_roles":["controller@v1"],'
+        '"supported_pair_methods":{"pairing_psk":{},"telepathy":{"anything":[1,2]}}}'
+    )
+    methods = ClientHelloPayload.from_json(raw).supported_pair_methods
+    assert methods is not None
+    assert methods.pairing_psk == PairMethodDescriptor()
+    assert methods.ignored_methods == ["telepathy"]
+
+
+def test_both_pairing_code_methods_prefer_dynamic() -> None:
+    """Offering both code methods is recorded, and the dynamic one is preferred."""
+    raw = (
+        '{"client_id":"c1","name":"Client","version":1,"supported_roles":["controller@v1"],'
+        '"supported_pair_methods":{"static_pairing_code":{},'
+        '"dynamic_pairing_code":{"formats":["digits"],"out_channels":["display"]}}}'
+    )
+    methods = ClientHelloPayload.from_json(raw).supported_pair_methods
+    assert methods is not None
+    assert methods.static_pairing_code is None
+    assert methods.dynamic_pairing_code is not None
+    assert methods.offered_both_pairing_code_methods is True
+
+
+def test_dynamic_without_recognized_values_is_dropped() -> None:
+    """A dynamic descriptor left with nothing usable is dropped, and recorded on its own.
+
+    It is not an identifier the reader failed to recognize, so it is kept apart from those.
+    """
+    raw = (
+        '{"client_id":"c1","name":"Client","version":1,"supported_roles":["controller@v1"],'
+        '"supported_pair_methods":{"pairing_psk":{},'
+        '"dynamic_pairing_code":{"formats":["holographic"],"out_channels":["display"]}}}'
+    )
+    methods = ClientHelloPayload.from_json(raw).supported_pair_methods
+    assert methods is not None
+    assert methods.dynamic_pairing_code is None
+    assert methods.unusable_methods == ["dynamic_pairing_code"]
+    assert methods.ignored_methods is None
+
+
+def test_both_offered_keeps_static_when_dynamic_is_unusable() -> None:
+    """An unusable dynamic descriptor leaves static as the only code method to prefer."""
+    raw = (
+        '{"client_id":"c1","name":"Client","version":1,"supported_roles":["controller@v1"],'
+        '"supported_pair_methods":{"pairing_psk":{},"static_pairing_code":{},'
+        '"dynamic_pairing_code":{"formats":["holographic"],"out_channels":["display"]}}}'
+    )
+    methods = ClientHelloPayload.from_json(raw).supported_pair_methods
+    assert methods is not None
+    assert methods.offered_both_pairing_code_methods is True
+    assert methods.static_pairing_code == PairMethodDescriptor()
+    assert methods.dynamic_pairing_code is None
+    assert methods.unusable_methods == ["dynamic_pairing_code"]
+    assert methods.pairing_psk is not None
+
+
+def test_structured_descriptor_values_are_ignored_not_rejected() -> None:
+    """A value that is not an identifier at all is ignored, like any unrecognized one.
+
+    Objects and arrays cannot be looked up as identifiers, so a reader that tested
+    membership first would fail the whole hello rather than skipping the value.
+    """
+    raw = (
+        '{"client_id":"c1","name":"Client","version":1,"supported_roles":["controller@v1"],'
+        '"supported_pair_methods":{"pairing_psk":{"locations":["device",{"a":1},["b"],7]}}}'
+    )
+    methods = ClientHelloPayload.from_json(raw).supported_pair_methods
+    assert methods is not None
+    assert methods.pairing_psk is not None
+    assert methods.pairing_psk.locations == ["device"]
+
+
+def test_dynamic_with_only_structured_values_is_dropped() -> None:
+    """The same rule leaves a dynamic descriptor with nothing usable, so it is dropped."""
+    raw = (
+        '{"client_id":"c1","name":"Client","version":1,"supported_roles":["controller@v1"],'
+        '"supported_pair_methods":{"pairing_psk":{},"dynamic_pairing_code":'
+        '{"formats":[{"a":1}],"out_channels":["display"]}}}'
+    )
+    methods = ClientHelloPayload.from_json(raw).supported_pair_methods
+    assert methods is not None
+    assert methods.dynamic_pairing_code is None
+    assert methods.unusable_methods == ["dynamic_pairing_code"]
+
+
+def test_pair_method_records_cannot_be_spoofed_over_the_wire() -> None:
+    """The parser overwrites its own records, so a client cannot plant them."""
+    raw = (
+        '{"client_id":"c1","name":"Client","version":1,"supported_roles":["controller@v1"],'
+        '"supported_pair_methods":{"pairing_psk":{},"ignored_methods":["invented"],'
+        '"unusable_methods":["invented"],"offered_both_pairing_code_methods":true}}'
+    )
+    methods = ClientHelloPayload.from_json(raw).supported_pair_methods
+    assert methods is not None
+    assert methods.ignored_methods is None
+    assert methods.unusable_methods is None
+    assert methods.offered_both_pairing_code_methods is None

@@ -7,7 +7,11 @@ from dataclasses import dataclass
 from typing import Literal
 from uuid import UUID
 
-from aiosendspin.models.player import ClientHelloPlayerSupport, SupportedAudioFormat
+from aiosendspin.models.player import (
+    ClientHelloPlayerSupport,
+    SupportedAudioFormat,
+    pack_player_audio_header,
+)
 from aiosendspin.models.types import AudioCodec, PlayerCommand, Roles
 from aiosendspin.server.channels import MAIN_CHANNEL, ChannelResolver
 from aiosendspin.server.client import SendspinClient
@@ -69,13 +73,17 @@ class CaptureConnection:
         data: bytes,
         *,
         role: str,  # noqa: ARG002
-        timestamp_us: int,  # noqa: ARG002
+        timestamp_us: int,
         message_type: int,  # noqa: ARG002
         buffer_end_time_us: int | None = None,
         buffer_byte_count: int | None = None,
         duration_us: int | None = None,
+        player_audio_header: bool = False,
+        epoch_exempt: bool = False,  # noqa: ARG002
     ) -> bool:
         """Record outbound binary and optionally update buffered-byte accounting."""
+        if player_audio_header:
+            data = pack_player_audio_header(timestamp_us, 0) + data
         self.events.append(Event(kind="bin", payload=data))
         if (
             self.buffer_tracker is not None
@@ -128,6 +136,7 @@ def make_player(
     hello = type("Hello", (), {})()
     hello.client_id = client_id
     hello.name = client_id
+    hello.device_info = None
     hello.player_support = ClientHelloPlayerSupport(
         supported_formats=supported_formats,
         buffer_capacity=buffer_capacity,

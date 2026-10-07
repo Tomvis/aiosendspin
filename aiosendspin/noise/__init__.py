@@ -1,6 +1,9 @@
 """Noise Protocol Framework (KKpsk2) transport for Sendspin."""
 
+from aiosendspin.models.types import ServerErrorReason
+
 from .constants import (
+    ERROR_TYPE_SERVER,
     HANDSHAKE_TYPE,
     INIT_TYPE_CLIENT,
     INIT_TYPE_SERVER,
@@ -14,6 +17,7 @@ from .driver import (
     HandshakeAbortedError,
     HandshakeResult,
     HandshakeWebSocket,
+    InitRejectedError,
     PskProvider,
     PskResolver,
     run_handshake_client,
@@ -39,12 +43,15 @@ from .models import (
     NoiseHandshakePayload,
     NoiseMsg1Payload,
     NoiseMsg2Payload,
+    ServerErrorMessage,
+    ServerErrorPayload,
     ServerInitMessage,
     ServerInitPayload,
     ServerPairFinalizeMessage,
     ServerPairFinalizePayload,
 )
 from .pairing import (
+    InvalidPairingCodeError,
     PairingError,
     run_dynamic_pairing_code_client,
     run_dynamic_pairing_code_server,
@@ -53,6 +60,7 @@ from .pairing import (
     run_static_pairing_code_client,
     run_static_pairing_code_server,
 )
+from .pairing_code import format_pairing_code
 from .pairing_token import (
     PSKPairingToken,
     decode_pairing_code_token,
@@ -74,14 +82,13 @@ from .trust_store import (
     ServerPairingRecord,
     ServerPairingStore,
     StagedPairingPsk,
-    StorageExhaustedError,
     TrustedUnpairedClient,
-    TrustLevel,
 )
 from .wire import EncryptedWebSocket, RawWebSocket
 
 __all__ = [
     "DEFAULT_HANDSHAKE_TIMEOUT_S",
+    "ERROR_TYPE_SERVER",
     "HANDSHAKE_TYPE",
     "INIT_TYPE_CLIENT",
     "INIT_TYPE_SERVER",
@@ -106,6 +113,8 @@ __all__ = [
     "Identity",
     "InMemoryClientPairingStore",
     "InMemoryServerPairingStore",
+    "InitRejectedError",
+    "InvalidPairingCodeError",
     "NoiseCipherSuite",
     "NoiseHandshakeMessage",
     "NoiseHandshakePayload",
@@ -120,6 +129,9 @@ __all__ = [
     "PskResolver",
     "RawWebSocket",
     "ResolvedPsk",
+    "ServerErrorMessage",
+    "ServerErrorPayload",
+    "ServerErrorReason",
     "ServerInitMessage",
     "ServerInitPayload",
     "ServerPairFinalizeMessage",
@@ -127,8 +139,6 @@ __all__ = [
     "ServerPairingRecord",
     "ServerPairingStore",
     "StagedPairingPsk",
-    "StorageExhaustedError",
-    "TrustLevel",
     "TrustedUnpairedClient",
     "b64url_decode",
     "b64url_encode",
@@ -136,6 +146,7 @@ __all__ = [
     "decode_psk_token",
     "encode_pairing_code_token",
     "encode_psk_token",
+    "format_pairing_code",
     "generate_psk",
     "psk_id_for",
     "run_dynamic_pairing_code_client",

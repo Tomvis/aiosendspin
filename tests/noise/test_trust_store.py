@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import json
+import logging
 import stat
 import sys
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 import pytest
 
 from aiosendspin.models.types import PairMethod
-from aiosendspin.noise.keys import generate_psk, psk_id_for
+from aiosendspin.noise.keys import b64url_encode, generate_psk, psk_id_for
 from aiosendspin.noise.trust_store import (
-    PAIRING_CODE_ESCALATION_THRESHOLD,
+    PAIRING_ROUND_LIMIT,
     ClientPairingRecord,
     ClientPairingStore,
     FileClientPairingStore,
@@ -26,7 +29,7 @@ from aiosendspin.noise.trust_store import (
     StagedPairingPsk,
     TrustedUnpairedClient,
 )
-from tests.pairing_stores import ExhaustedClientStore
+from tests.pairing_stores import seed_used_client_records
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -39,14 +42,12 @@ def _server_record(client_id: str = "client-A") -> ServerPairingRecord:
     )
 
 
+_EPOCH = datetime(2026, 1, 1, tzinfo=UTC)
+
+
 def _client_record(server_id: str = "server-X") -> ClientPairingRecord:
     psk = generate_psk()
     return ClientPairingRecord(psk_id=psk_id_for(psk), psk=psk, server_id=server_id)
-
-
-def _shared_record() -> ClientPairingRecord:
-    psk = generate_psk()
-    return ClientPairingRecord(psk_id=psk_id_for(psk), psk=psk, server_id=None)
 
 
 def _pairing_psk() -> PairingPsk:
@@ -57,6 +58,18 @@ def _pairing_psk() -> PairingPsk:
 def _staged_psk() -> StagedPairingPsk:
     psk = generate_psk()
     return StagedPairingPsk(psk_id=psk_id_for(psk), psk=psk)
+
+
+def _record_dict(client_id: str, pair_methods: list[str]) -> dict[str, object]:
+    psk = generate_psk()
+    return {
+        "psk_id": psk_id_for(psk),
+        "psk": b64url_encode(psk),
+        "client_id": client_id,
+        "pair_methods": pair_methods,
+        "created_at": "2026-05-01T12:00:00+00:00",
+        "owner": None,
+    }
 
 
 @pytest.fixture(params=["memory", "file"])
@@ -113,6 +126,31 @@ def test_server_record_pair_methods_round_trip_and_back_compat() -> None:
     legacy = record.to_dict()
     del legacy["pair_methods"]
     assert ServerPairingRecord.from_dict(legacy).pair_methods == []
+
+
+# DEPRECATED(spec-pr-179): remove in aiosendspin <version>
+def test_server_record_maps_legacy_pair_method_names() -> None:
+    """Pre-rename method names load as their pairing-code methods, de-duplicated in order."""
+    data = _record_dict(
+        "client-A", ["static_pin", "pairing_psk", "dynamic_pin", "static_pairing_code"]
+    )
+    record = ServerPairingRecord.from_dict(data)
+    assert record.pair_methods == [
+        PairMethod.STATIC_PAIRING_CODE,
+        PairMethod.PAIRING_PSK,
+        PairMethod.DYNAMIC_PAIRING_CODE,
+    ]
+    assert record.to_dict()["pair_methods"] == [
+        "static_pairing_code",
+        "pairing_psk",
+        "dynamic_pairing_code",
+    ]
+
+
+def test_server_record_rejects_unknown_pair_method() -> None:
+    """An unrecognised method name raises ValueError."""
+    with pytest.raises(ValueError, match="unknown pair method 'carrier_pigeon'"):
+        ServerPairingRecord.from_dict(_record_dict("client-A", ["carrier_pigeon"]))
 
 
 def test_server_record_owner_round_trips_and_back_compat() -> None:
@@ -292,6 +330,79 @@ async def test_file_server_store_tolerates_absent_sections(tmp_path: Path) -> No
     assert list(await store.list_trusted_unpaired()) == []
 
 
+# DEPRECATED(spec-pr-179): remove in aiosendspin <version>
+async def test_file_server_store_loads_legacy_pair_method_names(tmp_path: Path) -> None:
+    """A store saved with pre-rename method names loads, and saves only the new names."""
+    path = tmp_path / "pairings.json"
+    staged = _staged_psk()
+    path.write_text(
+        json.dumps(
+            {
+                "records": {
+                    "client-A": _record_dict("client-A", ["dynamic_pin"]),
+                    "client-B": _record_dict("client-B", ["pairing_psk", "static_pin"]),
+                },
+                "staged_pairing_psks": {"client-S": staged.to_dict()},
+                "trusted_unpaired_clients": {
+                    "client-T": {"client_id": "client-T", "created_at": "2026-05-01T12:00:00+00:00"}
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    store = await FileServerPairingStore.open(path)
+    record_a = await store.record_by_client_id("client-A")
+    record_b = await store.record_by_client_id("client-B")
+    assert record_a is not None
+    assert record_a.pair_methods == [PairMethod.DYNAMIC_PAIRING_CODE]
+    assert record_b is not None
+    assert record_b.pair_methods == [PairMethod.PAIRING_PSK, PairMethod.STATIC_PAIRING_CODE]
+    assert await store.staged_pairing_psk("client-S") == staged
+    assert await store.trusted_unpaired("client-T") is not None
+
+    await store.store_record(_server_record(client_id="client-C"))
+    saved = json.loads(path.read_text(encoding="utf-8"))["records"]
+    assert saved["client-A"]["pair_methods"] == ["dynamic_pairing_code"]
+    assert saved["client-B"]["pair_methods"] == ["pairing_psk", "static_pairing_code"]
+    assert saved["client-C"]["pair_methods"] == []
+
+
+async def test_file_server_store_skips_record_with_unknown_pair_method(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A record naming an unknown method is skipped with a warning; the rest of the store loads."""
+    path = tmp_path / "pairings.json"
+    staged = _staged_psk()
+    known = _record_dict("client-A", ["pairing_psk"])
+    path.write_text(
+        json.dumps(
+            {
+                "records": {
+                    "client-A": known,
+                    "client-X": _record_dict("client-X", ["pairing_psk", "carrier_pigeon"]),
+                },
+                "staged_pairing_psks": {"client-S": staged.to_dict()},
+                "trusted_unpaired_clients": {
+                    "client-T": {"client_id": "client-T", "created_at": "2026-05-01T12:00:00+00:00"}
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with caplog.at_level(logging.WARNING, logger="aiosendspin.noise.trust_store"):
+        store = await FileServerPairingStore.open(path)
+
+    assert list(await store.list_records()) == [ServerPairingRecord.from_dict(known)]
+    assert await store.record_by_client_id("client-X") is None
+    assert await store.staged_pairing_psk("client-S") == staged
+    assert await store.trusted_unpaired("client-T") is not None
+    assert [r.levelno for r in caplog.records] == [logging.WARNING]
+    assert "client-X" in caplog.records[0].getMessage()
+    assert "carrier_pigeon" in caplog.records[0].getMessage()
+
+
 async def test_file_server_store_rejects_malformed_file(tmp_path: Path) -> None:
     """A present-but-malformed store fails loud rather than silently dropping credentials."""
     non_object = tmp_path / "top.json"
@@ -310,21 +421,6 @@ async def test_file_server_store_rejects_malformed_file(tmp_path: Path) -> None:
         await FileServerPairingStore.open(bad_entry)
 
 
-async def test_file_client_store_seeds_shared_record_on_first_open(tmp_path: Path) -> None:
-    """First open provisions a shared-PSK fallback record referenced by record_mode."""
-    path = tmp_path / "client.json"
-    store = await FileClientPairingStore.open(path)
-    config = await store.get_pairing_config()
-    records = list(await store.list_records())
-    assert len(records) == 1
-    shared = records[0]
-    assert shared.server_id is None  # shared-PSK record
-    assert config.record_mode_psk_id == shared.psk_id
-    # The seed is persisted, so it is stable across reopen.
-    reopened = await FileClientPairingStore.open(path)
-    assert (await reopened.get_pairing_config()).record_mode_psk_id == shared.psk_id
-
-
 async def test_file_client_store_persists_state(tmp_path: Path) -> None:
     """Records, config, Pairing PSK, static code, and failure count survive a reload."""
     path = tmp_path / "client.json"
@@ -334,28 +430,26 @@ async def test_file_client_store_persists_state(tmp_path: Path) -> None:
     await store.store_record(record)
     await store.set_pairing_psk(pairing)
     await store.set_static_pairing_code("12345678")
-    await store.record_pairing_code_failure()
+    await store.record_pairing_round()
 
     reloaded = await FileClientPairingStore.open(path)
     assert await reloaded.record_by_server_id("server-X") == record
     assert await reloaded.pairing_psk() == pairing
     assert await reloaded.static_pairing_code() == "12345678"
-    assert await reloaded.pairing_code_failure_count() == 1
+    assert await reloaded.pairing_round_count() == 1
 
 
+# DEPRECATED(spec-pr-179): remove in aiosendspin <version>
 async def test_file_client_store_migrates_per_method_pin_failures(tmp_path: Path) -> None:
-    """A pre-escalation store carries its dynamic count over, keeping escalation state."""
+    """A store with per-method counters carries its dynamic count over as the round count."""
     path = tmp_path / "client.json"
     await FileClientPairingStore.open(path)
     data = json.loads(path.read_text(encoding="utf-8"))
-    data["pin_failures"] = {
-        PairMethod.DYNAMIC_PAIRING_CODE.value: PAIRING_CODE_ESCALATION_THRESHOLD,
-        PairMethod.STATIC_PAIRING_CODE.value: 3,
-    }
+    data["pin_failures"] = {"dynamic_pin": PAIRING_ROUND_LIMIT, "static_pin": 3}
     path.write_text(json.dumps(data), encoding="utf-8")
 
     reloaded = await FileClientPairingStore.open(path)
-    assert await reloaded.pairing_code_failure_count() == PAIRING_CODE_ESCALATION_THRESHOLD
+    assert await reloaded.pairing_round_count() == PAIRING_ROUND_LIMIT
 
 
 async def test_file_client_store_persists_last_playback_server(tmp_path: Path) -> None:
@@ -399,7 +493,6 @@ async def test_file_client_store_pairing_outcome_generates_per_server_record(
     """An unbounded file client mints a fresh per-server record on pairing."""
     store = await FileClientPairingStore.open(tmp_path / "client.json")
     psk, record = await store.resolve_pairing_outcome(server_id="server-Y")
-    assert record is not None
     assert record.server_id == "server-Y"
     assert record.psk == psk
 
@@ -467,8 +560,8 @@ async def test_client_store_record_takes_precedence_over_pairing_psk(
 
 
 async def test_client_store_mark_record_used(client_store: ClientPairingStore) -> None:
-    """mark_record_used flips the flag once; absent or already-used calls are no-ops."""
-    record = _client_record(server_id="server-X")
+    """mark_record_used flags the record and refreshes its last use; absent is a no-op."""
+    record = replace(_client_record(server_id="server-X"), last_used_at=_EPOCH)
     await client_store.store_record(record)
     stored = await client_store.record_by_psk_id(record.psk_id)
     assert stored is not None
@@ -478,8 +571,12 @@ async def test_client_store_mark_record_used(client_store: ClientPairingStore) -
     used = await client_store.record_by_psk_id(record.psk_id)
     assert used is not None
     assert used.used is True
+    assert used.last_used_at > _EPOCH
 
-    await client_store.mark_record_used(record.psk_id)  # already used, no-op
+    await client_store.mark_record_used(record.psk_id)
+    reused = await client_store.record_by_psk_id(record.psk_id)
+    assert reused is not None
+    assert reused.last_used_at >= used.last_used_at
     await client_store.mark_record_used("absent")  # no-op
 
 
@@ -489,11 +586,11 @@ async def test_client_store_remove_and_list(client_store: ClientPairingStore) ->
     b = _client_record(server_id="server-B")
     await client_store.store_record(a)
     await client_store.store_record(b)
-    added = {r for r in await client_store.list_records() if r.server_id is not None}
+    added = set(await client_store.list_records())
     assert added == {a, b}
     await client_store.remove_record(a.psk_id)
     assert await client_store.resolve_by_psk_id(a.psk_id) is None
-    added = {r for r in await client_store.list_records() if r.server_id is not None}
+    added = set(await client_store.list_records())
     assert added == {b}
     # Removing an absent record is a no-op.
     await client_store.remove_record("absent")
@@ -512,96 +609,29 @@ async def test_client_store_replace_record_drops_prior_for_server(
     assert await client_store.record_by_psk_id(old.psk_id) is None
 
 
-async def test_client_store_replace_record_keeps_shared_records(
+async def test_pairing_round_counter_increments_and_resets(
     client_store: ClientPairingStore,
 ) -> None:
-    """A shared record binds to no server, so replacing one leaves the others alone."""
-    existing = _shared_record()
-    await client_store.store_record(existing)
+    """Rounds accumulate and reset clears the count."""
+    assert await client_store.pairing_round_count() == 0
+    assert await client_store.record_pairing_round() == 1
+    assert await client_store.record_pairing_round() == 2
+    await client_store.reset_pairing_rounds()
+    assert await client_store.pairing_round_count() == 0
 
-    await client_store.replace_record_for_server_id(_shared_record())
 
-    assert await client_store.record_by_psk_id(existing.psk_id) == existing
-
-
-async def test_client_store_reports_no_storage_accounting_by_default(
+async def test_pairing_round_limit_is_reached_at_20_and_clears_on_reset(
     client_store: ClientPairingStore,
 ) -> None:
-    """The default store is unbounded and reports no storage accounting."""
-    assert await client_store.storage_accounting() is None
-
-
-async def test_pairing_code_failure_counter_increments_and_resets(
-    client_store: ClientPairingStore,
-) -> None:
-    """Failures accumulate and reset clears the counter."""
-    assert await client_store.pairing_code_failure_count() == 0
-    assert await client_store.record_pairing_code_failure() == 1
-    assert await client_store.record_pairing_code_failure() == 2
-    await client_store.reset_pairing_code_failures()
-    assert await client_store.pairing_code_failure_count() == 0
-
-
-async def test_pairing_code_escalation_at_threshold_and_clears_on_reset(
-    client_store: ClientPairingStore,
-) -> None:
-    """Escalation trips at the threshold and clears only on reset."""
-    for _ in range(PAIRING_CODE_ESCALATION_THRESHOLD - 1):
-        await client_store.record_pairing_code_failure()
-    assert not await client_store.is_pairing_code_escalated()
-    await client_store.record_pairing_code_failure()
-    assert await client_store.is_pairing_code_escalated()
-    await client_store.reset_pairing_code_failures()
-    assert not await client_store.is_pairing_code_escalated()
-
-
-# --- shared-PSK records --------------------------------------------------
-
-
-def test_shared_record_round_trips_and_resolves() -> None:
-    """A shared-PSK record omits server_id; as_resolved carries no counterparty."""
-    record = _shared_record()
-    assert record.server_id is None
-    restored = ClientPairingRecord.from_dict(record.to_dict())
-    assert restored == record
-    assert restored.server_id is None
-    resolved = record.as_resolved()
-    assert resolved.category is PskCategory.LONG_TERM
-    assert resolved.counterparty_id is None
-
-
-async def test_shared_record_excluded_from_server_id_lookup(
-    client_store: ClientPairingStore,
-) -> None:
-    """A shared-PSK record is found by psk_id but never by server_id."""
-    record = _shared_record()
-    await client_store.store_record(record)
-    assert await client_store.resolve_by_psk_id(record.psk_id) == record.as_resolved()
-    assert await client_store.record_by_server_id("any-server") is None
-
-
-async def test_set_record_mode_psk_id_validates_reference(
-    client_store: ClientPairingStore,
-) -> None:
-    """The record_mode psk_id must reference an existing shared-PSK record."""
-    shared = _shared_record()
-    pubkey = _client_record(server_id="server-X")
-    await client_store.store_record(shared)
-    await client_store.store_record(pubkey)
-
-    # The store is pre-provisioned with a shared fallback at construction.
-    initial = (await client_store.get_pairing_config()).record_mode_psk_id
-    assert initial is not None
-    assert await client_store.record_by_psk_id(initial) is not None
-
-    with pytest.raises(ValueError, match="references no record"):
-        await client_store.set_record_mode_psk_id("missing")
-    with pytest.raises(ValueError, match="must reference a shared-PSK record"):
-        await client_store.set_record_mode_psk_id(pubkey.psk_id)
-
-    await client_store.set_record_mode_psk_id(shared.psk_id)
-    assert (await client_store.get_pairing_config()).record_mode_psk_id == shared.psk_id
-    assert not await client_store.can_remove_record(shared.psk_id)
+    """The round limit is reached at 20 rounds and clears only on reset."""
+    assert PAIRING_ROUND_LIMIT == 20
+    for _ in range(PAIRING_ROUND_LIMIT - 1):
+        await client_store.record_pairing_round()
+    assert not await client_store.is_pairing_round_limit_reached()
+    await client_store.record_pairing_round()
+    assert await client_store.is_pairing_round_limit_reached()
+    await client_store.reset_pairing_rounds()
+    assert not await client_store.is_pairing_round_limit_reached()
 
 
 async def test_resolve_outcome_mints_stored_pubkey_record(
@@ -609,18 +639,224 @@ async def test_resolve_outcome_mints_stored_pubkey_record(
 ) -> None:
     """A storable store generates a fresh PSK bound to the server_id."""
     psk, record = await client_store.resolve_pairing_outcome(server_id="server-X")
-    assert record is not None
     assert record.psk == psk
     assert record.psk_id == psk_id_for(psk)
     assert record.server_id == "server-X"
 
 
-async def test_resolve_outcome_falls_back_to_shared_on_exhaustion() -> None:
-    """A configured shared fallback admits under the shared record when full."""
-    store = ExhaustedClientStore()
-    shared = _shared_record()
-    await store.store_record(shared)
-    await store.set_record_mode_psk_id(shared.psk_id)
-    psk, record = await store.resolve_pairing_outcome(server_id="server-X")
-    assert psk == shared.psk
-    assert record is None
+# --- record capacity and eviction -----------------------------------------
+
+
+async def _client_store_with_capacity(
+    kind: str, tmp_path: Path, record_capacity: int
+) -> ClientPairingStore:
+    if kind == "file":
+        return await FileClientPairingStore.open(
+            tmp_path / "client.json", record_capacity=record_capacity
+        )
+    return InMemoryClientPairingStore(record_capacity=record_capacity)
+
+
+async def _per_server_psk_ids(store: ClientPairingStore) -> set[str]:
+    return {r.psk_id for r in await store.list_records()}
+
+
+async def test_client_store_record_capacity_defaults_to_16(
+    client_store: ClientPairingStore,
+) -> None:
+    """A client store holds 16 per-server records unless configured otherwise."""
+    assert client_store.record_capacity == 16
+
+
+@pytest.mark.parametrize("kind", ["memory", "file"])
+async def test_client_store_record_capacity_is_configurable(kind: str, tmp_path: Path) -> None:
+    """The record capacity is set at construction, down to the spec minimum of 5."""
+    store = await _client_store_with_capacity(kind, tmp_path, 5)
+    assert store.record_capacity == 5
+
+
+@pytest.mark.parametrize("kind", ["memory", "file"])
+async def test_client_store_rejects_capacity_below_5(kind: str, tmp_path: Path) -> None:
+    """A record capacity below the spec minimum of 5 is rejected."""
+    with pytest.raises(ValueError, match="at least 5"):
+        await _client_store_with_capacity(kind, tmp_path, 4)
+
+
+@pytest.mark.parametrize("kind", ["memory", "file"])
+async def test_pairing_at_capacity_evicts_least_recently_used(kind: str, tmp_path: Path) -> None:
+    """At capacity, persisting a new server's record evicts the least recently used one."""
+    store = await _client_store_with_capacity(kind, tmp_path, 5)
+    oldest, *rest = await seed_used_client_records(store, 5)
+    new = _client_record(server_id="server-new")
+
+    await store.replace_record_for_server_id(new)
+
+    assert await _per_server_psk_ids(store) == {new.psk_id, *(r.psk_id for r in rest)}
+    assert await store.record_by_psk_id(oldest.psk_id) is None
+
+
+@pytest.mark.parametrize("kind", ["memory", "file"])
+async def test_eviction_skips_records_backing_open_connections(kind: str, tmp_path: Path) -> None:
+    """A protected record is never evicted, even when it is the least recently used."""
+    store = await _client_store_with_capacity(kind, tmp_path, 5)
+    oldest, second, *_ = await seed_used_client_records(store, 5)
+    new = _client_record(server_id="server-new")
+
+    await store.replace_record_for_server_id(new, protected={oldest.psk_id})
+
+    assert await store.record_by_psk_id(oldest.psk_id) is not None
+    assert await store.record_by_psk_id(second.psk_id) is None
+    assert await store.record_by_psk_id(new.psk_id) == new
+
+
+async def test_repairing_a_known_server_at_capacity_evicts_nothing(tmp_path: Path) -> None:
+    """Re-pairing a stored server replaces its record without evicting another."""
+    store = await _client_store_with_capacity("memory", tmp_path, 5)
+    seeded = await seed_used_client_records(store, 5)
+    renewed = _client_record(server_id="server-2")
+
+    await store.replace_record_for_server_id(renewed)
+
+    expected = {r.psk_id for r in seeded if r is not seeded[2]} | {renewed.psk_id}
+    assert await _per_server_psk_ids(store) == expected
+
+
+@pytest.mark.parametrize("kind", ["memory", "file"])
+async def test_repairing_keeps_the_prior_record_while_a_connection_uses_it(
+    kind: str, tmp_path: Path
+) -> None:
+    """Re-pairing a server keeps its prior record while an open connection still uses it."""
+    store = await _client_store_with_capacity(kind, tmp_path, 5)
+    seeded = await seed_used_client_records(store, 5)
+    renewed = _client_record(server_id="server-2")
+
+    await store.replace_record_for_server_id(renewed, protected={seeded[2].psk_id})
+
+    assert await store.record_by_psk_id(seeded[2].psk_id) is not None
+    assert await store.record_by_psk_id(renewed.psk_id) == renewed
+    assert await store.record_by_psk_id(seeded[0].psk_id) is None
+    assert len(await _per_server_psk_ids(store)) == 5
+
+
+async def test_pairing_persists_when_every_other_record_is_protected(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """With nothing evictable the new record still persists, over capacity, with a warning."""
+    store = await _client_store_with_capacity("memory", tmp_path, 5)
+    seeded = await seed_used_client_records(store, 5)
+    new = _client_record(server_id="server-new")
+
+    with caplog.at_level(logging.WARNING):
+        await store.replace_record_for_server_id(new, protected={r.psk_id for r in seeded})
+
+    assert await _per_server_psk_ids(store) == {new.psk_id, *(r.psk_id for r in seeded)}
+    assert any(
+        r.getMessage()
+        == "Pairing records exceed the capacity of 5; the remaining records are backed by "
+        "open connections"
+        for r in caplog.records
+    )
+
+
+def test_client_record_without_last_used_at_falls_back_to_created_at() -> None:
+    """A record written before last_used_at existed loads with its creation time."""
+    record = _client_record()
+    data = record.to_dict()
+    del data["last_used_at"]
+
+    restored = ClientPairingRecord.from_dict(data)
+
+    assert restored.last_used_at == record.created_at
+
+
+async def test_file_client_store_loads_records_without_last_used_at(tmp_path: Path) -> None:
+    """A pairing store file written before last_used_at existed still loads."""
+    path = tmp_path / "client.json"
+    store = await FileClientPairingStore.open(path)
+    record = _client_record()
+    await store.store_record(record)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    for entry in data["records"].values():
+        del entry["last_used_at"]
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+    reopened = await FileClientPairingStore.open(path)
+
+    restored = await reopened.record_by_psk_id(record.psk_id)
+    assert restored is not None
+    assert restored.last_used_at == record.created_at
+
+
+async def test_file_client_store_loads_a_9_1_store_with_record_mode(tmp_path: Path) -> None:
+    """A 9.1 store file loads without its shared record-mode record."""
+    shared_psk, server_psk = generate_psk(), generate_psk()
+    shared_id, server_psk_id = psk_id_for(shared_psk), psk_id_for(server_psk)
+    path = tmp_path / "client.json"
+    path.write_text(
+        json.dumps(
+            {
+                "records": {
+                    shared_id: {
+                        "psk_id": shared_id,
+                        "psk": b64url_encode(shared_psk),
+                        "server_id": None,
+                        "used": False,
+                        "created_at": "2026-05-01T12:00:00+00:00",
+                    },
+                    server_psk_id: {
+                        "psk_id": server_psk_id,
+                        "psk": b64url_encode(server_psk),
+                        "server_id": "server-X",
+                        "used": True,
+                        "created_at": "2026-05-01T12:00:00+00:00",
+                    },
+                },
+                "pairing_config": {
+                    "pairing_psk_enabled": True,
+                    "dynamic_pin_enabled": True,
+                    "static_pin_enabled": True,
+                    "unpaired_access_enabled": False,
+                    "dynamic_pin_min_length": 6,
+                    "record_mode_psk_id": shared_id,
+                },
+                "pairing_psk": None,
+                "static_pin": None,
+                "pin_failures": 0,
+                "last_playback_server_id": "server-X",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    store = await FileClientPairingStore.open(path)
+
+    assert [r.psk_id for r in await store.list_records()] == [server_psk_id]
+    assert (await store.get_pairing_config()).static_pairing_code_enabled is True
+
+
+async def test_record_by_server_id_prefers_the_newest_record(
+    client_store: ClientPairingStore,
+) -> None:
+    """With two records for one server, the lookup returns the newer one."""
+    older = replace(_client_record(server_id="server-X"), created_at=_EPOCH)
+    newer = replace(_client_record(server_id="server-X"), created_at=_EPOCH + timedelta(days=1))
+    await client_store.store_record(older)
+    await client_store.store_record(newer)
+
+    assert await client_store.record_by_server_id("server-X") == newer
+
+
+async def test_remove_superseded_records_keeps_protected_and_newest(
+    client_store: ClientPairingStore,
+) -> None:
+    """Superseded per-server records go unless protected, and newest records stay."""
+    x_old = replace(_client_record(server_id="server-X"), created_at=_EPOCH)
+    x_new = _client_record(server_id="server-X")
+    y_old = replace(_client_record(server_id="server-Y"), created_at=_EPOCH)
+    y_new = _client_record(server_id="server-Y")
+    for record in (x_old, x_new, y_old, y_new):
+        await client_store.store_record(record)
+
+    await client_store.remove_superseded_records(protected={y_old.psk_id})
+
+    assert await _per_server_psk_ids(client_store) == {x_new.psk_id, y_old.psk_id, y_new.psk_id}

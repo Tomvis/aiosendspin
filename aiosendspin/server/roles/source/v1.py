@@ -7,7 +7,7 @@ import binascii
 import logging
 from typing import TYPE_CHECKING
 
-from aiosendspin.audio.codecs import create_decoder
+from aiosendspin.audio.codecs import create_decoder, decoded_bit_depth, opus_available
 from aiosendspin.audio.format import AudioFormat
 from aiosendspin.models.core import ServerCommandMessage, ServerCommandPayload
 from aiosendspin.models.source import SourceCommandServerPayload
@@ -42,9 +42,12 @@ class SourceV1Role(Role):
         self._decoder: object | None = None
         self._stream: SourceStream | None = None
         self._stream_active = False
-        self._initial_state_received = False
-        # Require a fresh start request after reconnecting.
-        self._start_requested = False
+        # The source object of the client/state this activation requires.
+        self._source_state_received = False
+        # A start request waiting for can_start; see request_start().
+        self._start_queued = False
+        # A start was sent after the latest stop, unavailability, removal or disconnect.
+        self._stream_wanted = False
         # Stamp decoder output produced during flush.
         self._last_timestamp_us = 0
         self._signal: SignalState | None = None
@@ -56,7 +59,7 @@ class SourceV1Role(Role):
 
     @property
     def stream_active(self) -> bool:
-        """Whether the client currently has an open input stream."""
+        """Whether a stream handle is open for consumers."""
         return self._stream_active
 
     def handles_inbound_binary(self, message_type: int) -> bool:
@@ -68,21 +71,31 @@ class SourceV1Role(Role):
         """Role family name for protocol messages."""
         return "source"
 
+    @staticmethod
+    def accepted_codecs() -> list[AudioCodec]:
+        """Codecs accepted in client-stream/start, as listed in server/hello."""
+        codecs = [AudioCodec.FLAC, AudioCodec.PCM]
+        if opus_available():
+            codecs.append(AudioCodec.OPUS)
+        return codecs
+
     def on_connect(self) -> None:
         """Connect without a group role."""
 
     def on_disconnect(self) -> None:
         """End any active stream so a waiting consumer is released."""
         self._end_stream()
-        self._initial_state_received = False
-        self._start_requested = False
+        self._source_state_received = False
+        self._start_queued = False
+        self._stream_wanted = False
         self._signal = None
 
     def on_deactivate(self) -> None:
         """End any active stream when the role leaves active_roles."""
         self._end_stream()
-        self._initial_state_received = False
-        self._start_requested = False
+        self._source_state_received = False
+        self._start_queued = False
+        self._stream_wanted = False
         self._signal = None
         super().on_deactivate()
 
@@ -90,18 +103,46 @@ class SourceV1Role(Role):
         """Require synchronized client state before accepting captured audio."""
         return True
 
-    def request_start(self) -> None:
-        """Ask the source client to begin streaming (server/command: start)."""
-        self._start_requested = True
-        self.send_message(
-            ServerCommandMessage(
-                payload=ServerCommandPayload(source=SourceCommandServerPayload(command="start"))
-            )
+    def initial_state_deviations(self, payload: ClientStatePayload) -> list[str]:
+        """Report a client/state that lacks the source object its activation requires."""
+        if payload.source is None:
+            return ["has an active source role but no source state"]
+        return []
+
+    # DEPRECATED(spec-pr-195): remove in aiosendspin <version>
+    def on_initial_client_state(self, payload: ClientStatePayload) -> None:  # noqa: ARG002
+        """Record the initial client/state, which allows a start even without a source object."""
+        # A pre-#195 client may never send the source object. Only its initial client/state
+        # stands in, flagged by initial_state_deviations, which a strict server rejects.
+        self._source_state_received = True
+
+    def on_hold_released(self) -> None:
+        """Send a queued start now that the role's client/state hold is over."""
+        self._send_queued_start()
+
+    @property
+    def can_start(self) -> bool:
+        """Whether `request_start()` may send a start command now."""
+        return (
+            self._source_state_received
+            and self._client.available
+            and not self._client.awaits_role_state(self.role_family)
         )
+
+    def request_start(self) -> None:
+        """
+        Ask the source client to begin streaming (server/command: start).
+
+        While `can_start` is false the request is queued and sent once it turns true.
+        `request_stop()`, a disconnect or the role's deactivation cancels it.
+        """
+        self._start_queued = True
+        self._send_queued_start()
 
     def request_stop(self) -> None:
         """Ask the source client to stop streaming (server/command: stop)."""
-        self._start_requested = False
+        self._start_queued = False
+        self._stream_wanted = False
         self.send_message(
             ServerCommandMessage(
                 payload=ServerCommandPayload(source=SourceCommandServerPayload(command="stop"))
@@ -109,22 +150,35 @@ class SourceV1Role(Role):
         )
 
     def on_client_stream_start(self, payload: ClientStreamStartPayload) -> None:
-        """Build a decoder and a fresh stream handle, then announce it."""
-        if not self._start_requested:
-            # Let server compliance policy decide whether to disconnect.
-            self._client.flag_noncompliance(
-                "client_stream/start sent without a preceding source start command"
-            )
-            return
+        """Build a decoder and a fresh stream handle, then announce it, if a stream is wanted."""
         source = payload.source
         if self._stream_active:
             self._end_stream()
+        if not self._stream_wanted:
+            # A response to a start that crossed a stop, unavailability or removal: discard it.
+            return
 
-        # The spec ignores bit_depth for opus, so decode at the canonical 16 bits.
-        bit_depth = 16 if source.codec is AudioCodec.OPUS else source.bit_depth
+        if source.codec not in self.accepted_codecs():
+            self._client.flag_noncompliance(
+                f"client-stream/start announced codec {source.codec.value!r}, "
+                "which server/hello did not list"
+            )
+            return
+        if source.codec is not AudioCodec.OPUS and not 1 <= source.bit_depth <= 32:
+            self._client.flag_noncompliance(
+                f"client-stream/start announced unsupported bit_depth {source.bit_depth}"
+            )
+            return
+        if source.codec is AudioCodec.PCM and source.bit_depth % 8:
+            # The PCM wire convention only packs whole-byte samples.
+            self._client.flag_noncompliance(
+                f"client-stream/start announced pcm bit_depth {source.bit_depth}, "
+                "which is not a whole number of bytes"
+            )
+            return
         audio_format = AudioFormat(
             sample_rate=source.sample_rate,
-            bit_depth=bit_depth,
+            bit_depth=decoded_bit_depth(source.codec.value, source.bit_depth),
             channels=source.channels,
         )
         header = None
@@ -133,7 +187,7 @@ class SourceV1Role(Role):
                 header = base64.b64decode(source.codec_header, validate=True)
             except (binascii.Error, ValueError):
                 self._client.flag_noncompliance(
-                    "client_stream/start codec_header is not valid Base64"
+                    "client-stream/start codec_header is not valid Base64"
                 )
                 return
         if source.codec is AudioCodec.FLAC and (
@@ -144,7 +198,7 @@ class SourceV1Role(Role):
             or int.from_bytes(header[5:8], "big") != 34
         ):
             self._client.flag_noncompliance(
-                "client_stream/start FLAC codec_header must contain STREAMINFO"
+                "client-stream/start FLAC codec_header must contain STREAMINFO"
             )
             return
         try:
@@ -156,7 +210,7 @@ class SourceV1Role(Role):
             self._decoder = create_decoder(
                 source.codec.value,
                 sample_rate=source.sample_rate,
-                bit_depth=bit_depth,
+                bit_depth=source.bit_depth,
                 channels=source.channels,
                 codec_header=header,
             )
@@ -174,13 +228,11 @@ class SourceV1Role(Role):
     def on_binary_chunk(self, message_type: int, timestamp_us: int, data: bytes) -> None:  # noqa: ARG002
         """Decode a source audio chunk into the active stream."""
         if (
-            not self._initial_state_received
+            not self._source_state_received
             or not self._stream_active
             or self._stream is None
             or self._decoder is None
         ):
-            return
-        if not self._client.available:
             return
         try:
             pcm = self._decoder.decode(data)  # type: ignore[attr-defined]
@@ -214,10 +266,11 @@ class SourceV1Role(Role):
             self._client._signal_event(SourceStreamEndedEvent())  # noqa: SLF001
 
     def on_client_state(self, payload: ClientStatePayload) -> None:
-        """Surface a source's signal presence, only when it advertised line_sense."""
-        if payload.available is not None:
-            self._initial_state_received = True
+        """Send a queued start the state allows, and surface a line_sense signal change."""
         source = payload.source
+        if source is not None:
+            self._source_state_received = True
+        self._send_queued_start()
         if source is None or source.signal is None or not self._line_sense_supported():
             return
         if source.signal == self._signal:
@@ -232,11 +285,26 @@ class SourceV1Role(Role):
         old_available: bool,  # noqa: ARG002, FBT001
         new_available: bool,  # noqa: FBT001
     ) -> None:
-        """Treat becoming unavailable as an implicit source stop."""
+        """Send a queued start once available, and treat becoming unavailable as a stop."""
         if new_available:
+            self._send_queued_start()
             return
-        self._start_requested = False
+        self._stream_wanted = False
         self._end_stream()
+
+    def _send_queued_start(self) -> None:
+        """Send the queued start command once `can_start` allows it."""
+        if not self._start_queued or not self.can_start:
+            return
+        self._start_queued = False
+        self._stream_wanted = True
+        if (connection := self._client.connection) is not None:
+            connection.record_source_start()
+        self.send_message(
+            ServerCommandMessage(
+                payload=ServerCommandPayload(source=SourceCommandServerPayload(command="start"))
+            )
+        )
 
     def _line_sense_supported(self) -> bool:
         """Whether the source advertised the 'line_sense' feature in client/hello."""

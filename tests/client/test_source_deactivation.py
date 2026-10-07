@@ -34,6 +34,7 @@ class _FakeClient:
             return 1_000_000
 
     clock = _Clock()
+    roles: tuple[Roles, ...] = ()
 
     async def note_playback_activity(self, _conn: object) -> None:
         pass
@@ -66,7 +67,9 @@ def _connection(
     conn._active_roles = active_roles  # noqa: SLF001
     conn._source_stream_active = stream_active  # noqa: SLF001
     conn._reported_available = True  # noqa: SLF001
+    conn._initial_state_sent = False  # noqa: SLF001
     conn._reported_source_signal = None  # noqa: SLF001
+    conn._pending_state = {}  # noqa: SLF001
     conn._time_filter = _FakeTimeFilter(synchronized=synchronized)  # type: ignore[assignment]  # noqa: SLF001
     conn._selected_pairing = None  # noqa: SLF001
 
@@ -78,13 +81,13 @@ def _connection(
 
 
 async def test_source_dropped_from_active_roles_ends_client_stream() -> None:
-    """Removing source@v1 from active_roles auto-sends client_stream/end."""
+    """Removing source@v1 from active_roles auto-sends client-stream/end."""
     ws = _FakeWs()
     conn = _connection(ws, active_roles=[Roles.SOURCE.value], stream_active=True)
     await conn._apply_activation(  # noqa: SLF001
         ServerActivatePayload(activities=[Activity.PLAYBACK], active_roles=[])
     )
-    assert any("client_stream/end" in m for m in ws.sent)
+    assert any("client-stream/end" in m for m in ws.sent)
     assert conn._source_stream_active is False  # noqa: SLF001
 
 
@@ -95,7 +98,7 @@ async def test_no_client_stream_end_when_source_retained() -> None:
     await conn._apply_activation(  # noqa: SLF001
         ServerActivatePayload(activities=[Activity.PLAYBACK], active_roles=[Roles.SOURCE.value])
     )
-    assert not any("client_stream/end" in m for m in ws.sent)
+    assert not any("client-stream/end" in m for m in ws.sent)
     assert conn._source_stream_active is True  # noqa: SLF001
 
 
@@ -109,8 +112,8 @@ async def test_no_client_stream_end_when_no_stream_active() -> None:
     assert ws.sent == []
 
 
-async def test_unpaired_activation_rejects_source_role() -> None:
-    """Unpaired connections cannot activate the source role."""
+async def test_unpaired_activation_admits_source_role_with_unpaired_access() -> None:
+    """An unpaired server may activate source@v1 when unpaired access is enabled."""
     ws = _FakeWs()
     conn = _connection(
         ws,
@@ -124,7 +127,56 @@ async def test_unpaired_activation_rejects_source_role() -> None:
         ServerActivatePayload(activities=[Activity.PLAYBACK], active_roles=[Roles.SOURCE.value])
     )
 
-    assert reason is GoodbyeReason.UNAUTHORIZED
+    assert reason is None
+    assert conn._active_roles == [Roles.SOURCE.value]  # noqa: SLF001
+
+
+async def test_unpaired_activation_of_source_needs_unpaired_access() -> None:
+    """Without unpaired access, activating source@v1 unpaired asks the server to pair."""
+    ws = _FakeWs()
+    conn = _connection(
+        ws,
+        active_roles=[Roles.PLAYER.value],
+        stream_active=False,
+        category=PskCategory.SENTINEL,
+        unpaired_access=False,
+    )
+
+    reason = await conn._apply_activation(  # noqa: SLF001
+        ServerActivatePayload(activities=[Activity.PLAYBACK], active_roles=[Roles.SOURCE.value])
+    )
+
+    assert reason is GoodbyeReason.PAIRING_REQUIRED
+    # A refused activation leaves the prior role set untouched.
+    assert conn._active_roles == [Roles.PLAYER.value]  # noqa: SLF001
+
+
+async def test_unpaired_source_streams_audio() -> None:
+    """A source activated unpaired can open its stream and send chunks."""
+    ws = _FakeWs()
+    conn = _connection(
+        ws,
+        active_roles=[],
+        stream_active=False,
+        category=PskCategory.SENTINEL,
+        unpaired_access=True,
+    )
+    await conn._apply_activation(  # noqa: SLF001
+        ServerActivatePayload(activities=[Activity.PLAYBACK], active_roles=[Roles.SOURCE.value])
+    )
+    conn._source_start_authorized = True  # noqa: SLF001
+
+    await conn.send_client_stream_start(
+        codec=AudioCodec.PCM,
+        sample_rate=48000,
+        channels=2,
+        bit_depth=16,
+        codec_header=None,
+    )
+    await conn.send_source_chunk(b"audio", timestamp_us=1)
+
+    assert any("client-stream/start" in m for m in ws.sent)
+    assert ws.sent_bytes != []
 
 
 async def test_source_chunks_rejected_after_role_deactivation() -> None:
@@ -159,6 +211,7 @@ async def test_stream_start_rejected_during_in_band_exchange() -> None:
     """A stream start during an in-band exchange fails instead of marking the stream active."""
     ws = _FakeWs()
     conn = _connection(ws, active_roles=[Roles.SOURCE.value], stream_active=False)
+    conn._source_start_authorized = True  # noqa: SLF001
     conn._exchange_in_progress = True  # noqa: SLF001
 
     with pytest.raises(RuntimeError, match="in-band exchange"):
@@ -192,7 +245,7 @@ async def test_source_unavailable_ends_stream_before_state() -> None:
 
     messages = [orjson.loads(message) for message in ws.sent]
     assert [message["type"] for message in messages] == [
-        "client_stream/end",
+        "client-stream/end",
         "client/state",
     ]
     assert messages[-1]["payload"] == {"available": False, "source": {}}

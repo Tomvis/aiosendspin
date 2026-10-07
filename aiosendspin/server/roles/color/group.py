@@ -2,20 +2,14 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 from aiosendspin.models.color import SessionUpdateColor
 from aiosendspin.models.core import ServerStateMessage, ServerStatePayload
-from aiosendspin.server.roles.base import GroupRole, Role
 from aiosendspin.server.roles.color.events import ColorClearedEvent, ColorUpdatedEvent
 from aiosendspin.server.roles.color.state import Color
-from aiosendspin.server.roles.color.types import ColorRoleProtocol
-
-if TYPE_CHECKING:
-    from aiosendspin.server.group import SendspinGroup
+from aiosendspin.server.roles.scheduled_state import ScheduledStateGroupRole
 
 
-class ColorGroupRole(GroupRole):
+class ColorGroupRole(ScheduledStateGroupRole[Color]):
     """Coordinate color palette across a group.
 
     Stores current color state and pushes updates to subscribed ColorV1Roles.
@@ -23,46 +17,34 @@ class ColorGroupRole(GroupRole):
 
     role_family = "color"
 
-    def __init__(self, group: SendspinGroup) -> None:
-        """Initialize ColorGroupRole."""
-        super().__init__(group)
-        self._current_color: Color | None = None
-
     @property
     def color(self) -> Color | None:
         """Return current color palette."""
-        return self._current_color
+        return self._state.current(self._now_us())
 
-    def on_member_join(self, role: Role) -> None:
-        """Send current color to newly joined member."""
-        self._send_state_to_role(role)
+    def set_color(self, color: Color | None, *, timestamp_us: int | None = None) -> None:
+        """Set color palette and push updates to all subscribed roles.
 
-    def _send_state_to_role(self, role: ColorRoleProtocol) -> None:
-        """Send current color state to a single role."""
-        timestamp = self._group._server.clock.now_us()  # noqa: SLF001
-        if self._current_color is not None:
-            color_update = self._current_color.snapshot_update(timestamp)
+        A future `timestamp_us` schedules the palette to take effect then, replacing any
+        palette already scheduled. It is sent to clients at most 20 seconds ahead, and
+        `ColorUpdatedEvent` fires now, carrying that timestamp. Otherwise the palette
+        applies at once and cancels a scheduled one. To show two palettes in sequence,
+        schedule the second only after the first took effect.
+
+        Raises ValueError when scheduling None; schedule `Color()` to blank the palette.
+        """
+        now_us = self._now_us()
+        last_color = self._state.current(now_us)
+        if timestamp_us is not None and timestamp_us > now_us:
+            if color is None:
+                raise ValueError("a color clear cannot be scheduled; schedule Color() instead")
+            self._schedule(color, timestamp_us)
+            timestamp = timestamp_us
         else:
-            color_update = SessionUpdateColor.cleared(timestamp)
-        role.send_message(ServerStateMessage(ServerStatePayload(color=color_update)))
-
-    def set_color(self, color: Color | None) -> None:
-        """Set color palette and push updates to all subscribed roles."""
-        if color == self._current_color:
-            return
-
-        timestamp = self._group._server.clock.now_us()  # noqa: SLF001
-        last_color = self._current_color
-        if color is None:
-            color_update = SessionUpdateColor.cleared(timestamp)
-        else:
-            color_update = color.diff_update(last_color, timestamp)
-
-        self._current_color = color
-
-        for role in self._members:
-            state_message = ServerStateMessage(ServerStatePayload(color=color_update))
-            role.send_message(state_message)
+            if color == last_color and self._state.pending_timestamp_us is None:
+                return
+            timestamp = now_us if timestamp_us is None else timestamp_us
+            self._apply(color, timestamp)
 
         if color is None:
             self.emit_group_event(
@@ -78,5 +60,13 @@ class ColorGroupRole(GroupRole):
         )
 
     def clear(self) -> None:
-        """Clear the color palette."""
+        """Clear the color palette, and any scheduled palette, at once."""
         self.set_color(None)
+
+    def _state_message(self, state: Color | None, timestamp_us: int) -> ServerStateMessage:
+        color_update = (
+            SessionUpdateColor(timestamp=timestamp_us)
+            if state is None
+            else state.snapshot_update(timestamp_us)
+        )
+        return ServerStateMessage(ServerStatePayload(color=color_update))

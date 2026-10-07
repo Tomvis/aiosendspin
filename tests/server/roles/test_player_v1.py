@@ -8,7 +8,7 @@ from uuid import uuid4
 
 import pytest
 
-from aiosendspin.models import AudioCodec, unpack_binary_header
+from aiosendspin.models import AudioCodec
 from aiosendspin.models.core import (
     ClientStatePayload,
     StreamClearMessage,
@@ -29,8 +29,8 @@ from aiosendspin.server.roles.base import AudioChunk, AudioRequirements, StreamR
 from aiosendspin.server.roles.player.audio_transformers import FlacEncoder, PcmPassthrough
 from aiosendspin.server.roles.player.events import (
     MinBufferChangedEvent,
+    OutputDelayChangedEvent,
     RequiredLeadTimeChangedEvent,
-    StaticDelayChangedEvent,
     VolumeChangedEvent,
 )
 
@@ -128,49 +128,86 @@ def test_player_role_initial_state_deviations_accepts_complete_timing() -> None:
     role = PlayerV1Role(client=_make_client_stub())
     payload = ClientStatePayload(
         available=True,
-        player=PlayerStatePayload(static_delay_ms=0, required_lead_time_ms=100, min_buffer_ms=200),
+        player=PlayerStatePayload(
+            output_delay_ms=0, required_lead_time_ms=100, min_buffer_ms=200, supported_commands=[]
+        ),
     )
     assert role.initial_state_deviations(payload) == []
 
 
-def _stub_with_player_support(*commands: PlayerCommand) -> MagicMock:
+def _stub_with_player_support(legacy_commands: list[PlayerCommand] | None = None) -> MagicMock:
     client = _make_client_stub()
     client.info.player_support = ClientHelloPlayerSupport(
         supported_formats=[
             SupportedAudioFormat(codec=AudioCodec.PCM, channels=2, sample_rate=48000, bit_depth=16)
         ],
         buffer_capacity=100_000,
-        supported_commands=list(commands),
+        supported_commands=legacy_commands,
     )
     return client
 
 
 def _complete_timing_state(**overrides: object) -> ClientStatePayload:
-    fields = {"static_delay_ms": 0, "required_lead_time_ms": 100, "min_buffer_ms": 200}
+    fields: dict[str, object] = {
+        "output_delay_ms": 0,
+        "required_lead_time_ms": 100,
+        "min_buffer_ms": 200,
+        "supported_commands": [],
+    }
     fields.update(overrides)
     return ClientStatePayload(available=True, player=PlayerStatePayload(**fields))  # type: ignore[arg-type]
 
 
+def test_player_role_initial_state_deviations_flags_missing_supported_commands() -> None:
+    """An initial player state without supported_commands is reported incomplete."""
+    role = PlayerV1Role(client=_stub_with_player_support())
+    reasons = role.initial_state_deviations(_complete_timing_state(supported_commands=None))
+    assert any("supported_commands" in r for r in reasons)
+
+
 def test_player_role_initial_state_deviations_flags_missing_volume() -> None:
-    """A player that declared the volume command but omits volume is reported incomplete."""
-    role = PlayerV1Role(client=_stub_with_player_support(PlayerCommand.VOLUME))
-    reasons = role.initial_state_deviations(_complete_timing_state())
+    """A player whose initial state declares the volume command but omits volume is flagged."""
+    role = PlayerV1Role(client=_stub_with_player_support())
+    reasons = role.initial_state_deviations(
+        _complete_timing_state(supported_commands=[PlayerCommand.VOLUME])
+    )
     assert any("volume" in r for r in reasons)
 
 
 def test_player_role_initial_state_deviations_flags_missing_muted() -> None:
-    """A player that declared the mute command but omits muted is reported incomplete."""
-    role = PlayerV1Role(client=_stub_with_player_support(PlayerCommand.MUTE))
-    reasons = role.initial_state_deviations(_complete_timing_state())
+    """A player whose initial state declares the mute command but omits muted is flagged."""
+    role = PlayerV1Role(client=_stub_with_player_support())
+    reasons = role.initial_state_deviations(
+        _complete_timing_state(supported_commands=[PlayerCommand.MUTE])
+    )
     assert any("muted" in r for r in reasons)
 
 
 def test_player_role_initial_state_deviations_accepts_declared_commands_reported() -> None:
     """Declared volume/mute commands with their values present are accepted."""
-    role = PlayerV1Role(client=_stub_with_player_support(PlayerCommand.VOLUME, PlayerCommand.MUTE))
-    assert role.initial_state_deviations(_complete_timing_state(volume=50, muted=False)) == []
+    role = PlayerV1Role(client=_stub_with_player_support())
+    payload = _complete_timing_state(
+        volume=50, muted=False, supported_commands=[PlayerCommand.VOLUME, PlayerCommand.MUTE]
+    )
+    assert role.initial_state_deviations(payload) == []
 
 
+def test_player_role_initial_state_deviations_reads_payload_commands() -> None:
+    """The initial state's own list is checked, not the role's previously stored one."""
+    role = PlayerV1Role(client=_stub_with_player_support())
+    role.state_supported_commands = [PlayerCommand.VOLUME]
+    assert role.initial_state_deviations(_complete_timing_state()) == []
+
+
+# DEPRECATED(spec-pr-177): remove in aiosendspin <version>
+def test_player_role_initial_state_deviations_legacy_hello_commands() -> None:
+    """A pre-#177 hello's commands stand in for an omitted state list, without a second flag."""
+    role = PlayerV1Role(client=_stub_with_player_support([PlayerCommand.VOLUME]))
+    reasons = role.initial_state_deviations(_complete_timing_state(supported_commands=None))
+    assert reasons == ["omitted volume despite declaring the volume command"]
+
+
+# DEPRECATED(spec-pr-195): remove in aiosendspin <version>
 def test_player_role_flags_undeclared_format_request() -> None:
     """A request for a format not in the client's declared supported_formats is flagged."""
     client = _stub_with_player_support()
@@ -181,6 +218,7 @@ def test_player_role_flags_undeclared_format_request() -> None:
     client.flag_noncompliance.assert_called_once()
 
 
+# DEPRECATED(spec-pr-195): remove in aiosendspin <version>
 def test_player_role_no_flag_for_declared_format_request() -> None:
     """A request matching a declared supported_format is not flagged."""
     client = _stub_with_player_support()
@@ -191,22 +229,38 @@ def test_player_role_no_flag_for_declared_format_request() -> None:
     client.flag_noncompliance.assert_not_called()
 
 
-def test_player_role_flags_volume_without_declared_support() -> None:
-    """A volume field sent with no declared volume command is a deviation."""
-    role = PlayerV1Role(client=_make_client_stub())  # player_support is None
-    reasons = role.client_state_deviations(
-        ClientStatePayload(available=True, player=PlayerStatePayload(volume=50))
+def test_player_role_accepts_read_only_volume() -> None:
+    """A volume reported without the volume command is applied and surfaced, not flagged."""
+    client = _make_client_stub()
+    role = PlayerV1Role(client=client)
+    payload = ClientStatePayload(
+        available=True, player=PlayerStatePayload(volume=50, supported_commands=[])
     )
-    assert any("volume" in r for r in reasons)
+
+    assert role.client_state_deviations(payload) == []
+    role.on_client_state(payload)
+
+    assert role.volume == 50
+    client._signal_event.assert_called_once_with(VolumeChangedEvent(volume=50, muted=False))  # noqa: SLF001
+    role.set_volume(20)
+    client.send_message.assert_not_called()
 
 
-def test_player_role_flags_muted_without_declared_support() -> None:
-    """A muted field sent with no declared mute command is a deviation."""
-    role = PlayerV1Role(client=_make_client_stub())  # player_support is None
-    reasons = role.client_state_deviations(
-        ClientStatePayload(available=True, player=PlayerStatePayload(muted=True))
+def test_player_role_accepts_read_only_muted() -> None:
+    """A muted state reported without the mute command is applied and surfaced, not flagged."""
+    client = _make_client_stub()
+    role = PlayerV1Role(client=client)
+    payload = ClientStatePayload(
+        available=True, player=PlayerStatePayload(muted=True, supported_commands=[])
     )
-    assert any("muted" in r for r in reasons)
+
+    assert role.client_state_deviations(payload) == []
+    role.on_client_state(payload)
+
+    assert role.muted is True
+    client._signal_event.assert_called_once_with(VolumeChangedEvent(volume=100, muted=True))  # noqa: SLF001
+    role.set_mute(False)
+    client.send_message.assert_not_called()
 
 
 def test_player_role_has_role_family() -> None:
@@ -517,13 +571,13 @@ def test_player_role_on_audio_chunk_sends_on_success() -> None:
     client.send_binary.assert_called_once()
 
 
-def test_player_role_on_audio_chunk_packs_binary_header() -> None:
-    """on_audio_chunk() packs binary header with timestamp."""
-    sent_data: list[bytes] = []
+def test_player_role_on_audio_chunk_leaves_header_to_connection() -> None:
+    """on_audio_chunk() sends the raw payload and asks the connection for the header."""
+    sent_data: list[tuple[bytes, dict[str, object]]] = []
     client = MagicMock()
 
-    def capture_send(data: bytes, **kwargs: object) -> bool:  # noqa: ARG001
-        sent_data.append(data)
+    def capture_send(data: bytes, **kwargs: object) -> bool:
+        sent_data.append((data, kwargs))
         return True
 
     client.send_binary.side_effect = capture_send
@@ -536,10 +590,11 @@ def test_player_role_on_audio_chunk_packs_binary_header() -> None:
     role.on_audio_chunk(chunk)
 
     assert len(sent_data) == 1
-    header = unpack_binary_header(sent_data[0])
-    assert header.message_type == BinaryMessageType.AUDIO_CHUNK.value
-    assert header.timestamp_us == 123_456
-    assert sent_data[0][9:] == b"\x01\x02\x03"
+    data, kwargs = sent_data[0]
+    assert data == b"\x01\x02\x03"
+    assert kwargs["message_type"] == BinaryMessageType.AUDIO_CHUNK.value
+    assert kwargs["timestamp_us"] == 123_456
+    assert kwargs["player_audio_header"] is True
 
 
 def test_player_role_on_audio_chunk_passes_buffer_metadata() -> None:
@@ -556,30 +611,32 @@ def test_player_role_on_audio_chunk_passes_buffer_metadata() -> None:
 
     call_kwargs = client.send_binary.call_args.kwargs
     assert call_kwargs["buffer_end_time_us"] == 1000 + 25000
-    assert call_kwargs["buffer_byte_count"] == 100
+    # The 13-byte audio chunk header counts with the payload.
+    assert call_kwargs["buffer_byte_count"] == 13 + 100
     assert call_kwargs["duration_us"] == 25000
 
 
-def test_player_role_on_audio_chunk_applies_static_delay_to_buffer_end() -> None:
-    """Buffer tracking end time should account for the player's static delay."""
+def test_player_role_output_delay_reaches_the_buffer_tracker() -> None:
+    """The buffer end time stays raw; the tracker applies the latest reported output delay."""
     client = _make_client_stub()
     client.send_binary.return_value = True
-
+    client.info.player_support = _make_player_support(
+        SupportedAudioFormat(codec=AudioCodec.PCM, channels=2, sample_rate=48000, bit_depth=16),
+    )
     role = PlayerV1Role(client=client)
     role._client.connection = MagicMock()  # noqa: SLF001
+    role.on_connect()
     role._stream_started = True  # noqa: SLF001
-    role.static_delay_ms = 500
+    tracker = role.get_buffer_tracker()
+    assert tracker is not None
 
-    chunk = AudioChunk(
-        data=b"audio",
-        timestamp_us=1_000_000,
-        duration_us=25_000,
-        byte_count=100,
+    role.on_client_state(ClientStatePayload(player=PlayerStatePayload(output_delay_ms=500)))
+    role.on_audio_chunk(
+        AudioChunk(data=b"audio", timestamp_us=1_000_000, duration_us=25_000, byte_count=100)
     )
-    role.on_audio_chunk(chunk)
 
-    call_kwargs = client.send_binary.call_args.kwargs
-    assert call_kwargs["buffer_end_time_us"] == 525_000
+    assert client.send_binary.call_args.kwargs["buffer_end_time_us"] == 1_025_000
+    assert tracker.output_delay_us == 500_000
 
 
 def test_player_role_on_audio_chunk_ignores_send_return_value() -> None:
@@ -644,6 +701,7 @@ def test_player_role_on_stream_clear_sends_message() -> None:
     role = PlayerV1Role(client=client)
     role._client.connection = MagicMock()  # noqa: SLF001
     role._buffer_tracker = None  # noqa: SLF001
+    role._stream_started = True  # noqa: SLF001
 
     role.on_stream_clear()
 
@@ -712,6 +770,7 @@ def test_player_role_on_stream_end_sends_message() -> None:
     role = PlayerV1Role(client=client)
     role._client.connection = MagicMock()  # noqa: SLF001
     role._buffer_tracker = None  # noqa: SLF001
+    role._stream_started = True  # noqa: SLF001
 
     role.on_stream_end()
 
@@ -811,7 +870,6 @@ def _make_player_support(*formats: SupportedAudioFormat) -> ClientHelloPlayerSup
     return ClientHelloPlayerSupport(
         supported_formats=list(formats),
         buffer_capacity=65536,
-        supported_commands=[PlayerCommand.VOLUME],
     )
 
 
@@ -916,7 +974,7 @@ def test_set_preferred_format_clear_mid_stream_notifies_group() -> None:
 
     assert role.set_preferred_format(None)
     assert role._pending_stream_start is True  # noqa: SLF001
-    client.group.on_role_format_changed.assert_called_once_with(role)
+    client.group.on_role_format_changed.assert_called_once_with(role, resume_at_us=None)
 
 
 def test_ensure_preferred_format_noop_when_no_player_support() -> None:
@@ -980,23 +1038,23 @@ def test_preferred_format_override_superseded_after_client_hello() -> None:
     assert role.preferred_format == AudioFormat(sample_rate=48000, bit_depth=16, channels=2)
 
 
-# --- Static delay ---
+# --- Output delay ---
 
 
-def test_static_delay_default_zero() -> None:
-    """Static delay defaults to 0."""
+def test_output_delay_default_zero() -> None:
+    """Output delay defaults to 0."""
     client = _make_client_stub()
     role = PlayerV1Role(client=client)
-    assert role.static_delay_ms == 0
+    assert role.output_delay_ms == 0
 
 
-def test_on_client_state_updates_static_delay() -> None:
-    """on_client_state() updates static_delay_ms and fires event."""
+def test_on_client_state_updates_output_delay() -> None:
+    """on_client_state() updates output_delay_ms and fires event."""
     client = _make_client_stub()
     role = PlayerV1Role(client=client)
-    payload = ClientStatePayload(player=PlayerStatePayload(static_delay_ms=300))
+    payload = ClientStatePayload(player=PlayerStatePayload(output_delay_ms=300))
     role.on_client_state(payload)
-    assert role.static_delay_ms == 300
+    assert role.output_delay_ms == 300
     client._signal_event.assert_called_once()  # noqa: SLF001
 
 
@@ -1004,7 +1062,7 @@ def test_on_client_state_no_event_if_unchanged() -> None:
     """on_client_state() does not fire event when delay is unchanged."""
     client = _make_client_stub()
     role = PlayerV1Role(client=client)
-    payload = ClientStatePayload(player=PlayerStatePayload(static_delay_ms=0))
+    payload = ClientStatePayload(player=PlayerStatePayload(output_delay_ms=0))
     role.on_client_state(payload)
     client._signal_event.assert_not_called()  # noqa: SLF001
 
@@ -1045,6 +1103,22 @@ def test_on_client_state_updates_min_buffer() -> None:
     assert event.min_buffer_ms == 1500
 
 
+def test_timing_fields_above_server_maximum_are_clamped() -> None:
+    """Timing values above 30 s are stored as reported but honoured at 30 s."""
+    client = _make_client_stub()
+    role = PlayerV1Role(client=client)
+    role.on_client_state(
+        ClientStatePayload(
+            player=PlayerStatePayload(required_lead_time_ms=45_000, min_buffer_ms=60_000)
+        )
+    )
+    assert role.required_lead_time_ms == 45_000
+    assert role.min_buffer_ms == 60_000
+    assert role.get_required_lead_time_us() == 30_000_000
+    assert role.get_min_buffer_us() == 30_000_000
+    client.flag_noncompliance.assert_not_called()
+
+
 def test_partial_client_state_does_not_reset_timing_fields() -> None:
     """A delta carrying only `volume` must leave timing fields and events untouched."""
     client = _make_client_stub()
@@ -1057,13 +1131,13 @@ def test_partial_client_state_does_not_reset_timing_fields() -> None:
         ClientStatePayload(
             player=PlayerStatePayload(
                 volume=80,
-                static_delay_ms=400,
+                output_delay_ms=400,
                 required_lead_time_ms=120,
                 min_buffer_ms=600,
             )
         )
     )
-    assert role.static_delay_ms == 400
+    assert role.output_delay_ms == 400
     assert role.required_lead_time_ms == 120
     assert role.min_buffer_ms == 600
 
@@ -1071,35 +1145,35 @@ def test_partial_client_state_does_not_reset_timing_fields() -> None:
 
     role.on_client_state(ClientStatePayload(player=PlayerStatePayload(volume=70)))
 
-    assert role.static_delay_ms == 400
+    assert role.output_delay_ms == 400
     assert role.required_lead_time_ms == 120
     assert role.min_buffer_ms == 600
     emitted_types = [
         type(call.args[0])
         for call in client._signal_event.call_args_list  # noqa: SLF001
     ]
-    assert StaticDelayChangedEvent not in emitted_types
+    assert OutputDelayChangedEvent not in emitted_types
     assert RequiredLeadTimeChangedEvent not in emitted_types
     assert MinBufferChangedEvent not in emitted_types
     assert VolumeChangedEvent in emitted_types
 
 
-def test_explicit_zero_static_delay_in_delta_updates_field() -> None:
-    """A delta of static_delay_ms=0 sets the field to 0 and fires its event."""
+def test_explicit_zero_output_delay_in_delta_updates_field() -> None:
+    """A delta of output_delay_ms=0 sets the field to 0 and fires its event."""
     client = _make_client_stub()
     role = PlayerV1Role(client=client)
 
-    role.on_client_state(ClientStatePayload(player=PlayerStatePayload(static_delay_ms=400)))
-    assert role.static_delay_ms == 400
+    role.on_client_state(ClientStatePayload(player=PlayerStatePayload(output_delay_ms=400)))
+    assert role.output_delay_ms == 400
 
     client._signal_event.reset_mock()  # noqa: SLF001
 
-    role.on_client_state(ClientStatePayload(player=PlayerStatePayload(static_delay_ms=0)))
+    role.on_client_state(ClientStatePayload(player=PlayerStatePayload(output_delay_ms=0)))
 
-    assert role.static_delay_ms == 0
+    assert role.output_delay_ms == 0
     event = client._signal_event.call_args[0][0]  # noqa: SLF001
-    assert isinstance(event, StaticDelayChangedEvent)
-    assert event.static_delay_ms == 0
+    assert isinstance(event, OutputDelayChangedEvent)
+    assert event.output_delay_ms == 0
 
 
 def test_on_client_state_updates_supported_commands() -> None:
@@ -1107,24 +1181,237 @@ def test_on_client_state_updates_supported_commands() -> None:
     client = _make_client_stub()
     role = PlayerV1Role(client=client)
     payload = ClientStatePayload(
-        player=PlayerStatePayload(supported_commands=[PlayerCommand.SET_STATIC_DELAY])
+        player=PlayerStatePayload(supported_commands=[PlayerCommand.SET_OUTPUT_DELAY])
     )
     role.on_client_state(payload)
-    assert PlayerCommand.SET_STATIC_DELAY in role.state_supported_commands
+    assert PlayerCommand.SET_OUTPUT_DELAY in role.state_supported_commands
 
 
-def test_set_static_delay_sends_command() -> None:
-    """set_static_delay() sends command when client supports it."""
+def test_volume_and_mute_commands_follow_latest_state_list() -> None:
+    """A mid-session supported_commands change alters which commands are sent."""
     client = _make_client_stub()
     role = PlayerV1Role(client=client)
-    role.state_supported_commands = [PlayerCommand.SET_STATIC_DELAY]
-    role.set_static_delay(500)
+
+    role.on_client_state(
+        ClientStatePayload(
+            player=PlayerStatePayload(supported_commands=[PlayerCommand.VOLUME, PlayerCommand.MUTE])
+        )
+    )
+    role.set_volume(30)
+    role.set_mute(True)
+    assert [c.args[0].payload.player.command for c in client.send_message.call_args_list] == [
+        PlayerCommand.VOLUME,
+        PlayerCommand.MUTE,
+    ]
+
+    client.send_message.reset_mock()
+    role.on_client_state(
+        ClientStatePayload(player=PlayerStatePayload(supported_commands=[PlayerCommand.MUTE]))
+    )
+    role.set_volume(40)
+    role.set_mute(False)
+    assert [c.args[0].payload.player.command for c in client.send_message.call_args_list] == [
+        PlayerCommand.MUTE
+    ]
+
+    client.send_message.reset_mock()
+    role.on_client_state(ClientStatePayload(player=PlayerStatePayload(volume=10)))
+    role.set_mute(True)
     client.send_message.assert_called_once()
 
 
-def test_set_static_delay_noop_without_support() -> None:
-    """set_static_delay() is a no-op when client doesn't support it."""
+def test_volume_event_listener_sees_same_state_commands() -> None:
+    """A listener reacting to VolumeChangedEvent gates on the commands from the same state."""
     client = _make_client_stub()
     role = PlayerV1Role(client=client)
-    role.set_static_delay(500)
+    client._signal_event.side_effect = lambda _event: role.set_volume(20)  # noqa: SLF001
+
+    role.on_client_state(
+        ClientStatePayload(
+            player=PlayerStatePayload(volume=50, supported_commands=[PlayerCommand.VOLUME])
+        )
+    )
+
+    client.send_message.assert_called_once()
+
+
+def test_on_connect_resets_supported_commands() -> None:
+    """A reconnecting player starts with no commands until its client/state declares them."""
+    client = _make_client_stub()
+    client.info.player_support = _make_player_support(
+        SupportedAudioFormat(codec=AudioCodec.PCM, channels=2, sample_rate=48000, bit_depth=16),
+    )
+    role = PlayerV1Role(client=client)
+    role.state_supported_commands = [PlayerCommand.VOLUME, PlayerCommand.SET_OUTPUT_DELAY]
+
+    role.on_connect()
+
+    assert role.state_supported_commands == []
+
+
+def test_on_connect_clears_supported_commands_before_joining_group() -> None:
+    """The group recomputes on join without the previous connection's commands."""
+    client = _make_client_stub()
+    client.info.player_support = _make_player_support(
+        SupportedAudioFormat(codec=AudioCodec.PCM, channels=2, sample_rate=48000, bit_depth=16),
+    )
+    role = PlayerV1Role(client=client)
+    role.state_supported_commands = [PlayerCommand.VOLUME, PlayerCommand.MUTE]
+    seen_on_join: list[tuple[int | None, bool | None]] = []
+    group_role = client.group.group_role.return_value
+    group_role.subscribe.side_effect = lambda r: seen_on_join.append(
+        (r.get_player_volume(), r.get_player_muted())
+    )
+
+    role.on_connect()
+
+    assert seen_on_join == [(None, None)]
+
+
+def test_player_volume_and_muted_require_supported_commands() -> None:
+    """Reported volume/mute count for the group only while their commands are supported."""
+    role = PlayerV1Role(client=_make_client_stub())
+
+    role.on_client_state(
+        ClientStatePayload(player=PlayerStatePayload(volume=40, muted=True, supported_commands=[]))
+    )
+    assert (role.volume, role.muted) == (40, True)
+    assert role.get_player_volume() is None
+    assert role.get_player_muted() is None
+
+    role.on_client_state(
+        ClientStatePayload(
+            player=PlayerStatePayload(supported_commands=[PlayerCommand.VOLUME, PlayerCommand.MUTE])
+        )
+    )
+    assert role.get_player_volume() == 40
+    assert role.get_player_muted() is True
+
+
+def test_supported_commands_change_emits_volume_event() -> None:
+    """Adding or removing volume/mute support emits VolumeChangedEvent with unchanged values."""
+    client = _make_client_stub()
+    role = PlayerV1Role(client=client)
+    role.on_client_state(
+        ClientStatePayload(player=PlayerStatePayload(volume=40, supported_commands=[]))
+    )
+
+    for commands in ([PlayerCommand.VOLUME], [PlayerCommand.VOLUME, PlayerCommand.MUTE], []):
+        client._signal_event.reset_mock()  # noqa: SLF001
+        role.on_client_state(
+            ClientStatePayload(player=PlayerStatePayload(supported_commands=commands))
+        )
+        client._signal_event.assert_called_once_with(  # noqa: SLF001
+            VolumeChangedEvent(volume=40, muted=False)
+        )
+
+    client._signal_event.reset_mock()  # noqa: SLF001
+    role.on_client_state(
+        ClientStatePayload(
+            player=PlayerStatePayload(supported_commands=[PlayerCommand.SET_OUTPUT_DELAY])
+        )
+    )
+    client._signal_event.assert_not_called()  # noqa: SLF001
+
+
+# DEPRECATED(spec-pr-177): remove in aiosendspin <version>
+def test_legacy_hello_commands_apply_from_first_state() -> None:
+    """A pre-#177 hello's commands apply once a client/state arrives, even one without a list."""
+    client = _stub_with_player_support([PlayerCommand.VOLUME, PlayerCommand.MUTE])
+    role = PlayerV1Role(client=client)
+
+    role.on_connect()
+    role.set_volume(30)
     client.send_message.assert_not_called()
+
+    role.on_client_state(ClientStatePayload(player=PlayerStatePayload(volume=50)))
+    assert role.state_supported_commands == [PlayerCommand.VOLUME, PlayerCommand.MUTE]
+    role.set_volume(30)
+    client.send_message.assert_called_once()
+
+
+# DEPRECATED(spec-pr-177): remove in aiosendspin <version>
+def test_legacy_hello_commands_extend_state_list() -> None:
+    """A pre-#177 state list is kept alongside the hello's commands, not in place of them."""
+    client = _stub_with_player_support([PlayerCommand.VOLUME, PlayerCommand.MUTE])
+    role = PlayerV1Role(client=client)
+    role.on_connect()
+
+    role.on_client_state(
+        ClientStatePayload(
+            player=PlayerStatePayload(
+                supported_commands=[PlayerCommand.SET_STATIC_DELAY, PlayerCommand.VOLUME]
+            )
+        )
+    )
+    assert role.state_supported_commands == [
+        PlayerCommand.VOLUME,
+        PlayerCommand.MUTE,
+        PlayerCommand.SET_STATIC_DELAY,
+    ]
+
+
+def test_set_output_delay_sends_command() -> None:
+    """set_output_delay() sends command when client supports it."""
+    client = _make_client_stub()
+    role = PlayerV1Role(client=client)
+    role.state_supported_commands = [PlayerCommand.SET_OUTPUT_DELAY]
+    role.set_output_delay(500)
+    client.send_message.assert_called_once()
+
+
+def test_set_output_delay_noop_without_support() -> None:
+    """set_output_delay() is a no-op when client doesn't support it."""
+    client = _make_client_stub()
+    role = PlayerV1Role(client=client)
+    role.set_output_delay(500)
+    client.send_message.assert_not_called()
+
+
+def test_set_output_delay_addresses_client_using_pre_rename_command() -> None:
+    """A client that only declared set_static_delay still gets a delay command it understands."""
+    client = _make_client_stub()
+    role = PlayerV1Role(client=client)
+    role.state_supported_commands = [PlayerCommand.SET_STATIC_DELAY]
+
+    role.set_output_delay(500)
+
+    client.send_message.assert_called_once()
+    sent = client.send_message.call_args.args[0]
+    assert sent.payload.player.command == PlayerCommand.SET_STATIC_DELAY
+    assert sent.payload.player.output_delay_ms == 500
+    assert sent.payload.player.to_dict() == {"command": "set_static_delay", "static_delay_ms": 500}
+
+
+def test_set_output_delay_prefers_current_command_when_both_declared() -> None:
+    """A client declaring both spellings is addressed with the current one."""
+    client = _make_client_stub()
+    role = PlayerV1Role(client=client)
+    role.state_supported_commands = [PlayerCommand.SET_STATIC_DELAY, PlayerCommand.SET_OUTPUT_DELAY]
+
+    role.set_output_delay(500)
+
+    sent = client.send_message.call_args.args[0]
+    assert sent.payload.player.command == PlayerCommand.SET_OUTPUT_DELAY
+
+
+def test_player_client_state_deviations_flags_pre_rename_delay_key() -> None:
+    """A client/state using static_delay_ms is a deviation."""
+    role = PlayerV1Role(client=_make_client_stub())
+    payload = ClientStatePayload(
+        available=True,
+        player=PlayerStatePayload.from_dict({"static_delay_ms": 250}),
+    )
+    reasons = role.client_state_deviations(payload)
+    assert any("static_delay_ms" in r for r in reasons)
+
+
+def test_player_client_state_deviations_flags_pre_rename_command_name() -> None:
+    """Declaring set_static_delay in supported_commands is a deviation."""
+    role = PlayerV1Role(client=_make_client_stub())
+    payload = ClientStatePayload(
+        available=True,
+        player=PlayerStatePayload(supported_commands=[PlayerCommand.SET_STATIC_DELAY]),
+    )
+    reasons = role.client_state_deviations(payload)
+    assert any("set_static_delay" in r for r in reasons)

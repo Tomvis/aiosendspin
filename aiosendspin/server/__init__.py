@@ -11,6 +11,7 @@ __all__ = [
     "AudioFormat",
     "ClientAddedEvent",
     "ClientConnectedEvent",
+    "ClientCredentialMismatchEvent",
     "ClientDisconnectedEvent",
     "ClientEvent",
     "ClientGroupChangedEvent",
@@ -28,6 +29,7 @@ __all__ = [
     "GroupRoleEvent",
     "GroupStateChangedEvent",
     "MinBufferChangedEvent",
+    "OutputDelayChangedEvent",
     "RequiredLeadTimeChangedEvent",
     "SendspinClient",
     "SendspinEvent",
@@ -38,7 +40,6 @@ __all__ = [
     "SourceStream",
     "SourceStreamEndedEvent",
     "SourceStreamStartedEvent",
-    "StaticDelayChangedEvent",
     "VolumeChangedEvent",
 ]
 
@@ -62,8 +63,8 @@ from .group import (
 )
 from .roles.player.events import (
     MinBufferChangedEvent,
+    OutputDelayChangedEvent,
     RequiredLeadTimeChangedEvent,
-    StaticDelayChangedEvent,
     VolumeChangedEvent,
 )
 from .roles.source import (
@@ -75,6 +76,7 @@ from .roles.source import (
 from .server import (
     ClientAddedEvent,
     ClientConnectedEvent,
+    ClientCredentialMismatchEvent,
     ClientDisconnectedEvent,
     ClientRemovedEvent,
     ClientUpdatedEvent,

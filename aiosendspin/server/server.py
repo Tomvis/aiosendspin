@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from ipaddress import ip_address
@@ -30,20 +30,27 @@ from zeroconf.asyncio import AsyncServiceBrowser, AsyncServiceInfo, AsyncZerocon
 
 from aiosendspin.clock import Clock, RawMonotonicClock
 from aiosendspin.models.core import ClientHelloPayload
+from aiosendspin.models.management import MANAGEMENT_DEPRECATION
 from aiosendspin.models.types import ConnectionReason, GoodbyeReason
 from aiosendspin.noise.keys import Identity
-from aiosendspin.noise.pairing import PairingAbortError, PairingAttempt, PairingTimeoutError
+from aiosendspin.noise.pairing import (
+    InvalidPairingCodeError,
+    PairingAbortError,
+    PairingAttempt,
+    PairingTimeoutError,
+)
 from aiosendspin.noise.trust_store import ServerPairingStore, TrustedUnpairedClient
-from aiosendspin.util import create_task, get_local_ip
+from aiosendspin.util import create_task, get_local_ip, warn_deprecated
 
 from .client import SendspinClient
 from .connection import SendspinConnection
 from .group import SendspinGroup
+from .roles.visualizer.v1 import warn_pitch_deprecated
 
 logger = logging.getLogger(__name__)
 
 
-# Abort reconnection attempts after exponential backoff reaches this ceiling
+# Ceiling for the exponential backoff between reconnection attempts
 MAX_RECONNECT_BACKOFF_S = 300.0
 # Only consider a connection stable if it lasts at least this long, otherwise
 # a successful but broken session may cause a reconnection every second.
@@ -55,7 +62,6 @@ class _ServerInitiatedConnectionOptions:
     """Retry policy for a server-initiated client URL."""
 
     retry_initial_connection: bool = False
-    retry_indefinitely: bool = False
 
 
 class SendspinEvent:
@@ -79,6 +85,19 @@ class ClientUpdatedEvent(SendspinEvent):
 @dataclass
 class ClientRemovedEvent(SendspinEvent):
     """A persistent client/device was removed from the server."""
+
+    client_id: str
+
+
+@dataclass
+class ClientCredentialMismatchEvent(SendspinEvent):
+    """A client could not use the pairing record this server holds for it.
+
+    Raised by an authenticated signal during the handshake, so it identifies the
+    real device rather than an impostor. The record is kept and the session admitted
+    on the Sentinel PSK, but it carries no playback until the two agree again — offer
+    the operator re-pairing.
+    """
 
     client_id: str
 
@@ -145,7 +164,7 @@ class SendspinServer:
     _pending_connections: set[SendspinConnection]
     """Incoming connections that have not finished their handshake/message loop yet."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0915
         self,
         loop: asyncio.AbstractEventLoop,
         identity: Identity,
@@ -155,6 +174,7 @@ class SendspinServer:
         pairing_store: ServerPairingStore,
         allow_unencrypted: bool = False,
         allow_noncompliant_clients: bool = True,
+        languages: Sequence[str] | None = None,
         clock: Clock | None = None,
     ) -> None:
         """Initialize a Sendspin server instance.
@@ -172,12 +192,29 @@ class SendspinServer:
                 built against pre-1.0 spec drafts when True, reject the client when
                 False. Tolerance is transitional and will be removed in a future
                 version.
+            languages: BCP 47 tags in descending operator preference, sent to clients
+                in server/hello, or None to declare none.
             clock: Clock source, or None for the default monotonic clock.
+
+        Raises:
+            TypeError: If ``languages`` is a single string rather than a sequence of tags.
+            ValueError: If ``languages`` is empty or contains a blank tag.
         """
+        if languages is not None:
+            if isinstance(languages, str):
+                msg = "languages must be a sequence of tags, not a string"
+                raise TypeError(msg)
+            if not languages:
+                msg = "languages must not be empty"
+                raise ValueError(msg)
+            if not all(tag.strip() for tag in languages):
+                msg = "languages must not contain a blank tag"
+                raise ValueError(msg)
         self._loop = loop
         self._identity = identity
         self._id = identity.peer_id
         self._name = server_name
+        self._languages = tuple(languages) if languages is not None else None
         self._pairing_store = pairing_store
         self._allow_unencrypted = allow_unencrypted
         self._allow_noncompliant_clients = allow_noncompliant_clients
@@ -185,11 +222,13 @@ class SendspinServer:
 
         self._clients: dict[str, SendspinClient] = {}
         self._event_cbs: list[Callable[[SendspinServer, SendspinEvent], None]] = []
-        # Server-wide toggle for the visualizer `pitch` feature. Off by default:
-        # `pitch` rides reserved binary type 21, so enabling it puts a
-        # spec-reserved type on the wire and is technically non-compliant. It is
-        # kept as an opt-in extension for constrained/experimental setups. Read by
-        # VisualizerV1Role when building its stream config.
+        # DEPRECATED(spec-pr-86): remove in aiosendspin <version>
+        # Server-wide toggle for the deprecated visualizer `pitch` feature, which
+        # rides spec-reserved binary type 21. Off by default, which sheds pitch
+        # unless it is a client's only type. Only connections whose hello carried
+        # the pre-#195 visualizer stream configuration, on a server allowing
+        # non-compliant clients, can get pitch at all. Read by VisualizerV1Role
+        # when building its stream config.
         self._visualizer_pitch_enabled: bool = False
 
         if client_session is None:
@@ -213,6 +252,7 @@ class SendspinServer:
         self._reclaim_timeouts: dict[str, asyncio.Handle] = {}
         # Clients whose unregister a one-shot timer deferred to an in-flight reconnect.
         self._deferred_unregister: set[str] = set()
+        self._unencrypted_refused_peers: set[str] = set()
         self._pending_connections = set()
 
         self._mdns_client_urls: dict[str, str] = {}
@@ -271,6 +311,11 @@ class SendspinServer:
         return self._name
 
     @property
+    def languages(self) -> tuple[str, ...] | None:
+        """Return the operator's BCP 47 language preferences, or None when undeclared."""
+        return self._languages
+
+    @property
     def clients(self) -> list[SendspinClient]:
         """All known clients (including disconnected)."""
         return list(self._clients.values())
@@ -284,25 +329,32 @@ class SendspinServer:
         """Get a persistent client device by id, if known."""
         return self._clients.get(client_id)
 
+    # DEPRECATED(spec-pr-86): remove in aiosendspin <version>
     @property
     def visualizer_pitch_enabled(self) -> bool:
         """Whether visualizer roles compute the `pitch` feature (default False)."""
         return self._visualizer_pitch_enabled
 
+    # DEPRECATED(spec-pr-86): remove in aiosendspin <version>
     def set_visualizer_pitch_enabled(self, *, enabled: bool) -> None:
-        """Enable or disable the visualizer `pitch` feature server-wide.
+        """Enable or disable the deprecated visualizer `pitch` feature server-wide.
 
-        This option is ignored while `allow_noncompliant_clients` is False: `pitch`
-        uses reserved binary type 21, which the spec forbids, so a compliance-strict
-        server never emits it regardless of this toggle. It otherwise stays available
-        as an opt-in extension. Pitch (YINFFT) is also the heaviest per-frame
-        visualizer computation, so leaving it off sheds that cost on constrained
-        hardware.
+        `pitch` uses reserved binary type 21, which the spec forbids. Only legacy
+        connections, whose hello carried the pre-#195 visualizer stream
+        configuration, can receive it, and only while `allow_noncompliant_clients`
+        is True; this option has no effect on anyone else. Disabled, it drops
+        `pitch` from a legacy client's types unless `pitch` is the only type that
+        client requested, so it does not guarantee type 21 is never sent. Enabling
+        it logs a deprecation warning once per process. Pitch (YINFFT) is also the
+        heaviest per-frame visualizer computation, so leaving it off sheds that
+        cost on constrained hardware.
         Toggling drops/adds `pitch` on live roles' negotiated types and re-emits
         `stream/start`; new roles pick the setting up when they connect.
         """
         if enabled == self._visualizer_pitch_enabled:
             return
+        if enabled:
+            warn_pitch_deprecated()
         self._visualizer_pitch_enabled = enabled
         for client in self._clients.values():
             for role in client.active_roles:
@@ -426,6 +478,19 @@ class SendspinServer:
         """Emit a ClientUpdatedEvent (called from SendspinClient)."""
         self._signal_event(ClientUpdatedEvent(client_id))
 
+    def _signal_credential_mismatch(self, client_id: str) -> None:
+        """Emit a ClientCredentialMismatchEvent (called from SendspinConnection)."""
+        self._signal_event(ClientCredentialMismatchEvent(client_id))
+
+    def _warn_unencrypted_refused(self, peer: str) -> None:
+        """Warn once per peer that an unencrypted client was refused."""
+        if peer in self._unencrypted_refused_peers:
+            return
+        self._unencrypted_refused_peers.add(peer)
+        logger.warning(
+            "Refused unencrypted legacy connection from %s (transition mode is off)", peer
+        )
+
     def _signal_client_connected(self, client_id: str) -> None:
         """Emit a ClientConnectedEvent (called from SendspinClient)."""
         self._signal_event(ClientConnectedEvent(client_id))
@@ -457,25 +522,31 @@ class SendspinServer:
         *,
         connection_reason: ConnectionReason = ConnectionReason.DISCOVERY,
         retry_initial_connection: bool = False,
-        retry_indefinitely: bool = False,
+        # DEPRECATED(spec-pr-207): remove in aiosendspin <version>
+        retry_indefinitely: bool = False,  # noqa: ARG002
         pairing_attempt: PairingAttempt | None = None,
     ) -> None:
         """Start a background connection attempt to a client URL.
 
-        By default, initial connection failures are logged and stop the background task,
-        and automatic retries only happen after at least one successful connection.
+        By default, initial connection failures are logged and stop the background task.
+        Once connected, the task reconnects with capped exponential backoff until the
+        client says goodbye without asking for a reconnect, or the URL is disconnected.
         If mDNS discovery is unavailable, callers can build a full client WebSocket URL
         from a configured hostname/IP, port, and path, then pass
-        retry_initial_connection=True and retry_indefinitely=True.
+        retry_initial_connection=True to keep retrying until the client is reachable.
+
+        ``retry_indefinitely`` is deprecated and ignored: reconnection never gives up.
 
         ``pairing_attempt`` carries an operator-initiated pairing intent for this dial;
         when a dial task already exists it is queued for that task's next dial.
+
+        A ``PLAYBACK`` reason applies to the next connection only. Later reconnects use
+        ``DISCOVERY``.
         """
-        self._set_connection_options(
-            url,
-            retry_initial_connection=retry_initial_connection,
-            retry_indefinitely=retry_indefinitely,
-        )
+        self._set_connection_options(url, retry_initial_connection=retry_initial_connection)
+        # DEPRECATED(spec-pr-183): remove in aiosendspin <version>
+        if connection_reason is ConnectionReason.MANAGEMENT:
+            warn_deprecated("ConnectionReason.MANAGEMENT", MANAGEMENT_DEPRECATION)
         self._connection_reasons[url] = connection_reason
         prev_task = self._connection_tasks.get(url)
         if prev_task is not None:
@@ -498,23 +569,27 @@ class SendspinServer:
         *,
         connection_reason: ConnectionReason = ConnectionReason.DISCOVERY,
         retry_initial_connection: bool = False,
-        retry_indefinitely: bool = False,
+        # DEPRECATED(spec-pr-207): remove in aiosendspin <version>
+        retry_indefinitely: bool = False,  # noqa: ARG002
         pairing_attempt: PairingAttempt | None = None,
     ) -> None:
         """Connect to a client and wait for the initial connection attempt.
 
+        With ``retry_initial_connection=True`` this waits until the client is reachable or
+        the call is cancelled, so callers wanting a deadline must apply their own timeout.
+        ``retry_indefinitely`` is deprecated and ignored: reconnection never gives up.
+        A ``PLAYBACK`` reason applies to the next connection only, as in ``connect_to_client``.
+
         Raises:
             ClientConnectionError: If the initial connection to the client fails.
             ClientResponseError: If the client responds with an error HTTP status.
-            TimeoutError: If the initial connection attempt times out, or the backoff
-                ceiling is reached with retry_initial_connection=True.
+            TimeoutError: If the initial connection attempt times out.
             Exception: Other unexpected errors during the initial connection attempt.
         """
-        self._set_connection_options(
-            url,
-            retry_initial_connection=retry_initial_connection,
-            retry_indefinitely=retry_indefinitely,
-        )
+        self._set_connection_options(url, retry_initial_connection=retry_initial_connection)
+        # DEPRECATED(spec-pr-183): remove in aiosendspin <version>
+        if connection_reason is ConnectionReason.MANAGEMENT:
+            warn_deprecated("ConnectionReason.MANAGEMENT", MANAGEMENT_DEPRECATION)
         self._connection_reasons[url] = connection_reason
         if url in self._initial_connect_succeeded:
             return
@@ -541,14 +616,17 @@ class SendspinServer:
     async def initiate_pairing(self, client_id: str, attempt: PairingAttempt) -> None:
         """Run a pairing attempt on a connected client.
 
-        A pair abort raises and leaves the connection open (retry with another
-        ``initiate_pairing`` or drop out with ``end_pairing``); a server-side timeout
-        raises with pairing already left; other failures disconnect.
+        An unpaired client keeps its playback, roles and group during the attempt; a long-term
+        paired one leaves playback and its roles first.
+
+        A pair abort, a server-side timeout or ``InvalidPairingCodeError`` raises with pairing
+        already left, keeping the connection unless the abort reason closes it; other failures
+        disconnect.
         """
         connection = self._connection_for(client_id)
         try:
             await connection.initiate_pairing(attempt)
-        except (PairingAbortError, PairingTimeoutError):
+        except (PairingAbortError, PairingTimeoutError, InvalidPairingCodeError):
             raise
         except BaseException:
             await connection.disconnect(retry_connection=False)
@@ -558,20 +636,30 @@ class SendspinServer:
         """End pairing on a connected client without finalizing.
 
         No-op if not in pairing. Aborts any in-progress attempt with ``user_cancelled``, keeping
-        the connection alive.
+        the connection alive. Raises if it fails to return to its pairing record, closing it.
         If an attempt has already been finalized by the client, it completes as a success instead.
         """
         await self._connection_for(client_id).end_pairing()
 
+    # DEPRECATED(spec-pr-183): remove in aiosendspin <version>
     def enable_management(self, client_id: str) -> SendspinConnection:
-        """Enable a management session on a connected client and return its connection."""
+        """Enable a management session on a connected client and return its connection.
+
+        Deprecated: the Sendspin spec no longer defines the management activity.
+        """
+        warn_deprecated("SendspinServer.enable_management", MANAGEMENT_DEPRECATION)
         connection = self._connection_for(client_id)
-        connection.enable_management()
+        connection._set_management(active=True)  # noqa: SLF001
         return connection
 
+    # DEPRECATED(spec-pr-183): remove in aiosendspin <version>
     def disable_management(self, client_id: str) -> None:
-        """End a client's management session, leaving any playback on the connection intact."""
-        self._connection_for(client_id).disable_management()
+        """End a client's management session, leaving any playback on the connection intact.
+
+        Deprecated: the Sendspin spec no longer defines the management activity.
+        """
+        warn_deprecated("SendspinServer.disable_management", MANAGEMENT_DEPRECATION)
+        self._connection_for(client_id)._set_management(active=False)  # noqa: SLF001
 
     async def unpair(self, client_id: str) -> None:
         """Drop the pairing with a connected client: remove our record and tell it to drop its own.
@@ -580,6 +668,10 @@ class SendspinServer:
         """
         connection = self._connection_for(client_id)
         await self.pairing_store.remove_record(client_id)
+        connection.forget_credential_mismatch()
+        # A Sentinel session ignores server/unpair and stays up, so re-announce what it may
+        # now do; a long-term one closes on the message and never sees the activation.
+        await connection.refresh_trusted_unpaired()
         connection.unpair()
 
     async def trust_unpaired(self, client_id: str) -> None:
@@ -607,27 +699,14 @@ class SendspinServer:
             raise ValueError(f"client {client_id} is not connected")
         return connection
 
-    def _set_connection_options(
-        self,
-        url: str,
-        *,
-        retry_initial_connection: bool,
-        retry_indefinitely: bool,
-    ) -> None:
+    def _set_connection_options(self, url: str, *, retry_initial_connection: bool) -> None:
         """Store retry options without downgrading an existing background task."""
         previous = self._connection_options.get(url)
-        if previous is None:
-            self._connection_options[url] = _ServerInitiatedConnectionOptions(
-                retry_initial_connection=retry_initial_connection,
-                retry_indefinitely=retry_indefinitely,
-            )
-            return
-
         self._connection_options[url] = _ServerInitiatedConnectionOptions(
             retry_initial_connection=(
-                previous.retry_initial_connection or retry_initial_connection
+                retry_initial_connection
+                or (previous is not None and previous.retry_initial_connection)
             ),
-            retry_indefinitely=previous.retry_indefinitely or retry_indefinitely,
         )
 
     def _get_connection_options(self, url: str) -> _ServerInitiatedConnectionOptions:
@@ -637,6 +716,11 @@ class SendspinServer:
     def get_connection_reason(self, url: str) -> ConnectionReason:
         """Get the connection reason for a URL (for use by SendspinConnection)."""
         return self._connection_reasons.get(url, ConnectionReason.DISCOVERY)
+
+    def _consume_playback_reason(self, url: str) -> None:
+        """Downgrade a playback connection reason to discovery once a connection used it."""
+        if self._connection_reasons.get(url) is ConnectionReason.PLAYBACK:
+            self._connection_reasons[url] = ConnectionReason.DISCOVERY
 
     def register_client_url(self, client_id: str, url: str) -> None:
         """Record the URL used to connect to a client.
@@ -872,18 +956,6 @@ class SendspinServer:
                     else:
                         logger.debug("Connection task for %s failed: %s", url, err)
 
-                options = self._get_connection_options(url)
-                if not options.retry_indefinitely and backoff >= MAX_RECONNECT_BACKOFF_S:
-                    if not first_connection_succeeded:
-                        self._resolve_initial_connect_waiters(
-                            url,
-                            TimeoutError(
-                                "Initial connection did not succeed before "
-                                "the reconnect backoff ceiling was reached"
-                            ),
-                        )
-                    break
-
                 sleep_s = min(backoff, MAX_RECONNECT_BACKOFF_S)
                 logger.debug("Trying to reconnect to client at %s in %.1fs", url, sleep_s)
                 if retry_event is not None:
@@ -972,8 +1044,10 @@ class SendspinServer:
             logger.error("Failed to start server on %s:%d: %s", host, port, e)
             await self._stop_mdns()
             if self._app_runner:
+                # cleanup() already stops/unregisters any site added to this runner.
                 await self._app_runner.cleanup()
                 self._app_runner = None
+            self._tcp_site = None
             if self._app:
                 await self._app.shutdown()
                 self._app = None
@@ -1041,20 +1115,28 @@ class SendspinServer:
             properties["name"] = self._name
         properties["path"] = path
 
-        info = AsyncServiceInfo(
-            type_=service_type,
-            name=f"{self._id}.{service_type}",
-            server=f"{self._id}.local.",
-            parsed_addresses=addresses,
-            port=port,
-            properties=properties,
-        )
         try:
+            info = AsyncServiceInfo(
+                type_=service_type,
+                name=f"{self._id}.{service_type}",
+                server=f"{self._id}.local.",
+                parsed_addresses=addresses,
+                port=port,
+                properties=properties,
+            )
             await self._zc.async_register_service(info)
             self._mdns_service = info
             logger.debug("mDNS advertising server on port %d with path %s", port, path)
         except NonUniqueNameException:
             logger.error("Sendspin server with identical name present in the local network!")
+        except OSError as e:
+            # e.g. an advertise address that is not an IP literal; the HTTP listener
+            # and client discovery are unaffected, the server just isn't announced
+            logger.error(
+                "Server is running but not advertised over mDNS (addresses %s): %s",
+                addresses,
+                e,
+            )
 
     async def _start_mdns_discovery(self) -> None:
         assert self._zc is not None
@@ -1133,7 +1215,7 @@ class SendspinServer:
                 url,
             )
         self._mdns_client_urls[name] = url
-        self.connect_to_client(url)
+        self.connect_to_client(url, connection_reason=self.get_connection_reason(url))
 
     def _handle_service_removed(self, name: str) -> None:
         url = self._mdns_client_urls.pop(name, None)

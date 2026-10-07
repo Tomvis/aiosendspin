@@ -2,19 +2,48 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+import asyncio
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from PIL import Image
 
-from aiosendspin.models.artwork import ArtworkChannel, StreamRequestFormatArtwork
+from aiosendspin.models import pack_binary_header_raw
+from aiosendspin.models.artwork import (
+    ARTWORK_MAX_MESSAGE_SIZE,
+    ARTWORK_MAX_PART_DATA_SIZE,
+    ArtworkChannel,
+    ClientHelloArtworkSupport,
+    ClientStateArtwork,
+    StreamRequestFormatArtwork,
+    unpack_artwork_announce,
+)
 from aiosendspin.models.core import (
+    ClientStatePayload,
     StreamEndMessage,
     StreamRequestFormatPayload,
     StreamStartMessage,
 )
 from aiosendspin.models.types import ArtworkSource, PictureFormat
+from aiosendspin.server.clock import LoopClock, ManualClock
 from aiosendspin.server.roles.artwork.group import ArtworkGroupRole
-from aiosendspin.server.roles.artwork.v1 import ArtworkV1Role
+from aiosendspin.server.roles.artwork.v1 import MAX_ANNOUNCE_LEAD_US, ArtworkV1Role
+from aiosendspin.server.roles.scheduled_state import ScheduledRoleState
+
+_NOW_US = 1_000_000
+
+_ALBUM = ArtworkChannel(
+    source=ArtworkSource.ALBUM, format=PictureFormat.JPEG, width=300, height=300
+)
+_ARTIST = ArtworkChannel(
+    source=ArtworkSource.ARTIST, format=PictureFormat.PNG, width=400, height=200
+)
+_NONE = ArtworkChannel(source=ArtworkSource.NONE)
+
+_ALBUM_WIRE = {"source": "album", "format": "jpeg", "width": 300, "height": 300}
+_ARTIST_WIRE = {"source": "artist", "format": "png", "width": 400, "height": 200}
+_NONE_WIRE = {"source": "none"}
 
 
 def _make_client_stub() -> MagicMock:
@@ -27,23 +56,92 @@ def _make_client_stub() -> MagicMock:
     client.send_message = MagicMock()
     client.send_role_message = MagicMock()
     client.send_binary = MagicMock(return_value=True)
+    client.wait_role_drained = AsyncMock()
+    client._server.clock = ManualClock(now_us_value=_NOW_US)  # noqa: SLF001
     client._logger = MagicMock()  # noqa: SLF001
     return client
 
 
-def _make_client_stub_with_channel() -> MagicMock:
-    """Mock client whose hello advertises a single artwork channel."""
+def _decode(data: bytes) -> tuple[Any, ...]:
+    """Describe a transfer message by its kind and fields."""
+    channel = data[0] - 8
+    if data[1] == 0x02:
+        announce = unpack_artwork_announce(data)
+        return ("announce", channel, announce.timestamp_us, announce.total_size)
+    if data[1] == 0x01:
+        assert len(data) == 2
+        return ("cancel", channel)
+    assert data[1] == 0x00
+    return ("part", channel, data[2:])
+
+
+def _gate_writes(client: MagicMock) -> asyncio.Semaphore:
+    """Make each wait for the artwork queue to drain consume one released write."""
+    written = asyncio.Semaphore(0)
+
+    async def _wait(_role_family: str) -> None:
+        await written.acquire()
+
+    client.wait_role_drained.side_effect = _wait
+    return written
+
+
+async def _write(written: asyncio.Semaphore, count: int = 1) -> None:
+    """Report `count` artwork messages as written and let the role react."""
+    for _ in range(count):
+        written.release()
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+
+# DEPRECATED(spec-pr-195): remove in aiosendspin <version>
+def _make_legacy_client_stub(*channels: ArtworkChannel) -> MagicMock:
+    """Mock client whose hello declares artwork channels."""
     client = _make_client_stub()
-    client.info.artwork_support = MagicMock()
-    client.info.artwork_support.channels = [
-        ArtworkChannel(
-            source=ArtworkSource.ALBUM,
-            format=PictureFormat.JPEG,
-            width=300,
-            height=300,
-        )
-    ]
+    client.info.artwork_support = ClientHelloArtworkSupport(channels=list(channels or [_ALBUM]))
     return client
+
+
+def _state(*channels: ArtworkChannel) -> ClientStatePayload:
+    return ClientStatePayload(available=True, artwork=ClientStateArtwork(channels=list(channels)))
+
+
+def _record(client: MagicMock, monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    """Attach a group role with current images and record what the role sends, in order."""
+    group = MagicMock()
+    group._server.clock.now_us.return_value = _NOW_US  # noqa: SLF001
+    group_role = ArtworkGroupRole(group)
+    for source in (ArtworkSource.ALBUM, ArtworkSource.ARTIST):
+        state: ScheduledRoleState[Image.Image] = ScheduledRoleState()
+        state.apply(Image.new("RGB", (10, 10)))
+        group_role._artwork[source] = state  # noqa: SLF001
+    client.group.group_role.return_value = group_role
+
+    events: list[Any] = []
+
+    def _message(_role: str, message: object) -> None:
+        if isinstance(message, StreamStartMessage):
+            assert message.payload.artwork is not None
+            events.append(("start", message.payload.artwork.to_dict()["channels"]))
+        else:
+            events.append(type(message).__name__)
+
+    def _binary(data: bytes, **kwargs: Any) -> None:
+        if kwargs.get("epoch_exempt"):
+            events.append(("exempt", _decode(data)))
+        elif client.info.artwork_support is None:
+            events.append(_decode(data))
+        else:
+            events.append(("binary", kwargs["message_type"] - 8, len(data)))
+
+    def _schedule(_role: object, channel: int, _config: object) -> None:
+        events.append(("image", channel))
+
+    client.send_role_message.side_effect = _message
+    client.send_binary.side_effect = _binary
+    client.drop_pending_binary.side_effect = lambda roles: events.append(("drop", roles))
+    monkeypatch.setattr(group_role, "_schedule_replay", _schedule)
+    return events
 
 
 def test_artwork_role_has_role_id() -> None:
@@ -51,72 +149,6 @@ def test_artwork_role_has_role_id() -> None:
     client = _make_client_stub()
     role = ArtworkV1Role(client=client)
     assert role.role_id == "artwork@v1"
-
-
-def test_artwork_role_flags_nonpositive_request_dimensions() -> None:
-    """A stream/request-format with non-positive dimensions is flagged, not applied."""
-    client = _make_client_stub_with_channel()
-    role = ArtworkV1Role(client=client)
-    role.on_connect()
-    role.on_stream_request_format(
-        StreamRequestFormatPayload(artwork=StreamRequestFormatArtwork(channel=0, width=-10))
-    )
-    client.flag_noncompliance.assert_called_once()
-
-
-def test_artwork_role_applies_and_flags_pre_rename_request_dimensions() -> None:
-    """A stream/request-format phrased as media_width/media_height resizes, and is flagged."""
-    client = _make_client_stub_with_channel()
-    role = ArtworkV1Role(client=client)
-    role.on_connect()
-    role.on_stream_request_format(
-        StreamRequestFormatPayload(
-            artwork=StreamRequestFormatArtwork.from_dict(
-                {"channel": 0, "media_width": 800, "media_height": 480}
-            )
-        )
-    )
-    config = role.get_channel_configs()[0]
-    assert (config.width, config.height) == (800, 480)
-    assert "media_width" in client.flag_noncompliance.call_args.args[0]
-
-
-def test_artwork_role_flags_bmp_request_format() -> None:
-    """A stream/request-format asking for the removed 'bmp' format is flagged, not rejected."""
-    client = _make_client_stub_with_channel()
-    role = ArtworkV1Role(client=client)
-    role.on_connect()
-    role.on_stream_request_format(
-        StreamRequestFormatPayload(
-            artwork=StreamRequestFormatArtwork(channel=0, format=PictureFormat.BMP)
-        )
-    )
-    assert "bmp" in client.flag_noncompliance.call_args.args[0]
-    assert role.get_channel_configs()[0].format == PictureFormat.BMP
-
-
-def test_artwork_role_no_flag_for_valid_request_dimensions() -> None:
-    """A stream/request-format with positive dimensions is not flagged."""
-    client = _make_client_stub_with_channel()
-    role = ArtworkV1Role(client=client)
-    role.on_connect()
-    role.on_stream_request_format(
-        StreamRequestFormatPayload(
-            artwork=StreamRequestFormatArtwork(channel=0, width=100, height=100)
-        )
-    )
-    client.flag_noncompliance.assert_not_called()
-
-
-def test_artwork_role_flags_unknown_request_channel() -> None:
-    """A stream/request-format for a channel with no config is flagged."""
-    client = _make_client_stub_with_channel()
-    role = ArtworkV1Role(client=client)
-    role.on_connect()
-    role.on_stream_request_format(
-        StreamRequestFormatPayload(artwork=StreamRequestFormatArtwork(channel=1))
-    )
-    client.flag_noncompliance.assert_called_once()
 
 
 def test_artwork_role_has_role_family() -> None:
@@ -130,6 +162,13 @@ def test_artwork_role_requires_client() -> None:
     """ArtworkV1Role raises ValueError if no client provided."""
     with pytest.raises(ValueError, match="requires a client"):
         ArtworkV1Role(client=None)
+
+
+def test_artwork_role_has_no_audio_requirements() -> None:
+    """ArtworkV1Role does not receive audio."""
+    client = _make_client_stub()
+    role = ArtworkV1Role(client=client)
+    assert role.get_audio_requirements() is None
 
 
 def test_artwork_role_on_connect_subscribes_to_group_role() -> None:
@@ -158,33 +197,214 @@ def test_artwork_role_on_disconnect_unsubscribes_from_group_role() -> None:
     group_role.unsubscribe.assert_called_once_with(role)
 
 
-def test_artwork_role_on_deactivate_sends_stream_end_when_started() -> None:
-    """on_deactivate() ends the artwork stream once a stream/start was sent."""
-    client = _make_client_stub_with_channel()
+def test_artwork_role_on_connect_waits_for_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without the client/state artwork object, nothing is streamed."""
+    client = _make_client_stub()
+    events = _record(client, monkeypatch)
+    role = ArtworkV1Role(client=client)
+
+    role.on_connect()
+    role.on_client_state(ClientStatePayload(available=True))
+
+    assert events == []
+    assert role.get_channel_configs() == {}
+
+
+@pytest.mark.asyncio
+async def test_artwork_update_before_state_sends_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A group artwork update reaches the client only once its channels are declared."""
+    client = _make_client_stub()
+    events = _record(client, monkeypatch)
     role = ArtworkV1Role(client=client)
     role.on_connect()
+    group_role = client.group.group_role.return_value
+
+    await group_role.set_album_artwork(Image.new("RGB", (10, 10)))
+    assert events == []
+
+    role.on_client_state(_state(_ALBUM))
+    events.clear()
+    await group_role.set_album_artwork(Image.new("RGB", (10, 10)))
+    assert [event[:2] for event in events] == [("announce", 0), ("part", 0)]
+
+
+@pytest.mark.asyncio
+async def test_artwork_encoded_for_old_configuration_is_discarded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An image whose encode finishes after its channel was reconfigured is not sent."""
+    client = _make_client_stub()
+    events = _record(client, monkeypatch)
+    role = ArtworkV1Role(client=client)
+    role.on_connect()
+    group_role = client.group.group_role.return_value
+    role.on_client_state(_state(_ALBUM))
+    png_album = ArtworkChannel(
+        source=ArtworkSource.ALBUM, format=PictureFormat.PNG, width=300, height=300
+    )
+    role.on_client_state(_state(png_album))
+    events.clear()
+    image = Image.new("RGB", (10, 10))
+
+    await group_role._send_artwork_to_role_channel(role, image, 0, _ALBUM, _NOW_US)  # noqa: SLF001
+    assert events == []
+
+    await group_role._send_artwork_to_role_channel(  # noqa: SLF001
+        role, image, 0, png_album, _NOW_US
+    )
+    assert [event[:2] for event in events] == [("announce", 0), ("part", 0)]
+
+
+@pytest.mark.parametrize(
+    ("channels", "expected"),
+    [
+        ([_ALBUM], [_ALBUM_WIRE]),
+        ([_ALBUM, _NONE, _ARTIST, _NONE], [_ALBUM_WIRE, _NONE_WIRE, _ARTIST_WIRE]),
+        ([_NONE, _ARTIST], [_NONE_WIRE, _ARTIST_WIRE]),
+        ([_NONE], [_NONE_WIRE]),
+        ([_NONE, _NONE, _NONE, _NONE], [_NONE_WIRE]),
+    ],
+)
+def test_artwork_state_starts_truncated_stream(
+    monkeypatch: pytest.MonkeyPatch,
+    channels: list[ArtworkChannel],
+    expected: list[dict[str, object]],
+) -> None:
+    """stream/start matches the state, truncated after the last streamed channel."""
+    client = _make_client_stub()
+    events = _record(client, monkeypatch)
+    role = ArtworkV1Role(client=client)
+    role.on_connect()
+
+    role.on_client_state(_state(*channels))
+
+    assert events[0] == ("start", expected)
+
+
+def test_artwork_state_start_is_followed_by_current_images(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After stream/start, the current image is sent for each streamed channel."""
+    client = _make_client_stub()
+    events = _record(client, monkeypatch)
+    role = ArtworkV1Role(client=client)
+    role.on_connect()
+
+    role.on_client_state(_state(_ALBUM, _NONE, _ARTIST))
+
+    assert events == [
+        ("start", [_ALBUM_WIRE, _NONE_WIRE, _ARTIST_WIRE]),
+        ("image", 0),
+        ("image", 2),
+    ]
+    assert role.get_channel_configs() == {0: _ALBUM, 2: _ARTIST}
+
+
+def test_artwork_unchanged_state_sends_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A state repeating the current channels produces no messages."""
+    client = _make_client_stub()
+    events = _record(client, monkeypatch)
+    role = ArtworkV1Role(client=client)
+    role.on_connect()
+    role.on_client_state(_state(_ALBUM, _NONE))
+    events.clear()
+
+    stray_none = ArtworkChannel(
+        source=ArtworkSource.NONE, format=PictureFormat.PNG, width=1, height=1
+    )
+    role.on_client_state(_state(_ALBUM, stray_none))
+    role.on_client_state(_state(_ALBUM))
+
+    assert events == []
+
+
+def test_artwork_state_change_drops_clears_restarts_and_resends(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A changed state drops queued images, clears disabled channels, then re-sends images."""
+    client = _make_client_stub()
+    events = _record(client, monkeypatch)
+    role = ArtworkV1Role(client=client)
+    role.on_connect()
+    role.on_client_state(_state(_ALBUM, _NONE, _ARTIST))
+    events.clear()
+
+    role.on_client_state(_state(_NONE, _ARTIST, _ARTIST))
+
+    assert events == [
+        ("drop", ["artwork"]),
+        ("announce", 0, _NOW_US, 0),
+        ("start", [_NONE_WIRE, _ARTIST_WIRE, _ARTIST_WIRE]),
+        ("image", 1),
+        ("image", 2),
+    ]
+
+
+def test_artwork_state_format_change_restarts_and_resends(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Changing one channel's format re-announces the stream and re-sends every image."""
+    client = _make_client_stub()
+    events = _record(client, monkeypatch)
+    role = ArtworkV1Role(client=client)
+    role.on_connect()
+    role.on_client_state(_state(_ALBUM, _ARTIST))
+    events.clear()
+
+    png_album = ArtworkChannel(
+        source=ArtworkSource.ALBUM, format=PictureFormat.PNG, width=300, height=300
+    )
+    role.on_client_state(_state(png_album, _ARTIST))
+
+    assert events == [
+        ("drop", ["artwork"]),
+        ("start", [{**_ALBUM_WIRE, "format": "png"}, _ARTIST_WIRE]),
+        ("image", 0),
+        ("image", 1),
+    ]
+
+
+def test_artwork_all_none_state_keeps_stream_active(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Disabling every channel keeps the stream, so a later state can enable one again."""
+    client = _make_client_stub()
+    events = _record(client, monkeypatch)
+    role = ArtworkV1Role(client=client)
+    role.on_connect()
+    role.on_client_state(_state(_ALBUM))
+    events.clear()
+
+    role.on_client_state(_state(_NONE))
+    role.on_client_state(_state(_ALBUM))
+
+    assert events == [
+        ("drop", ["artwork"]),
+        ("announce", 0, _NOW_US, 0),
+        ("start", [_NONE_WIRE]),
+        ("drop", ["artwork"]),
+        ("start", [_ALBUM_WIRE]),
+        ("image", 0),
+    ]
+
+
+def test_artwork_role_on_deactivate_sends_stream_end_when_started() -> None:
+    """on_deactivate() ends the artwork stream and forgets its channels."""
+    client = _make_client_stub()
+    role = ArtworkV1Role(client=client)
+    role.on_connect()
+    role.on_client_state(_state(_ALBUM))
     client.send_role_message.reset_mock()
 
     role.on_deactivate()
 
     sent = [call.args[1] for call in client.send_role_message.call_args_list]
     assert any(isinstance(m, StreamEndMessage) and m.payload.roles == ["artwork"] for m in sent)
-
-
-def test_artwork_role_on_deactivate_clears_stream_started() -> None:
-    """on_deactivate() resets _stream_started so a reused instance holds no stale flag."""
-    client = _make_client_stub_with_channel()
-    role = ArtworkV1Role(client=client)
-    role.on_connect()
-
-    role.on_deactivate()
-
     assert role._stream_started is False  # noqa: SLF001
+    assert role.get_channel_configs() == {}
 
 
 def test_artwork_role_on_deactivate_noop_without_stream() -> None:
     """on_deactivate() sends nothing when no stream/start was ever sent."""
-    client = _make_client_stub()  # no artwork_support -> no stream/start
+    client = _make_client_stub()
     role = ArtworkV1Role(client=client)
     role.on_connect()
     client.send_role_message.reset_mock()
@@ -194,92 +414,502 @@ def test_artwork_role_on_deactivate_noop_without_stream() -> None:
     client.send_role_message.assert_not_called()
 
 
-def test_artwork_role_init_channel_configs_from_support() -> None:
-    """on_connect() initializes channel configs from client hello."""
+def test_artwork_reconnect_waits_for_state_again(monkeypatch: pytest.MonkeyPatch) -> None:
+    """After a reconnect the stream restarts only once that connection's state arrives."""
     client = _make_client_stub()
-    support = MagicMock()
-    support.channels = [
-        ArtworkChannel(
-            source=ArtworkSource.ALBUM,
-            format=PictureFormat.JPEG,
-            width=300,
-            height=300,
-        ),
-        ArtworkChannel(
-            source=ArtworkSource.ARTIST,
-            format=PictureFormat.PNG,
-            width=400,
-            height=400,
-        ),
-    ]
-    client.info.artwork_support = support
-
+    events = _record(client, monkeypatch)
     role = ArtworkV1Role(client=client)
     role.on_connect()
+    role.on_client_state(_state(_ALBUM))
+    role.on_disconnect()
+    events.clear()
 
-    configs = role.get_channel_configs()
-    assert len(configs) == 2
-    assert configs[0].source == ArtworkSource.ALBUM
-    assert configs[1].source == ArtworkSource.ARTIST
-
-
-def test_artwork_role_sends_stream_start_on_connect_with_transport() -> None:
-    """on_connect() sends stream/start when transport is attached."""
-    client = _make_client_stub()
-    support = MagicMock()
-    support.channels = [
-        ArtworkChannel(
-            source=ArtworkSource.ALBUM,
-            format=PictureFormat.JPEG,
-            width=300,
-            height=300,
-        ),
-    ]
-    client.info.artwork_support = support
-
-    role = ArtworkV1Role(client=client)
-    role._client.connection = MagicMock()  # noqa: SLF001
     role.on_connect()
+    assert events == []
+    assert role.get_channel_configs() == {}
 
-    client.send_role_message.assert_called()
-    _role, msg = client.send_role_message.call_args.args
-    assert isinstance(msg, StreamStartMessage)
-    assert msg.payload.artwork is not None
-    assert len(msg.payload.artwork.channels) == 1
+    role.on_client_state(_state(_ALBUM))
+    assert events == [("start", [_ALBUM_WIRE]), ("image", 0)]
 
 
-def test_artwork_role_send_artwork() -> None:
-    """send_artwork() sends binary message with header and image data."""
+@pytest.mark.asyncio
+async def test_artwork_image_is_announced_then_sent_in_capped_parts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An image goes out as a 14-byte announce, then parts of at most 65519 bytes."""
+    client = _make_client_stub()
+    events = _record(client, monkeypatch)
+    role = ArtworkV1Role(client=client)
+    role.on_connect()
+    role.on_client_state(_state(_ALBUM, _ARTIST))
+    events.clear()
+    image = bytes(range(256)) * 600
+
+    role.send_artwork(channel=1, image_data=image, timestamp_us=1_500_000)
+    await asyncio.sleep(0)
+
+    assert events[0] == ("announce", 1, 1_500_000, len(image))
+    parts = events[1:]
+    assert [part[:2] for part in parts] == [("part", 1)] * 3
+    assert [len(part[2]) for part in parts] == [
+        ARTWORK_MAX_PART_DATA_SIZE,
+        ARTWORK_MAX_PART_DATA_SIZE,
+        len(image) - 2 * ARTWORK_MAX_PART_DATA_SIZE,
+    ]
+    assert b"".join(part[2] for part in parts) == image
+    sizes = [len(call.args[0]) for call in client.send_binary.call_args_list]
+    assert sizes[0] == 14
+    assert max(sizes) == ARTWORK_MAX_MESSAGE_SIZE
+    assert {call.kwargs["timestamp_us"] for call in client.send_binary.call_args_list} == {0}
+
+
+@pytest.mark.asyncio
+async def test_artwork_parts_wait_for_the_previous_message_to_be_written(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each part is enqueued only once the artwork queue has been written."""
+    client = _make_client_stub()
+    events = _record(client, monkeypatch)
+    written = _gate_writes(client)
+    role = ArtworkV1Role(client=client)
+    role.on_connect()
+    role.on_client_state(_state(_ALBUM))
+    events.clear()
+
+    role.send_artwork(0, bytes(ARTWORK_MAX_PART_DATA_SIZE + 1), _NOW_US)
+    assert [event[0] for event in events] == ["announce"]
+    await _write(written)
+    assert [event[0] for event in events] == ["announce", "part"]
+    await _write(written)
+    assert [event[0] for event in events] == ["announce", "part", "part"]
+
+
+@pytest.mark.asyncio
+async def test_artwork_cleared_sends_empty_announce(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Clearing a channel announces an empty image with no parts."""
+    client = _make_client_stub()
+    events = _record(client, monkeypatch)
+    role = ArtworkV1Role(client=client)
+    role.on_connect()
+    role.on_client_state(_state(_NONE, _ARTIST))
+    events.clear()
+
+    role.send_artwork_cleared(channel=1, timestamp_us=2000)
+    await asyncio.sleep(0)
+
+    assert events == [("announce", 1, 2000, 0)]
+
+
+@pytest.mark.asyncio
+async def test_artwork_new_image_for_in_flight_channel_cancels_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Replacing an image in flight drops its queued parts, cancels it, then announces."""
+    client = _make_client_stub()
+    events = _record(client, monkeypatch)
+    written = _gate_writes(client)
+    role = ArtworkV1Role(client=client)
+    role.on_connect()
+    role.on_client_state(_state(_ALBUM))
+    events.clear()
+
+    role.send_artwork(0, b"old", _NOW_US)
+    role.send_artwork(0, b"new", _NOW_US)
+    await _write(written, 2)
+
+    assert events == [
+        ("announce", 0, _NOW_US, 3),
+        ("drop", ["artwork"]),
+        ("exempt", ("cancel", 0)),
+        ("announce", 0, _NOW_US, 3),
+        ("part", 0, b"new"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_artwork_one_transfer_in_flight_across_channels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An image for another channel is announced only after the transfer completes."""
+    client = _make_client_stub()
+    events = _record(client, monkeypatch)
+    written = _gate_writes(client)
+    role = ArtworkV1Role(client=client)
+    role.on_connect()
+    role.on_client_state(_state(_ALBUM, _ARTIST))
+    events.clear()
+
+    role.send_artwork(0, b"album", _NOW_US)
+    role.send_artwork(1, b"artist", _NOW_US)
+    role.send_artwork(1, b"artist2", _NOW_US)
+    assert events == [("announce", 0, _NOW_US, 5)]
+
+    await _write(written)
+    assert events[-1] == ("part", 0, b"album")
+    await _write(written)
+    assert events[-1] == ("announce", 1, _NOW_US, 7)
+    await _write(written)
+
+    assert events == [
+        ("announce", 0, _NOW_US, 5),
+        ("part", 0, b"album"),
+        ("announce", 1, _NOW_US, 7),
+        ("part", 1, b"artist2"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_artwork_in_flight_transfer_cancelled_before_stream_end(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Deactivating mid-transfer cancels the transfer ahead of stream/end."""
+    client = _make_client_stub()
+    events = _record(client, monkeypatch)
+    _gate_writes(client)
+    role = ArtworkV1Role(client=client)
+    role.on_connect()
+    role.on_client_state(_state(_ALBUM, _ARTIST))
+    role.send_artwork(1, b"artist", _NOW_US)
+    events.clear()
+
+    role.on_deactivate()
+
+    assert events == [("drop", ["artwork"]), ("exempt", ("cancel", 1)), "StreamEndMessage"]
+
+
+@pytest.mark.asyncio
+async def test_artwork_in_flight_transfer_cancelled_before_reconfiguring_stream_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reconfiguring state cancels the transfer, clears disabled channels, then restarts."""
+    client = _make_client_stub()
+    events = _record(client, monkeypatch)
+    _gate_writes(client)
+    role = ArtworkV1Role(client=client)
+    role.on_connect()
+    role.on_client_state(_state(_ALBUM, _ARTIST))
+    role.send_artwork(1, b"artist", _NOW_US)
+    events.clear()
+
+    role.on_client_state(_state(_NONE, _ARTIST))
+
+    assert events == [
+        ("drop", ["artwork"]),
+        ("exempt", ("cancel", 1)),
+        ("announce", 0, _NOW_US, 0),
+        ("start", [_NONE_WIRE, _ARTIST_WIRE]),
+        ("image", 1),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_artwork_scheduled_image_is_announced_at_most_20s_ahead(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A far-future image waits until 20 s before its timestamp, without blocking others."""
+    loop = asyncio.get_running_loop()
+    clock = LoopClock(loop)
+    client = _make_client_stub()
+    client._server.clock = clock  # noqa: SLF001
+    events = _record(client, monkeypatch)
+    role = ArtworkV1Role(client=client)
+    role.on_connect()
+    role.on_client_state(_state(_ALBUM, _ARTIST))
+    events.clear()
+    scheduled_us = clock.now_us() + MAX_ANNOUNCE_LEAD_US + 100_000
+    announced_at: list[int] = []
+    client.send_binary.side_effect = lambda data, **_: (
+        events.append(_decode(data)),
+        announced_at.append(clock.now_us()),
+    )
+
+    role.send_artwork(0, b"later", scheduled_us)
+    role.send_artwork(1, b"now", clock.now_us())
+    await asyncio.sleep(0)
+    assert [event[:2] for event in events] == [("announce", 1), ("part", 1)]
+
+    await asyncio.sleep(0.2)
+
+    assert events[2] == ("announce", 0, scheduled_us, 5)
+    assert announced_at[2] >= scheduled_us - MAX_ANNOUNCE_LEAD_US
+
+
+_LATER_US = _NOW_US + 1_000_000
+
+
+@pytest.mark.asyncio
+async def test_artwork_scheduled_image_waits_for_current_image_in_flight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A scheduled image leaves the channel's current image in flight to complete first."""
+    client = _make_client_stub()
+    events = _record(client, monkeypatch)
+    written = _gate_writes(client)
+    role = ArtworkV1Role(client=client)
+    role.on_connect()
+    role.on_client_state(_state(_ALBUM))
+    events.clear()
+
+    role.send_artwork(0, b"now", _NOW_US)
+    role.send_artwork(0, b"next", _LATER_US)
+    await _write(written, 3)
+
+    assert events == [
+        ("announce", 0, _NOW_US, 3),
+        ("part", 0, b"now"),
+        ("announce", 0, _LATER_US, 4),
+        ("part", 0, b"next"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_artwork_queued_current_image_is_announced_before_scheduled_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Queued behind another channel, a current image still goes before a scheduled one."""
+    client = _make_client_stub()
+    events = _record(client, monkeypatch)
+    written = _gate_writes(client)
+    role = ArtworkV1Role(client=client)
+    role.on_connect()
+    role.on_client_state(_state(_ALBUM, _ARTIST))
+    events.clear()
+
+    role.send_artwork(1, b"artist", _NOW_US)
+    role.send_artwork(0, b"old", _NOW_US)
+    role.send_artwork(0, b"next", _LATER_US)
+    role.send_artwork(0, b"now", _NOW_US)
+    role.send_artwork(0, b"later", _LATER_US)
+    await _write(written, 6)
+
+    assert [event[:3] for event in events] == [
+        ("announce", 1, _NOW_US),
+        ("part", 1, b"artist"),
+        ("announce", 0, _NOW_US),
+        ("part", 0, b"now"),
+        ("announce", 0, _LATER_US),
+        ("part", 0, b"later"),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("timestamp_us", "image"), [(_LATER_US, b"other"), (_NOW_US, b"now")])
+async def test_artwork_scheduled_image_in_flight_is_replaced(
+    monkeypatch: pytest.MonkeyPatch, timestamp_us: int, image: bytes
+) -> None:
+    """Any new image for the channel cancels its scheduled image in flight."""
+    client = _make_client_stub()
+    events = _record(client, monkeypatch)
+    written = _gate_writes(client)
+    role = ArtworkV1Role(client=client)
+    role.on_connect()
+    role.on_client_state(_state(_ALBUM))
+    events.clear()
+
+    role.send_artwork(0, b"next", _LATER_US)
+    role.send_artwork(0, image, timestamp_us)
+    await _write(written, 2)
+
+    assert events == [
+        ("announce", 0, _LATER_US, 4),
+        ("drop", ["artwork"]),
+        ("exempt", ("cancel", 0)),
+        ("announce", 0, timestamp_us, len(image)),
+        ("part", 0, image),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_artwork_cancel_scheduled_image_in_flight(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Cancelling a scheduled image in flight cancels its transfer and keeps others queued."""
+    client = _make_client_stub()
+    events = _record(client, monkeypatch)
+    written = _gate_writes(client)
+    role = ArtworkV1Role(client=client)
+    role.on_connect()
+    role.on_client_state(_state(_ALBUM, _ARTIST))
+    events.clear()
+
+    role.send_artwork(0, b"next", _LATER_US)
+    role.send_artwork(1, b"artist", _NOW_US)
+    assert role.cancel_scheduled_artwork(0)
+    await _write(written, 2)
+
+    assert events == [
+        ("announce", 0, _LATER_US, 4),
+        ("drop", ["artwork"]),
+        ("exempt", ("cancel", 0)),
+        ("announce", 1, _NOW_US, 6),
+        ("part", 1, b"artist"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_artwork_cancel_of_held_scheduled_image_ends_transfer_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancelling an image held back by the 20 s limit stops the transfer loop waiting for it."""
+    client = _make_client_stub()
+    events = _record(client, monkeypatch)
+    role = ArtworkV1Role(client=client)
+    role.on_connect()
+    role.on_client_state(_state(_ALBUM))
+    events.clear()
+    role.send_artwork(0, b"later", _NOW_US + MAX_ANNOUNCE_LEAD_US + 10_000_000)
+    await asyncio.sleep(0)
+
+    assert role.cancel_scheduled_artwork(0)
+    await asyncio.sleep(0)
+
+    assert events == []
+    assert role._transfer_task is not None  # noqa: SLF001
+    assert role._transfer_task.done()  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_artwork_cancel_drops_queued_scheduled_image(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancelling a scheduled image not yet announced only drops it from the queue."""
+    client = _make_client_stub()
+    events = _record(client, monkeypatch)
+    written = _gate_writes(client)
+    role = ArtworkV1Role(client=client)
+    role.on_connect()
+    role.on_client_state(_state(_ALBUM, _ARTIST))
+    events.clear()
+
+    role.send_artwork(1, b"artist", _NOW_US)
+    role.send_artwork(0, b"now", _NOW_US)
+    role.send_artwork(0, b"next", _LATER_US)
+    assert role.cancel_scheduled_artwork(0)
+    await _write(written, 4)
+
+    assert [event[:3] for event in events] == [
+        ("announce", 1, _NOW_US),
+        ("part", 1, b"artist"),
+        ("announce", 0, _NOW_US),
+        ("part", 0, b"now"),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replacement_us", [None, _NOW_US + MAX_ANNOUNCE_LEAD_US + 1])
+async def test_artwork_announced_scheduled_image_is_cancelled(
+    monkeypatch: pytest.MonkeyPatch, replacement_us: int | None
+) -> None:
+    """A sent scheduled image is cancelled when cancelled or replaced by a later announce."""
+    client = _make_client_stub()
+    events = _record(client, monkeypatch)
+    written = _gate_writes(client)
+    role = ArtworkV1Role(client=client)
+    role.on_connect()
+    role.on_client_state(_state(_ALBUM))
+    role.send_artwork(0, b"next", _LATER_US)
+    await _write(written, 2)
+    events.clear()
+
+    if replacement_us is None:
+        assert role.cancel_scheduled_artwork(0)
+    else:
+        role.send_artwork(0, b"much later", replacement_us)
+    await _write(written)
+
+    assert events == [("exempt", ("cancel", 0))]
+
+
+@pytest.mark.asyncio
+async def test_artwork_cancel_keeps_current_image_in_flight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A current image in flight already discarded the scheduled one, so nothing is sent."""
+    client = _make_client_stub()
+    events = _record(client, monkeypatch)
+    written = _gate_writes(client)
+    role = ArtworkV1Role(client=client)
+    role.on_connect()
+    role.on_client_state(_state(_ALBUM))
+    events.clear()
+
+    role.send_artwork(0, b"now", _NOW_US)
+    assert role.cancel_scheduled_artwork(0)
+    await _write(written)
+
+    assert events == [("announce", 0, _NOW_US, 3), ("part", 0, b"now")]
+
+
+@pytest.mark.asyncio
+async def test_artwork_stream_ends_when_client_becomes_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """available: false ends the artwork stream, and no image follows until it restarts."""
+    client = _make_client_stub()
+    events = _record(client, monkeypatch)
+    role = ArtworkV1Role(client=client)
+    role.on_connect()
+    role.on_client_state(_state(_ALBUM))
+    events.clear()
+
+    client.available = False
+    role.on_availability_changed(old_available=True, new_available=False)
+    role.send_artwork(0, b"image", _NOW_US)
+    await asyncio.sleep(0)
+
+    assert events == [("drop", ["artwork"]), "StreamEndMessage"]
+
+
+@pytest.mark.asyncio
+async def test_artwork_disconnect_stops_transfer_and_forgets_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After a disconnect mid-transfer, the next stream starts with no transfer in flight."""
+    client = _make_client_stub()
+    events = _record(client, monkeypatch)
+    written = _gate_writes(client)
+    role = ArtworkV1Role(client=client)
+    role.on_connect()
+    role.on_client_state(_state(_ALBUM))
+    role.send_artwork(0, b"old", _NOW_US)
+    role.on_disconnect()
+    for _ in range(5):
+        await asyncio.sleep(0)
+    written.release()
+    for _ in range(5):
+        await asyncio.sleep(0)
+    # The stopped transfer left the released write unused.
+    await asyncio.wait_for(written.acquire(), 1)
+    assert ("part", 0, b"old") not in events
+    assert ("exempt", ("cancel", 0)) not in events
+    events.clear()
+
+    role.on_connect()
+    role.on_client_state(_state(_ALBUM))
+    role.send_artwork(0, b"new", _NOW_US)
+    assert events == [("start", [_ALBUM_WIRE]), ("image", 0), ("announce", 0, _NOW_US, 3)]
+    await _write(written)
+
+    assert events[-1] == ("part", 0, b"new")
+
+
+def test_artwork_role_send_artwork_skips_unstreamed_channels() -> None:
+    """No artwork binary goes out before stream/start or for a channel that is not streamed."""
     client = _make_client_stub()
     role = ArtworkV1Role(client=client)
     role._client.connection = MagicMock()  # noqa: SLF001
 
     role.send_artwork(channel=0, image_data=b"image", timestamp_us=1000)
+    role.on_client_state(_state(_ALBUM, _NONE))
+    role.send_artwork(channel=1, image_data=b"image", timestamp_us=1000)
+    role.send_artwork_cleared(channel=2, timestamp_us=1000)
 
-    client.send_binary.assert_called_once()
-    kwargs = client.send_binary.call_args.kwargs
-    assert kwargs["role_family"] == "artwork"
-    assert kwargs["timestamp_us"] == 1000
-    assert kwargs["message_type"] == 8  # ARTWORK_CHANNEL_0
-
-
-def test_artwork_role_send_artwork_cleared() -> None:
-    """send_artwork_cleared() sends empty binary message."""
-    client = _make_client_stub()
-    role = ArtworkV1Role(client=client)
-    role._client.connection = MagicMock()  # noqa: SLF001
-
-    role.send_artwork_cleared(channel=1, timestamp_us=2000)
-
-    client.send_binary.assert_called_once()
-    kwargs = client.send_binary.call_args.kwargs
-    assert kwargs["message_type"] == 9  # ARTWORK_CHANNEL_1
+    client.send_binary.assert_not_called()
 
 
 def test_artwork_role_send_artwork_noop_without_transport() -> None:
     """send_artwork() is a no-op when no transport."""
     client = _make_client_stub()
     role = ArtworkV1Role(client=client)
+    role.on_client_state(_state(_ALBUM))
     role._client.connection = None  # noqa: SLF001
 
     role.send_artwork(channel=0, image_data=b"image", timestamp_us=1000)
@@ -287,68 +917,365 @@ def test_artwork_role_send_artwork_noop_without_transport() -> None:
     client.send_binary.assert_not_called()
 
 
-def test_artwork_role_has_no_audio_requirements() -> None:
-    """ArtworkV1Role does not receive audio."""
+def test_artwork_initial_state_without_artwork_is_a_deviation() -> None:
+    """An initial client/state must carry the artwork object."""
     client = _make_client_stub()
     role = ArtworkV1Role(client=client)
-    assert role.get_audio_requirements() is None
 
-
-def test_artwork_role_on_connect_schedules_artwork_once_per_channel() -> None:
-    """on_connect() schedules a single artwork snapshot per configured channel."""
-    from PIL import Image  # noqa: PLC0415
-
-    client = _make_client_stub()
-    support = MagicMock()
-    support.channels = [
-        ArtworkChannel(
-            source=ArtworkSource.ALBUM,
-            format=PictureFormat.JPEG,
-            width=300,
-            height=300,
-        ),
-        ArtworkChannel(
-            source=ArtworkSource.ARTIST,
-            format=PictureFormat.PNG,
-            width=400,
-            height=400,
-        ),
+    assert role.initial_state_deviations(ClientStatePayload(available=True)) == [
+        "has an active artwork role but no artwork state"
     ]
-    client.info.artwork_support = support
-    client.connection = MagicMock()
+    assert role.initial_state_deviations(_state(_ALBUM)) == []
 
-    group = MagicMock()
-    group._server = MagicMock()  # noqa: SLF001
-    group._server.clock.now_us.return_value = 1_000_000  # noqa: SLF001
-    group_role = ArtworkGroupRole(group)
-    group_role._current_artwork = {  # noqa: SLF001
-        ArtworkSource.ALBUM: Image.new("RGB", (10, 10)),
-        ArtworkSource.ARTIST: Image.new("RGB", (10, 10)),
-    }
-    client.group.group_role.return_value = group_role
 
+def test_artwork_state_on_superseded_wire_is_a_deviation() -> None:
+    """A state artwork object using 'bmp' or media_width/media_height is reported."""
+    client = _make_client_stub()
     role = ArtworkV1Role(client=client)
-    with patch.object(group_role, "_schedule_send_artwork") as schedule:
-        role.on_connect()
+    payload = ClientStatePayload.from_dict(
+        {
+            "available": True,
+            "artwork": {
+                "channels": [
+                    {"source": "album", "format": "bmp", "media_width": 8, "media_height": 8}
+                ]
+            },
+        }
+    )
 
-    channels_sent = [call.args[2] for call in schedule.call_args_list]
-    assert sorted(channels_sent) == [0, 1]
+    assert role.client_state_deviations(payload) == [
+        "artwork used pre-rename dimension keys: media_height, media_width",
+        "artwork declared the removed 'bmp' format",
+    ]
+    assert role.client_state_deviations(_state(_ALBUM)) == []
 
 
+# DEPRECATED(spec-pr-188): remove in aiosendspin <version>
+def test_legacy_hello_client_gets_single_message_artwork() -> None:
+    """A client configured by its hello gets `[type][ts][image]`, and a bare header to clear."""
+    client = _make_legacy_client_stub(_ALBUM, _ARTIST)
+    role = ArtworkV1Role(client=client)
+    role.on_connect()
+    client.send_binary.reset_mock()
+
+    role.send_artwork(channel=0, image_data=b"image", timestamp_us=1000)
+    role.send_artwork(channel=0, image_data=b"image2", timestamp_us=1001)
+    role.send_artwork_cleared(channel=1, timestamp_us=2000)
+
+    assert [call.args[0] for call in client.send_binary.call_args_list] == [
+        pack_binary_header_raw(8, 1000) + b"image",
+        pack_binary_header_raw(8, 1001) + b"image2",
+        pack_binary_header_raw(9, 2000),
+    ]
+    assert [call.kwargs["timestamp_us"] for call in client.send_binary.call_args_list] == [
+        1000,
+        1001,
+        2000,
+    ]
+
+
+# DEPRECATED(spec-pr-195): remove in aiosendspin <version>
+# DEPRECATED(spec-pr-135): remove in aiosendspin <version>
+@pytest.mark.asyncio
+async def test_legacy_hello_client_gets_scheduled_artwork_once_due() -> None:
+    """A single-message client gets a scheduled image only at its timestamp, unless replaced."""
+    client = _make_legacy_client_stub(_ALBUM)
+    clock = client._server.clock  # noqa: SLF001
+    role = ArtworkV1Role(client=client)
+    role.on_connect()
+    client.send_binary.reset_mock()
+    later_us = _NOW_US + 1_000
+
+    role.send_artwork(channel=0, image_data=b"later", timestamp_us=later_us)
+    await asyncio.sleep(0)
+    client.send_binary.assert_not_called()
+
+    clock.advance_us(1_000)
+    role._queue_changed.set()  # noqa: SLF001
+    await asyncio.sleep(0)
+    assert [call.args[0] for call in client.send_binary.call_args_list] == [
+        pack_binary_header_raw(8, later_us) + b"later"
+    ]
+
+    role.send_artwork(channel=0, image_data=b"much later", timestamp_us=later_us + 10_000_000)
+    role.send_artwork(channel=0, image_data=b"now", timestamp_us=clock.now_us())
+    await asyncio.sleep(0)
+    assert [call.args[0] for call in client.send_binary.call_args_list][1:] == [
+        pack_binary_header_raw(8, _NOW_US + 1_000) + b"now"
+    ]
+    # The replaced image's deadline no longer keeps the transfer loop waiting.
+    assert role._transfer_task is not None  # noqa: SLF001
+    assert role._transfer_task.done()  # noqa: SLF001
+
+
+# DEPRECATED(spec-pr-195): remove in aiosendspin <version>
+# DEPRECATED(spec-pr-135): remove in aiosendspin <version>
+@pytest.mark.asyncio
+async def test_legacy_hello_client_gets_due_image_when_next_one_is_scheduled() -> None:
+    """Scheduling an image sends a queued one already due before the transfer loop woke."""
+    client = _make_legacy_client_stub(_ALBUM)
+    clock = client._server.clock  # noqa: SLF001
+    role = ArtworkV1Role(client=client)
+    role.on_connect()
+    client.send_binary.reset_mock()
+    role.send_artwork(channel=0, image_data=b"next", timestamp_us=_NOW_US + 1_000)
+    await asyncio.sleep(0)
+
+    clock.advance_us(1_000)
+    role.send_artwork(channel=0, image_data=b"later", timestamp_us=_NOW_US + 10_000_000)
+    await asyncio.sleep(0)
+
+    assert [call.args[0] for call in client.send_binary.call_args_list] == [
+        pack_binary_header_raw(8, _NOW_US + 1_000) + b"next"
+    ]
+    role.on_disconnect()
+
+
+# DEPRECATED(spec-pr-195): remove in aiosendspin <version>
+@pytest.mark.asyncio
+async def test_legacy_hello_client_cannot_cancel_scheduled_artwork() -> None:
+    """A single-message client needs the current image re-sent to drop a scheduled one."""
+    client = _make_legacy_client_stub()
+    role = ArtworkV1Role(client=client)
+    role.on_connect()
+    role.send_artwork(0, b"later", _NOW_US + MAX_ANNOUNCE_LEAD_US + 10_000_000)
+    await asyncio.sleep(0)
+
+    assert not role.cancel_scheduled_artwork(0)
+    await asyncio.sleep(0)
+
+    client.send_binary.assert_not_called()
+    assert role._transfer_task is not None  # noqa: SLF001
+    assert role._transfer_task.done()  # noqa: SLF001
+
+
+def test_legacy_initial_state_without_artwork_is_not_a_deviation() -> None:
+    """A client configured by its hello needs no artwork object in the initial state."""
+    client = _make_legacy_client_stub()
+    role = ArtworkV1Role(client=client)
+
+    assert role.initial_state_deviations(ClientStatePayload(available=True)) == []
+
+
+# DEPRECATED(spec-pr-195): remove in aiosendspin <version>
+def test_legacy_hello_channels_start_stream_on_connect(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A hello declaring artwork channels starts the stream on connect, then sends images."""
+    client = _make_legacy_client_stub(_ALBUM, _ARTIST)
+    events = _record(client, monkeypatch)
+    role = ArtworkV1Role(client=client)
+
+    role.on_connect()
+
+    assert events == [("start", [_ALBUM_WIRE, _ARTIST_WIRE]), ("image", 0), ("image", 1)]
+    assert role.get_channel_configs() == {0: _ALBUM, 1: _ARTIST}
+
+
+# DEPRECATED(spec-pr-195): remove in aiosendspin <version>
+# DEPRECATED(spec-pr-188): remove in aiosendspin <version>
+def test_legacy_state_replaces_hello_channels(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A client/state artwork object replaces the channels the hello declared."""
+    client = _make_legacy_client_stub(_ALBUM)
+    events = _record(client, monkeypatch)
+    role = ArtworkV1Role(client=client)
+    role.on_connect()
+    events.clear()
+
+    role.on_client_state(_state(_NONE, _ARTIST))
+
+    assert events == [
+        ("drop", ["artwork"]),
+        ("binary", 0, 9),
+        ("start", [_NONE_WIRE, _ARTIST_WIRE]),
+        ("image", 1),
+    ]
+    assert role.get_channel_configs() == {1: _ARTIST}
+
+
+# DEPRECATED(spec-pr-195): remove in aiosendspin <version>
+def test_legacy_request_format_restarts_stream_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stream/request-format re-announces the stream; repeating it sends nothing."""
+    client = _make_legacy_client_stub(_ALBUM, _ARTIST)
+    events = _record(client, monkeypatch)
+    role = ArtworkV1Role(client=client)
+    role.on_connect()
+    events.clear()
+
+    role.on_stream_request_format(
+        StreamRequestFormatPayload(artwork=StreamRequestFormatArtwork(channel=1, width=800))
+    )
+    role.on_stream_request_format(
+        StreamRequestFormatPayload(artwork=StreamRequestFormatArtwork(channel=1, width=800))
+    )
+
+    assert events == [
+        ("drop", ["artwork"]),
+        ("start", [_ALBUM_WIRE, {**_ARTIST_WIRE, "width": 800}]),
+        ("image", 0),
+        ("image", 1),
+    ]
+
+
+# DEPRECATED(spec-pr-195): remove in aiosendspin <version>
+def test_legacy_request_format_disabling_channel_keeps_its_format_and_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A none channel announced to a hello-wire client still carries its format and size."""
+    client = _make_legacy_client_stub(_ALBUM, _ARTIST)
+    events = _record(client, monkeypatch)
+    role = ArtworkV1Role(client=client)
+    role.on_connect()
+    events.clear()
+
+    role.on_stream_request_format(
+        StreamRequestFormatPayload(
+            artwork=StreamRequestFormatArtwork(channel=0, source=ArtworkSource.NONE)
+        )
+    )
+
+    assert events == [
+        ("drop", ["artwork"]),
+        ("binary", 0, 9),
+        ("start", [{**_ALBUM_WIRE, "source": "none"}, _ARTIST_WIRE]),
+        ("image", 1),
+    ]
+
+
+# DEPRECATED(spec-pr-195): remove in aiosendspin <version>
+def test_legacy_request_format_enables_declared_none_channel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A request can enable a hello channel declared as none, keeping its declared size."""
+    declared_none = ArtworkChannel(
+        source=ArtworkSource.NONE, format=PictureFormat.PNG, width=64, height=64
+    )
+    client = _make_legacy_client_stub(_ALBUM, declared_none)
+    events = _record(client, monkeypatch)
+    role = ArtworkV1Role(client=client)
+    role.on_connect()
+    assert events[0] == (
+        "start",
+        [_ALBUM_WIRE, {"source": "none", "format": "png", "width": 64, "height": 64}],
+    )
+    events.clear()
+
+    role.on_stream_request_format(
+        StreamRequestFormatPayload(
+            artwork=StreamRequestFormatArtwork(channel=1, source=ArtworkSource.ARTIST)
+        )
+    )
+
+    assert events == [
+        ("drop", ["artwork"]),
+        ("start", [_ALBUM_WIRE, {"source": "artist", "format": "png", "width": 64, "height": 64}]),
+        ("image", 0),
+        ("image", 1),
+    ]
+
+
+# DEPRECATED(spec-pr-195): remove in aiosendspin <version>
+def test_legacy_request_format_keeps_size_set_on_none_channel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A size requested for a none channel applies once a later request enables it."""
+    declared_none = ArtworkChannel(
+        source=ArtworkSource.NONE, format=PictureFormat.PNG, width=64, height=64
+    )
+    client = _make_legacy_client_stub(_ALBUM, declared_none)
+    events = _record(client, monkeypatch)
+    role = ArtworkV1Role(client=client)
+    role.on_connect()
+    events.clear()
+
+    role.on_stream_request_format(
+        StreamRequestFormatPayload(artwork=StreamRequestFormatArtwork(channel=1, width=128))
+    )
+    assert events == []
+    role.on_stream_request_format(
+        StreamRequestFormatPayload(
+            artwork=StreamRequestFormatArtwork(channel=1, source=ArtworkSource.ARTIST)
+        )
+    )
+
+    assert role.get_channel_configs()[1].width == 128
+
+
+# DEPRECATED(spec-pr-195): remove in aiosendspin <version>
+def test_artwork_role_flags_nonpositive_request_dimensions() -> None:
+    """A stream/request-format with non-positive dimensions is flagged, not applied."""
+    client = _make_legacy_client_stub()
+    role = ArtworkV1Role(client=client)
+    role.on_connect()
+    role.on_stream_request_format(
+        StreamRequestFormatPayload(artwork=StreamRequestFormatArtwork(channel=0, width=-10))
+    )
+    client.flag_noncompliance.assert_called_once()
+
+
+# DEPRECATED(spec-pr-195): remove in aiosendspin <version>
+def test_artwork_role_applies_and_flags_pre_rename_request_dimensions() -> None:
+    """A stream/request-format phrased as media_width/media_height resizes, and is flagged."""
+    client = _make_legacy_client_stub()
+    role = ArtworkV1Role(client=client)
+    role.on_connect()
+    role.on_stream_request_format(
+        StreamRequestFormatPayload(
+            artwork=StreamRequestFormatArtwork.from_dict(
+                {"channel": 0, "media_width": 800, "media_height": 480}
+            )
+        )
+    )
+    config = role.get_channel_configs()[0]
+    assert (config.width, config.height) == (800, 480)
+    assert "media_width" in client.flag_noncompliance.call_args.args[0]
+
+
+# DEPRECATED(spec-pr-195): remove in aiosendspin <version>
+def test_artwork_role_flags_bmp_request_format() -> None:
+    """A stream/request-format asking for the removed 'bmp' format is flagged, not rejected."""
+    client = _make_legacy_client_stub()
+    role = ArtworkV1Role(client=client)
+    role.on_connect()
+    role.on_stream_request_format(
+        StreamRequestFormatPayload(
+            artwork=StreamRequestFormatArtwork(channel=0, format=PictureFormat.BMP)
+        )
+    )
+    assert "bmp" in client.flag_noncompliance.call_args.args[0]
+    assert role.get_channel_configs()[0].format == PictureFormat.BMP
+
+
+# DEPRECATED(spec-pr-195): remove in aiosendspin <version>
+def test_artwork_role_no_flag_for_valid_request_dimensions() -> None:
+    """A stream/request-format with positive dimensions is not flagged."""
+    client = _make_legacy_client_stub()
+    role = ArtworkV1Role(client=client)
+    role.on_connect()
+    role.on_stream_request_format(
+        StreamRequestFormatPayload(
+            artwork=StreamRequestFormatArtwork(channel=0, width=100, height=100)
+        )
+    )
+    client.flag_noncompliance.assert_not_called()
+
+
+# DEPRECATED(spec-pr-195): remove in aiosendspin <version>
+def test_artwork_role_flags_unknown_request_channel() -> None:
+    """A stream/request-format for a channel with no config is flagged."""
+    client = _make_legacy_client_stub()
+    role = ArtworkV1Role(client=client)
+    role.on_connect()
+    role.on_stream_request_format(
+        StreamRequestFormatPayload(artwork=StreamRequestFormatArtwork(channel=1))
+    )
+    client.flag_noncompliance.assert_called_once()
+
+
+# DEPRECATED(spec-pr-195): remove in aiosendspin <version>
 def test_artwork_partial_format_request_preserves_unchanged_fields() -> None:
     """A partial stream/request-format only overwrites fields the client included."""
-    client = _make_client_stub()
-    support = MagicMock()
-    support.channels = [
-        ArtworkChannel(
-            source=ArtworkSource.ALBUM,
-            format=PictureFormat.JPEG,
-            width=300,
-            height=300,
-        ),
-    ]
-    client.info.artwork_support = support
-
+    client = _make_legacy_client_stub()
     role = ArtworkV1Role(client=client)
     role.on_connect()
 

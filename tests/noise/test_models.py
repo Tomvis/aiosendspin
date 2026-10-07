@@ -4,16 +4,30 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
+from aiosendspin import noise
+from aiosendspin.models.types import PairAbortReason, ServerErrorReason
 from aiosendspin.noise.models import (
     ClientInitMessage,
     ClientInitPayload,
+    ClientPairPendingMessage,
+    ClientPairPendingPayload,
+    ClientPairRetryMessage,
     NoiseHandshakeMessage,
     NoiseHandshakePayload,
     NoiseMsg1Payload,
     NoiseMsg2Payload,
+    PairAbortMessage,
+    PairingMessage,
+    ServerErrorMessage,
+    ServerErrorPayload,
     ServerInitMessage,
     ServerInitPayload,
+    ServerPairInitMessage,
+    ServerPairInitPayload,
 )
+from aiosendspin.noise.trust_store import PskCategory
 
 
 def test_client_init_message_round_trip() -> None:
@@ -45,6 +59,34 @@ def test_server_init_has_no_suite_field() -> None:
     assert '"type":"server/init"' in raw
 
 
+@pytest.mark.parametrize("reason", list(ServerErrorReason))
+def test_server_error_message_round_trip(reason: ServerErrorReason) -> None:
+    """ServerErrorMessage carries only the reason and roundtrips through from_json."""
+    msg = ServerErrorMessage(payload=ServerErrorPayload(reason=reason))
+    raw = msg.to_json()
+    assert json.loads(raw) == {"type": "server/error", "payload": {"reason": reason.value}}
+    assert ServerErrorMessage.from_json(raw) == msg
+
+
+def test_server_error_reasons_match_the_spec() -> None:
+    """ServerErrorReason holds exactly the spec's reasons."""
+    assert {reason.value for reason in ServerErrorReason} == {
+        "unsupported_version",
+        "unsupported_suite",
+        "malformed",
+    }
+
+
+def test_server_error_names_are_public() -> None:
+    """The server/error models, reason and rejection are importable from the noise package."""
+    for name in ("ServerErrorMessage", "ServerErrorPayload", "ServerErrorReason"):
+        assert name in noise.__all__
+    assert noise.ServerErrorMessage is ServerErrorMessage
+    assert noise.ServerErrorPayload is ServerErrorPayload
+    assert noise.ServerErrorReason is ServerErrorReason
+    assert "InitRejectedError" in noise.__all__
+
+
 def test_noise_integer_fields_serialize_as_integers() -> None:
     """Noise messages emit integer-typed wire fields."""
     msg = ClientInitMessage(
@@ -67,11 +109,25 @@ def test_noise_handshake_message_round_trip() -> None:
     assert parsed.type == "noise/handshake"
 
 
-def test_noise_msg1_payload_carries_psk_id() -> None:
-    """The encrypted msg-1 inner payload exposes ``psk_id`` exactly."""
-    payload = NoiseMsg1Payload(psk_id="GFsV9tLaSQm9HcFWpKsgYQOr7wFTvNUtkmFwuVz3zoo")
+def test_noise_msg1_payload_carries_psk_id_and_category() -> None:
+    """The encrypted msg-1 inner payload exposes ``psk_id`` and the PSK's category code."""
+    payload = NoiseMsg1Payload(
+        psk_id="GFsV9tLaSQm9HcFWpKsgYQOr7wFTvNUtkmFwuVz3zoo",
+        psk_category=PskCategory.SENTINEL.code,
+    )
     raw = payload.to_json()
-    assert raw == '{"psk_id":"GFsV9tLaSQm9HcFWpKsgYQOr7wFTvNUtkmFwuVz3zoo"}'
+    assert raw == ('{"psk_id":"GFsV9tLaSQm9HcFWpKsgYQOr7wFTvNUtkmFwuVz3zoo","psk_category":"sn"}')
+
+
+def test_noise_msg1_payload_requires_a_category() -> None:
+    """The category is not optional: a payload without it does not parse."""
+    with pytest.raises(Exception, match="psk_category"):
+        NoiseMsg1Payload.from_json('{"psk_id":"GFsV9tLaSQm9HcFWpKsgYQOr7wFTvNUtkmFwuVz3zoo"}')
+
+
+def test_noise_msg1_category_codes_share_one_length() -> None:
+    """Equal-length codes keep the encrypted payload's length independent of the category."""
+    assert len({len(category.code) for category in PskCategory}) == 1
 
 
 def test_noise_msg2_payload_serializes_to_empty_object() -> None:
@@ -79,3 +135,58 @@ def test_noise_msg2_payload_serializes_to_empty_object() -> None:
     assert NoiseMsg2Payload().to_json() == "{}"
     # And empty input roundtrips cleanly.
     assert NoiseMsg2Payload.from_json("{}") == NoiseMsg2Payload()
+
+
+@pytest.mark.parametrize(
+    ("payload", "wire"),
+    [
+        pytest.param(
+            ServerPairInitPayload(nonce_A="A" * 43), {"nonce_A": "A" * 43}, id="first-round"
+        ),
+        pytest.param(ServerPairInitPayload(), {}, id="later-round"),
+    ],
+)
+def test_server_pair_init_omits_absent_nonce(
+    payload: ServerPairInitPayload, wire: dict[str, str]
+) -> None:
+    """server/pair-init carries nonce_A only when set and round-trips either way."""
+    msg = ServerPairInitMessage(payload=payload)
+    raw = msg.to_json()
+    assert json.loads(raw) == {"type": "server/pair-init", "payload": wire}
+    assert PairingMessage.from_json(raw) == msg
+
+
+@pytest.mark.parametrize(
+    ("payload", "wire"),
+    [
+        pytest.param(
+            ClientPairPendingPayload(pairing_index=1, message="Press the button"),
+            {"pairing_index": 1, "message": "Press the button"},
+            id="with-message",
+        ),
+        pytest.param(ClientPairPendingPayload(pairing_index=1), {"pairing_index": 1}, id="bare"),
+    ],
+)
+def test_client_pair_pending_omits_absent_message(
+    payload: ClientPairPendingPayload, wire: dict[str, object]
+) -> None:
+    """client/pair-pending carries message only when set and round-trips either way."""
+    msg = ClientPairPendingMessage(payload=payload)
+    raw = msg.to_json()
+    assert json.loads(raw) == {"type": "client/pair-pending", "payload": wire}
+    assert PairingMessage.from_json(raw) == msg
+
+
+def test_client_pair_retry_round_trip() -> None:
+    """client/pair-retry is an empty-payload pairing message."""
+    raw = ClientPairRetryMessage().to_json()
+    assert json.loads(raw) == {"type": "client/pair-retry", "payload": {}}
+    assert PairingMessage.from_json(raw) == ClientPairRetryMessage()
+
+
+# DEPRECATED(spec-pr-137): remove in aiosendspin <version>
+def test_pair_abort_reads_pre_rename_pin_mismatch() -> None:
+    """A pre-rename PIN client's pin_mismatch abort parses as a pairing-code mismatch."""
+    message = PairingMessage.from_json('{"type":"pair/abort","payload":{"reason":"pin_mismatch"}}')
+    assert isinstance(message, PairAbortMessage)
+    assert message.payload.reason is PairAbortReason.PAIRING_CODE_MISMATCH

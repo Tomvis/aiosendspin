@@ -1,4 +1,5 @@
 """Unit tests for the server-side management request/reply correlation."""
+# DEPRECATED(spec-pr-183): remove in aiosendspin <version>
 
 from __future__ import annotations
 
@@ -16,6 +17,7 @@ from aiosendspin.models.types import ManagementResult
 from aiosendspin.noise.keys import generate_psk, psk_id_for
 from aiosendspin.noise.trust_store import PskCategory, ResolvedPsk
 from aiosendspin.server.connection import SendspinConnection
+from tests.conftest import recorded_deprecations
 
 
 class _OtherResultPayload(ManagementResultPayload):
@@ -28,6 +30,7 @@ def _bare_connection() -> SendspinConnection:
     conn._logger = logging.getLogger("test")  # noqa: SLF001
     conn._management_waiter = None  # noqa: SLF001
     conn._client = None  # noqa: SLF001
+    conn._hello_description = ""  # noqa: SLF001
     conn._server = SimpleNamespace(allow_noncompliant_clients=True)  # type: ignore[assignment]  # noqa: SLF001
     return conn
 
@@ -74,6 +77,8 @@ async def test_management_request_rejects_wrong_reply_type() -> None:
     conn = _bare_connection()
     conn._transport = object()  # type: ignore[assignment]  # noqa: SLF001 - non-None sentinel
     conn._disconnecting = False  # noqa: SLF001
+    conn._management_active = True  # noqa: SLF001
+    conn._noise_psk = _long_term_psk()  # noqa: SLF001
 
     def _send(_message: object) -> None:
         pass
@@ -91,6 +96,35 @@ async def test_management_request_rejects_wrong_reply_type() -> None:
         await task
 
 
+def _long_term_psk() -> ResolvedPsk:
+    psk = generate_psk()
+    return ResolvedPsk(psk_id_for(psk), psk, PskCategory.LONG_TERM)
+
+
+@pytest.mark.parametrize(
+    ("active", "category"),
+    [(False, PskCategory.LONG_TERM), (True, PskCategory.SENTINEL)],
+)
+async def test_management_request_refused_unless_enabled(
+    *, active: bool, category: PskCategory
+) -> None:
+    """No management/* request is sent on a connection the embedder has not enabled."""
+    conn = _bare_connection()
+    conn._transport = object()  # type: ignore[assignment]  # noqa: SLF001 - non-None sentinel
+    conn._disconnecting = False  # noqa: SLF001
+    conn._management_active = active  # noqa: SLF001
+    psk = generate_psk()
+    conn._noise_psk = ResolvedPsk(psk_id_for(psk), psk, category)  # noqa: SLF001
+    sent: list[object] = []
+    conn.send_priority_message = sent.append  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="management is not enabled"):
+        await conn._management_request(  # noqa: SLF001
+            ManagementListRecordsMessage(), ManagementResultPayload
+        )
+    assert sent == []
+
+
 def _conn_with_psk(category: PskCategory | None) -> SendspinConnection:
     """Build a connection with just the PSK/management attributes the gate touches."""
     conn = SendspinConnection.__new__(SendspinConnection)
@@ -100,7 +134,9 @@ def _conn_with_psk(category: PskCategory | None) -> SendspinConnection:
         psk = generate_psk()
         conn._noise_psk = ResolvedPsk(psk_id_for(psk), psk, category)  # noqa: SLF001
     conn._management_active = False  # noqa: SLF001
-    conn._pairing_message_queue = None  # noqa: SLF001 — keeps _pairing_in_progress False
+    # Keep _pairing_in_progress False.
+    conn._in_pairing = False  # noqa: SLF001
+    conn._pairing_message_queue = None  # noqa: SLF001
     conn._declared_activities = None  # noqa: SLF001 — _refresh_activities then no-ops
     return conn
 
@@ -129,6 +165,20 @@ def test_enable_management_rejects_non_long_term(category: PskCategory | None) -
     with pytest.raises(RuntimeError, match="paired"):
         conn.enable_management()
     assert conn._management_active is False  # noqa: SLF001
+
+
+def test_connection_management_toggles_warn_once_each(caplog: pytest.LogCaptureFixture) -> None:
+    """The connection's enable/disable each warn once, however often they are called."""
+    conn = _conn_with_psk(PskCategory.LONG_TERM)
+    with caplog.at_level(logging.WARNING), recorded_deprecations() as deprecations:
+        for _ in range(2):
+            conn.enable_management()
+            conn.disable_management()
+
+    apis = ["SendspinConnection.enable_management", "SendspinConnection.disable_management"]
+    assert [m.split(" is deprecated")[0] for m in deprecations] == apis
+    logged = [r.message for r in caplog.records if r.name == "aiosendspin.util"]
+    assert [m.split(" is deprecated")[0] for m in logged] == apis
 
 
 def test_enable_management_allows_long_term() -> None:

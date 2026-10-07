@@ -4,10 +4,38 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from typing import Final
 
 from mashumaro.types import Discriminator
 
 from .base import SendspinConfig, SendspinModel
+
+# Wire names the spec has replaced, kept readable so an existing client still parses.
+SUPERSEDED_NAME_BY_CURRENT: Final[dict[str, str]] = {
+    "client-stream/start": "client_stream/start",
+    "client-stream/end": "client_stream/end",
+}
+
+
+_CURRENT_BY_SUPERSEDED: Final[dict[str, str]] = {
+    superseded: current for current, superseded in SUPERSEDED_NAME_BY_CURRENT.items()
+}
+
+
+def replacement_for(message_type: str) -> str | None:
+    """Return the name that replaced ``message_type``, or None if nothing did."""
+    return _CURRENT_BY_SUPERSEDED.get(message_type)
+
+
+def _client_message_tags(variant: type) -> list[str]:
+    """Return every ``type`` value that names ``variant``, current spelling first."""
+    # Read off the class itself: a base or mixin without its own ``type`` names nothing,
+    # and raising here would take down parsing for every client message.
+    current = variant.__dict__.get("type")
+    if not isinstance(current, str):
+        return []
+    superseded = SUPERSEDED_NAME_BY_CURRENT.get(current)
+    return [current] if superseded is None else [current, superseded]
 
 
 # Base message classes
@@ -18,7 +46,9 @@ class ClientMessage(SendspinModel):
     class Config(SendspinConfig):
         """Config for parsing json messages."""
 
-        discriminator = Discriminator(field="type", include_subtypes=True)
+        discriminator = Discriminator(
+            field="type", include_subtypes=True, variant_tagger_fn=_client_message_tags
+        )
 
 
 @dataclass
@@ -52,13 +82,6 @@ def undefined_field() -> UndefinedField:
 # Enums
 
 
-class TrustLevel(Enum):
-    """Trust a client extends to a server, governing allowed management operations."""
-
-    NONE = "none"
-    USER = "user"
-
-
 class Roles(Enum):
     """Client roles with explicit versioning."""
 
@@ -77,7 +100,7 @@ class Roles(Enum):
     VISUALIZER = "visualizer@v1"
     """
     Visualizes music. Has preferred format for audio features (FFT spectrum,
-    loudness, beats, peaks, pitch).
+    loudness, beats, peaks).
     """
     COLOR = "color@v1"
     """Receives colors derived from the current audio."""
@@ -107,6 +130,7 @@ class BinaryMessageType(Enum):
     """Loudness frame (Visualizer role, slot 0). Also reused for the legacy
     `visualizer@_draft_r1` `VISUALIZATION_DATA` blob — same wire byte, the
     negotiated role's `get_binary_handling` selects the framing."""
+    # DEPRECATED(spec-pr-86): remove in aiosendspin <version>
     VISUALIZATION_DATA = 16  # noqa: PIE796
     """Alias of `VISUALIZATION_LOUDNESS` for the legacy draft_r1 wire."""
     VISUALIZATION_BEAT = 17
@@ -117,8 +141,13 @@ class BinaryMessageType(Enum):
     """Display-binned spectrum (Visualizer role, slot 3)."""
     VISUALIZATION_PEAK = 20
     """Energy onset event with strength (Visualizer role, slot 4)."""
+    # DEPRECATED(spec-pr-86): remove in aiosendspin <version>
     VISUALIZATION_PITCH = 21
-    """Perceived pitch (MIDI 8.8 + confidence) (Visualizer role, slot 5)."""
+    """Deprecated perceived pitch (MIDI 8.8 + confidence) (Visualizer role, slot 5).
+
+    The spec reserves type 21. The server only sends it to legacy `visualizer@v1`
+    connections, and the client SDK ignores it.
+    """
 
     # Source role (bits 000011xx, IDs 12-15):
     SOURCE_AUDIO_CHUNK = 12
@@ -161,6 +190,8 @@ class PlayerCommand(Enum):
 
     VOLUME = "volume"
     MUTE = "mute"
+    SET_OUTPUT_DELAY = "set_output_delay"
+    # Removed from the spec, still served to clients that declare it.
     SET_STATIC_DELAY = "set_static_delay"
 
 
@@ -213,8 +244,9 @@ class ConnectionReason(Enum):
     """Server is performing a pairing handshake."""
     PLAYBACK = "playback"
     """Server needs client for active or upcoming playback."""
+    # DEPRECATED(spec-pr-183): remove in aiosendspin <version>
     MANAGEMENT = "management"
-    """Server is opening a dedicated management session."""
+    """Server is opening a dedicated management session (deprecated)."""
 
 
 class Activity(Enum):
@@ -224,8 +256,9 @@ class Activity(Enum):
     """Active or upcoming playback."""
     PAIRING = "pairing"
     """A pairing exchange."""
+    # DEPRECATED(spec-pr-183): remove in aiosendspin <version>
     MANAGEMENT = "management"
-    """A dedicated management session."""
+    """A dedicated management session (deprecated)."""
 
 
 class GoodbyeReason(Enum):
@@ -240,7 +273,7 @@ class GoodbyeReason(Enum):
     USER_REQUEST = "user_request"
     """User explicitly requested to disconnect from this server."""
     UNAUTHORIZED = "unauthorized"
-    """Server requested an activity the client's trust level does not permit."""
+    """Server requested an activity the client is not authorized for."""
     PAIRING_REQUIRED = "pairing_required"
     """Server requested playback but the client requires pairing first."""
     CONCURRENT_ATTEMPT = "concurrent_attempt"
@@ -264,6 +297,13 @@ class PairingCodeFormat(Enum):
     QR_CODE = "qr_code"
 
 
+# Values a pair-method descriptor may carry. A peer ignores any other value it finds there,
+# so these gate the parse as plain sets; an enum would reject the descriptor outright.
+PAIRING_CODE_FORMATS: frozenset[str] = frozenset(f.value for f in PairingCodeFormat)
+PAIRING_CODE_OUT_CHANNELS: frozenset[str] = frozenset({"display", "speaker"})
+SECRET_LOCATIONS: frozenset[str] = frozenset({"device", "leaflet", "operator"})
+
+
 class PairAbortReason(Enum):
     """Reason a pairing attempt was aborted."""
 
@@ -274,10 +314,19 @@ class PairAbortReason(Enum):
     USER_CANCELLED = "user_cancelled"
 
 
+class ServerErrorReason(Enum):
+    """Reason the server rejected a ``client/init``."""
+
+    UNSUPPORTED_VERSION = "unsupported_version"
+    UNSUPPORTED_SUITE = "unsupported_suite"
+    MALFORMED = "malformed"
+
+
 # The sender closes the connection after these abort reasons; every other reason keeps it open.
 CLOSING_ABORT_REASONS: frozenset[PairAbortReason] = frozenset({PairAbortReason.CONCURRENT_ATTEMPT})
 
 
+# DEPRECATED(spec-pr-183): remove in aiosendspin <version>
 class ManagementResult(Enum):
     """Result code carried by management/result."""
 

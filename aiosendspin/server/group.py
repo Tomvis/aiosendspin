@@ -130,13 +130,10 @@ class SendspinGroup:
         # Replace any existing active stream so stale handles cannot continue
         # committing audio after a new stream is started.
         if self._push_stream is not None and not self._push_stream.is_stopped:
-            if self._server.allow_noncompliant_clients:
-                self._push_stream.stop()
-            else:
-                # Clear buffered audio while preserving the protocol stream across replacement.
-                # Gate the spec-compliant path while legacy clients still mishandle stream/clear.
-                self._push_stream.clear()
-                self._push_stream.stop(keep_stream=True)
+            # Clear buffered audio while preserving the protocol stream across replacement:
+            # a track change must not end the stream.
+            self._push_stream.clear(end_roles=self._legacy_replacement_roles())
+            self._push_stream.stop(keep_stream=True)
 
         self._push_stream = PushStream(
             loop=self._server.loop,
@@ -169,10 +166,10 @@ class SendspinGroup:
             self._push_stream.stop()
             self._push_stream = None
 
-    def on_role_format_changed(self, role: Role) -> None:
+    def on_role_format_changed(self, role: Role, *, resume_at_us: int | None = None) -> None:
         """Notify PushStream that a role's audio format changed mid-stream."""
         if self._push_stream is not None and not self._push_stream.is_stopped:
-            self._push_stream.on_role_format_changed(role)
+            self._push_stream.on_role_format_changed(role, resume_at_us=resume_at_us)
 
     def on_role_activated(self, role: Role) -> None:
         """Join a role activated mid-connection to the active stream, if any."""
@@ -188,31 +185,58 @@ class SendspinGroup:
         if self._push_stream is not None and not self._push_stream.is_stopped:
             self._push_stream.on_role_leave(role)
 
-    def _send_group_update_to_clients(self) -> None:
-        """Send group/update messages to all clients."""
-        group_message = GroupUpdateServerMessage(
+    # DEPRECATED(spec-pr-218): remove in aiosendspin <version>
+    def _legacy_replacement_roles(self) -> set[Role]:
+        """Return the roles whose client gets stream/end, not stream/clear, on replacement.
+
+        Clients on a pre-#177 wire predate reliable stream/clear handling, so a
+        replaced stream still ends for them as it did before. The pre-#177 wire is
+        the only per-connection signal of such a client; this outlives that wire
+        tolerance only if another signal replaces it.
+        """
+        return {
+            role
+            for client in self._clients
+            if client.connection is not None and client.connection.uses_pre_spec_177_wire
+            for role in client.active_roles
+        }
+
+    def _group_update_message(self) -> GroupUpdateServerMessage:
+        """Build a group/update carrying this group's current state."""
+        return GroupUpdateServerMessage(
             GroupUpdateServerPayload(
                 playback_state=self._current_state,
                 group_id=self.group_id,
                 group_name=self.group_name,
             )
         )
+
+    def _send_group_update(self, client: SendspinClient, message: GroupUpdateServerMessage) -> None:
+        """Send one group/update to a client that has finished coming up.
+
+        A client still mid-bring-up is told the group's state by ``on_client_connected``
+        once its first client/state lands, so anything sent before then is superseded.
+        """
+        if client.is_connected:
+            client.send_message(message)
+
+    def _send_group_update_to_clients(self) -> None:
+        """Send group/update to every member that has finished coming up."""
+        group_message = self._group_update_message()
         for client in self._clients:
-            client.send_message(group_message)
+            self._send_group_update(client, group_message)
+
+    def _publish_if_name_changed(self, previous: str) -> None:
+        """Publish group/update when the name the group reports is no longer ``previous``."""
+        if self.group_name != previous:
+            self._send_group_update_to_clients()
 
     def on_client_connected(self, client: SendspinClient) -> None:
         """Send current group state to a client that just finished handshaking."""
         if client not in self._clients:
             return
 
-        group_message = GroupUpdateServerMessage(
-            GroupUpdateServerPayload(
-                playback_state=self._current_state,
-                group_id=self.group_id,
-                group_name=self.group_name,
-            )
-        )
-        client.send_message(group_message)
+        self._send_group_update(client, self._group_update_message())
 
         if self._push_stream is not None and not self._push_stream.is_stopped:
             for role in client.active_roles:
@@ -233,7 +257,7 @@ class SendspinGroup:
         Stop playback for the group and clean up resources.
 
         This stops any active PushStream and marks the group playback state as
-        STOPPED.
+        STOPPED. The reported playback position resets to 0 as of the stop.
 
         Returns:
             bool: True if an active stream was stopped,
@@ -257,7 +281,7 @@ class SendspinGroup:
 
             metadata_group_role = self.group_role("metadata")
             if isinstance(metadata_group_role, MetadataGroupRole):
-                metadata_group_role.freeze_progress()
+                metadata_group_role.reset_progress()
 
             # Stop the push stream if active
             if self._push_stream is not None:
@@ -341,9 +365,17 @@ class SendspinGroup:
         return self._group_id
 
     @property
-    def group_name(self) -> str | None:
-        """Friendly name for this group."""
-        return self._group_name
+    def group_name(self) -> str:
+        """Friendly name for this group, its founding member's device name by default."""
+        if self._group_name is not None:
+            return self._group_name
+        return self._clients[0].name if self._clients else ""
+
+    def set_group_name(self, name: str | None) -> None:
+        """Name this group, publishing the change; ``None`` restores the default."""
+        previous = self.group_name
+        self._group_name = name
+        self._publish_if_name_changed(previous)
 
     @property
     def state(self) -> PlaybackStateType:
@@ -367,6 +399,7 @@ class SendspinGroup:
 
         # Cancel any pending delayed join for this client
         logger.debug("removing %s from group with members: %s", client.client_id, self._clients)
+        previous_name = self.group_name
         if len(self._clients) == 1:
             # Delete this group if that was the last client
             await self._stop_and_invalidate_stale_binary([client])
@@ -386,6 +419,8 @@ class SendspinGroup:
                 await self._stop_and_invalidate_stale_binary(self._clients)
             # Emit event for client removal
             self._signal_event(GroupMemberRemovedEvent(client.client_id))
+            # Losing the founding member changes the name the survivors report.
+            self._publish_if_name_changed(previous_name)
         # Each client needs to be in a group, add it to a new one
         new_group = SendspinGroup(self._server, client)
         # Send group update to notify client of their new solo group
@@ -410,6 +445,8 @@ class SendspinGroup:
 
     def _finalize_empty_group(self) -> None:
         """Tear down a group with no remaining clients."""
+        for group_role in self._group_roles.values():
+            group_role.on_group_deleted()
         self._signal_event(GroupDeletedEvent())
 
     async def add_client(self, client: SendspinClient) -> None:
@@ -438,16 +475,18 @@ class SendspinGroup:
             # per client_id, but if a duplicate object appears, replace the stale one so
             # membership and role subscriptions stay coherent.
             logger.debug(
-                "Removing stale client %s (object %s) before adding new client (object %s)",
+                "Replacing stale client %s (object %s) with new client (object %s)",
                 stale_client.client_id,
                 id(stale_client),
                 id(client),
             )
-            self._clients.remove(stale_client)
+            # Taking the stale object's place keeps the membership order, and with it the
+            # founding member an unnamed group takes its name from.
+            self._clients[self._clients.index(stale_client)] = client
             self._unregister_client_events(stale_client)
-
-        # Add client to this group's client list
-        self._clients.append(client)
+        else:
+            # Add client to this group's client list
+            self._clients.append(client)
 
         # Emit event for client addition
         self._signal_event(GroupMemberAddedEvent(client.client_id))
@@ -475,12 +514,5 @@ class SendspinGroup:
                         self._push_stream.on_role_join(role)
 
         # Send current state to the new client
-        group_message = GroupUpdateServerMessage(
-            GroupUpdateServerPayload(
-                playback_state=self._current_state,
-                group_id=self.group_id,
-                group_name=self.group_name,
-            )
-        )
         logger.debug("Sending group update to new client %s", client.client_id)
-        client.send_message(group_message)
+        self._send_group_update(client, self._group_update_message())

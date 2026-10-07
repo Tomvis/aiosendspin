@@ -2,25 +2,32 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
+import orjson
 import pytest
+from mashumaro.exceptions import SuitableVariantNotFoundError
 
 from aiosendspin.models.core import (
     ClientHelloPayload,
     ClientStatePayload,
     PairMethodDescriptor,
     ServerCommandPayload,
+    ServerHelloPayload,
+    SupportedPairMethods,
 )
 from aiosendspin.models.source import (
     ClientStreamEndMessage,
     ClientStreamStartMessage,
+    ClientStreamStartPayload,
     ClientStreamStartSource,
+    ServerHelloSourceSupport,
 )
 from aiosendspin.models.types import (
     AudioCodec,
     ClientMessage,
-    PairMethod,
     SignalState,
-    TrustLevel,
+    _client_message_tags,
 )
 
 
@@ -48,10 +55,11 @@ def test_hello_serializes_support_under_versioned_alias() -> None:
     assert "source@v1_support" in hello.to_dict()
 
 
-def test_hello_source_role_requires_support_object() -> None:
-    """Listing source@v1 requires its versioned support object."""
-    with pytest.raises(ValueError, match="source@v1_support"):
-        ClientHelloPayload(name="x", supported_roles=["source@v1"])
+def test_hello_source_role_without_support_object_is_recorded() -> None:
+    """Listing source@v1 without its versioned support object records it as missing."""
+    hello = ClientHelloPayload(name="x", supported_roles=["source@v1"])
+    assert hello.missing_support_roles == ["source@v1"]
+    assert hello.activatable_roles == []
 
 
 def test_hello_drops_source_support_without_role() -> None:
@@ -61,12 +69,11 @@ def test_hello_drops_source_support_without_role() -> None:
 
 
 def test_hello_preserves_supported_pair_methods_positional_argument() -> None:
-    """Source support does not displace existing client/hello positional arguments."""
-    pair_methods = [PairMethodDescriptor(method=PairMethod.PAIRING_PSK)]
+    """Source support is appended, so it does not displace supported_pair_methods."""
+    pair_methods = SupportedPairMethods(pairing_psk=PairMethodDescriptor())
     payload = ClientHelloPayload(
         "Client",
         [],
-        TrustLevel.NONE,
         None,
         None,
         None,
@@ -115,13 +122,13 @@ def test_server_command_source_requires_command() -> None:
 def test_client_stream_messages_dispatch_by_discriminator() -> None:
     """client_stream messages resolve to their concrete classes via the type field."""
     start = ClientMessage.from_json(
-        '{"type":"client_stream/start","payload":{"source":'
+        '{"type":"client-stream/start","payload":{"source":'
         '{"codec":"flac","channels":2,"sample_rate":48000,"bit_depth":16,"codec_header":"AAA="}}}'
     )
     assert isinstance(start, ClientStreamStartMessage)
     assert start.payload.source.codec is AudioCodec.FLAC
 
-    end = ClientMessage.from_json('{"type":"client_stream/end"}')
+    end = ClientMessage.from_json('{"type":"client-stream/end"}')
     assert isinstance(end, ClientStreamEndMessage)
 
 
@@ -130,3 +137,100 @@ def test_client_stream_start_header_optional_for_all_codecs() -> None:
     for codec in (AudioCodec.OPUS, AudioCodec.FLAC, AudioCodec.PCM):
         src = ClientStreamStartSource(codec=codec, channels=2, sample_rate=48000, bit_depth=16)
         assert src.codec_header is None
+
+
+def test_superseded_stream_message_names_still_parse() -> None:
+    """A source on the pre-rename wire is understood, and says which name it used."""
+    start = ClientMessage.from_json(
+        '{"type":"client_stream/start","payload":{"source":'
+        '{"codec":"pcm","sample_rate":48000,"bit_depth":16,"channels":2}}}'
+    )
+    end = ClientMessage.from_json('{"type":"client_stream/end"}')
+
+    assert isinstance(start, ClientStreamStartMessage)
+    assert isinstance(end, ClientStreamEndMessage)
+    assert start.type == "client_stream/start"
+    assert end.type == "client_stream/end"
+
+
+def test_stream_messages_are_emitted_under_the_current_names() -> None:
+    """What this client sends is the spelling the spec now uses."""
+    assert orjson.loads(ClientStreamEndMessage().to_json())["type"] == "client-stream/end"
+    payload = ClientStreamStartPayload(
+        source=ClientStreamStartSource(
+            codec=AudioCodec.PCM, sample_rate=48000, bit_depth=16, channels=2
+        )
+    )
+    raw = orjson.loads(ClientStreamStartMessage(payload=payload).to_json())
+    assert raw["type"] == "client-stream/start"
+
+
+def test_a_client_message_without_a_type_does_not_break_dispatch() -> None:
+    """The tagger must tolerate a variant carrying no ``type`` of its own.
+
+    Raising there would take down parsing for every client message, not just source ones.
+    """
+
+    @dataclass
+    class _UntaggedClientMessage(ClientMessage):
+        """A subclass that declares no wire name, as a mixin or base might."""
+
+    assert _client_message_tags(_UntaggedClientMessage) == []
+
+    # Force the variant map to be rebuilt, so every subclass is put to the tagger rather
+    # than answered from what an earlier parse cached.
+    with pytest.raises(SuitableVariantNotFoundError):
+        ClientMessage.from_json('{"type":"nope/not-a-message"}')
+    parsed = ClientMessage.from_json('{"type":"client-stream/end"}')
+    assert isinstance(parsed, ClientStreamEndMessage)
+
+
+def test_server_hello_serializes_source_support_under_versioned_alias() -> None:
+    """The accepted source codecs round-trip under the wire key ``source@v1_support``."""
+    hello = ServerHelloPayload(
+        name="Server",
+        source_support=ServerHelloSourceSupport(
+            supported_codecs=[AudioCodec.FLAC, AudioCodec.PCM, AudioCodec.OPUS]
+        ),
+    )
+
+    assert hello.to_dict()["source@v1_support"] == {"supported_codecs": ["flac", "pcm", "opus"]}
+    parsed = ServerHelloPayload.from_json(hello.to_json())
+    assert parsed.source_support is not None
+    assert parsed.source_support.supported_codecs == [
+        AudioCodec.FLAC,
+        AudioCodec.PCM,
+        AudioCodec.OPUS,
+    ]
+
+
+def test_server_hello_carries_languages_alongside_source_support() -> None:
+    """Both optional server/hello fields round-trip together."""
+    hello = ServerHelloPayload(
+        name="s",
+        languages=["nl-NL", "en"],
+        source_support=ServerHelloSourceSupport(supported_codecs=[AudioCodec.PCM]),
+    )
+
+    assert hello.to_dict() == {
+        "name": "s",
+        "languages": ["nl-NL", "en"],
+        "source@v1_support": {"supported_codecs": ["pcm"]},
+    }
+    assert ServerHelloPayload.from_json(hello.to_json()) == hello
+
+
+def test_server_hello_omits_source_support_when_absent() -> None:
+    """A server without source support neither sends nor expects the support object."""
+    assert ServerHelloPayload(name="s").to_dict() == {"name": "s"}
+    assert ServerHelloPayload.from_json('{"name":"s"}').source_support is None
+
+
+def test_server_hello_ignores_unknown_source_codecs() -> None:
+    """Codec identifiers this implementation does not recognize are dropped."""
+    hello = ServerHelloPayload.from_json(
+        '{"name":"s","source@v1_support":{"supported_codecs":["flac","pcm","aac"]}}'
+    )
+
+    assert hello.source_support is not None
+    assert hello.source_support.supported_codecs == [AudioCodec.FLAC, AudioCodec.PCM]

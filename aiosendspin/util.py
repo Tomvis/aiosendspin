@@ -6,6 +6,7 @@ import asyncio
 import logging
 import socket
 import sys
+import warnings
 from collections.abc import Coroutine
 from typing import Any
 
@@ -15,6 +16,9 @@ _LOGGER = logging.getLogger(__name__)
 _SUPPORTS_EAGER_START = sys.version_info >= (3, 12)
 
 TASKS: set[asyncio.Task[Any]] = set()
+
+# APIs whose deprecation this process has already reported.
+_WARNED_DEPRECATIONS: set[str] = set()
 
 
 def _log_task_exception(task: asyncio.Task[Any]) -> None:
@@ -71,6 +75,22 @@ def create_task[T](
     return task
 
 
+async def finish_despite_cancel[T](coro: Coroutine[None, None, T]) -> tuple[T, bool]:
+    """Run ``coro`` through any cancellation, returning its result and whether one arrived.
+
+    ``coro`` must finish on its own: cancels cannot stop it.
+    """
+    task = asyncio.create_task(coro)
+    cancelled = False
+    while True:
+        try:
+            return await asyncio.shield(task), cancelled
+        except asyncio.CancelledError:
+            if task.cancelled():
+                raise
+            cancelled = True
+
+
 def get_local_ip() -> str | None:
     """Get a local IP address that can be used for mDNS advertising.
 
@@ -86,3 +106,17 @@ def get_local_ip() -> str | None:
             return result
     except OSError:
         return None
+
+
+def warn_deprecated(api: str, reason: str) -> None:
+    """Report once per process that ``api`` is deprecated.
+
+    The first call for ``api`` emits a ``DeprecationWarning`` attributed to the caller of
+    ``api`` and logs a warning; later calls are silent.
+    """
+    if api in _WARNED_DEPRECATIONS:
+        return
+    _WARNED_DEPRECATIONS.add(api)
+    message = f"{api} is deprecated: {reason}"
+    warnings.warn(message, DeprecationWarning, stacklevel=3)
+    _LOGGER.warning(message)

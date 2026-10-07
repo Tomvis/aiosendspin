@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
 from mashumaro.types import Discriminator
 
 from aiosendspin.models.base import SendspinConfig, SendspinModel
-from aiosendspin.models.types import PairAbortReason, ServerMessage
+from aiosendspin.models.types import PairAbortReason, ServerErrorReason, ServerMessage
 
 
 @dataclass
@@ -50,6 +50,22 @@ class ServerInitMessage(SendspinModel):
 
 
 @dataclass
+class ServerErrorPayload(SendspinModel):
+    """Cleartext ``server/error`` payload — replaces ``server/init``; the server closes after."""
+
+    reason: ServerErrorReason
+    """Why the server rejected the ``client/init``."""
+
+
+@dataclass
+class ServerErrorMessage(SendspinModel):
+    """Envelope for ``ServerErrorPayload``."""
+
+    payload: ServerErrorPayload
+    type: Literal["server/error"] = "server/error"
+
+
+@dataclass
 class NoiseHandshakePayload(SendspinModel):
     """Carries one Noise handshake message (base64url-encoded ciphertext)."""
 
@@ -71,6 +87,8 @@ class NoiseMsg1Payload(SendspinModel):
 
     psk_id: str
     """43-char base64url SHA-256 of the PSK (see ``psk_id_for``)."""
+    psk_category: str
+    """Category the server is using the referenced PSK as, as a ``PskCategory`` code."""
 
 
 @dataclass
@@ -134,6 +152,14 @@ class PairAbortPayload(SendspinModel):
     reason: PairAbortReason
     """Why the pairing attempt was aborted."""
 
+    # DEPRECATED(spec-pr-137): remove in aiosendspin <version>
+    @classmethod
+    def __pre_deserialize__(cls, d: dict[str, Any]) -> dict[str, Any]:
+        """Read the pre-rename ``pin_mismatch`` reason as ``pairing_code_mismatch``."""
+        if d.get("reason") == "pin_mismatch":
+            return {**d, "reason": PairAbortReason.PAIRING_CODE_MISMATCH.value}
+        return d
+
 
 @dataclass
 class PairAbortMessage(PairingMessage):
@@ -149,6 +175,16 @@ class ClientPairPendingPayload(SendspinModel):
 
     pairing_index: int
     """Pairing ``server/activate`` message count received since the last Noise handshake."""
+    message: str | None = None
+    """Short plain-text sentence for the operator, such as what to do to proceed.
+
+    Unauthenticated: show it as text attributed to the device, never as markup.
+    """
+
+    class Config(SendspinConfig):
+        """Omit the optional operator message when absent."""
+
+        omit_none = True
 
 
 @dataclass
@@ -161,18 +197,18 @@ class ClientPairPendingMessage(PairingMessage):
 
 @dataclass
 class ClientPairInitPayload(SendspinModel):
-    """``client/pair-init`` payload — signals readiness for the pairing code-pairing flow."""
+    """``client/pair-init`` payload — starts the pairing attempt, whatever the method."""
 
     pairing_index: int
     """Pairing ``server/activate`` message count received since the last Noise handshake."""
     commit_B: str | None = None  # noqa: N815 - spec wire field name
     """``SHA-256("sendspin-pair-commit-v1" || nonce_B)`` (43-char base64url).
 
-    Present in dynamic pairing code and absent in static pairing code.
+    Present in dynamic pairing code and absent otherwise.
     """
 
     class Config(SendspinConfig):
-        """Omit the optional commitment when absent (static pairing code)."""
+        """Omit the optional commitment when absent (all but dynamic pairing code)."""
 
         omit_none = True
 
@@ -187,10 +223,18 @@ class ClientPairInitMessage(PairingMessage):
 
 @dataclass
 class ServerPairInitPayload(SendspinModel):
-    """``server/pair-init`` payload — the server's nonce contribution (dynamic pairing code)."""
+    """``server/pair-init`` payload — begins a dynamic-pairing-code round."""
 
-    nonce_A: str  # noqa: N815 - spec wire field name
-    """32 bytes from a CSPRNG, base64url-encoded (43 chars)."""
+    nonce_A: str | None = None  # noqa: N815 - spec wire field name
+    """32 bytes from a CSPRNG, base64url-encoded (43 chars). Present in the first round only."""
+    # DEPRECATED(spec-pr-130): remove in aiosendspin <version>
+    pin_length: int | None = None
+    """Dynamic PIN length, for clients that read it here instead of from the activation."""
+
+    class Config(SendspinConfig):
+        """Omit the nonce in the rounds after the first, and an unset PIN length."""
+
+        omit_none = True
 
 
 @dataclass
@@ -250,6 +294,19 @@ class ServerPairConfirmMessage(PairingMessage):
 
 
 @dataclass
+class ClientPairRetryPayload(SendspinModel):
+    """``client/pair-retry`` payload — empty request for another dynamic-pairing-code round."""
+
+
+@dataclass
+class ClientPairRetryMessage(PairingMessage):
+    """Envelope for ``ClientPairRetryPayload``."""
+
+    payload: ClientPairRetryPayload = field(default_factory=ClientPairRetryPayload)
+    type: Literal["client/pair-retry"] = "client/pair-retry"
+
+
+@dataclass
 class ClientPairConfirmPayload(SendspinModel):
     """``client/pair-confirm`` payload — the client's MCF tag and wrapped commitment opening."""
 
@@ -257,6 +314,9 @@ class ClientPairConfirmPayload(SendspinModel):
     """CPace MCF tag ``Tb`` (HMAC-SHA-512, 86-char base64url)."""
     wrapped_nonce_B: str | None = None  # noqa: N815 - spec wire field name
     """48-byte wrapping of the ``commit_B`` preimage (64-char base64url). Dynamic only."""
+    # DEPRECATED(spec-pr-155): remove in aiosendspin <version>
+    nonce_B: str | None = None  # noqa: N815 - spec wire field name
+    """Unwrapped ``commit_B`` preimage (43-char base64url), sent by pre-rename PIN clients."""
 
     class Config(SendspinConfig):
         """Omit the optional wrapped nonce opening when absent (static pairing code)."""

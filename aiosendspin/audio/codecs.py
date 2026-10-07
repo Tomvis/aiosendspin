@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 import struct
 import types
@@ -30,6 +31,30 @@ def _require_av() -> types.ModuleType:
             "PyAV is required for Opus/FLAC encoding and decoding. "
             "Install the 'source' extra: pip install aiosendspin[source]"
         ) from err
+
+
+@functools.cache
+def opus_available() -> bool:
+    """Whether Opus can be encoded and decoded, which needs PyAV built with libopus."""
+    try:
+        av = _get_av()
+        av.codec.Codec("libopus", "w")
+        av.codec.Codec("libopus", "r")
+    except (ImportError, ValueError):
+        # PyAV reports a missing codec as UnknownCodecError, a ValueError.
+        return False
+    return True
+
+
+@functools.cache
+def flac_encoder_available() -> bool:
+    """Whether FLAC can be encoded, which needs PyAV with FFmpeg's FLAC encoder."""
+    try:
+        _get_av().codec.Codec("flac", "w")
+    except (ImportError, ValueError):
+        # PyAV reports a missing codec as UnknownCodecError, a ValueError.
+        return False
+    return True
 
 
 class PcmPassthrough:
@@ -555,18 +580,35 @@ class OpusEncoder:
         self._dur_residue = 0
 
 
+def decoded_bit_depth(codec: str, bit_depth: int) -> int:
+    """
+    Return the PCM bit depth a source decoder emits for an announced ``bit_depth``.
+
+    Opus ignores the announced depth and decodes to 16 bits.
+    """
+    if codec == "opus" or bit_depth <= 16:
+        return 16
+    return 24 if bit_depth <= 24 else 32
+
+
 class PcmDecoder:
-    """Identity decoder for raw PCM source frames (no transcoding)."""
+    """Decoder for raw PCM source frames, widening 8-bit samples to 16 bits."""
 
     def __init__(
         self, *, sample_rate: int, bit_depth: int, channels: int, codec_header: bytes | None = None
     ) -> None:
-        """Accept the declared format without setup."""
-        del sample_rate, bit_depth, channels, codec_header
+        """Accept the declared format; only an 8-bit depth changes the output."""
+        del sample_rate, channels, codec_header
+        self._widen = bit_depth == 8
 
     def decode(self, data: bytes) -> bytes:
-        """Return the PCM frame unchanged."""
-        return data
+        """Return the PCM frame at ``decoded_bit_depth()``."""
+        if not self._widen:
+            return data
+        widened = bytearray(len(data) * 2)
+        # A signed 8-bit sample is the high byte of the little-endian 16-bit sample.
+        widened[1::2] = data
+        return bytes(widened)
 
     def flush(self) -> bytes:
         """No buffered audio for raw PCM."""
@@ -641,7 +683,7 @@ class _AvDecoder:
 def create_decoder(
     codec: str, *, sample_rate: int, bit_depth: int, channels: int, codec_header: bytes | None
 ) -> PcmDecoder | _AvDecoder:
-    """Build a decoder for ``codec`` ('pcm' | 'flac' | 'opus')."""
+    """Build a decoder for ``codec`` ('pcm' | 'flac' | 'opus') at the announced format."""
     if codec == "pcm":
         return PcmDecoder(
             sample_rate=sample_rate,
@@ -654,7 +696,7 @@ def create_decoder(
         return _AvDecoder(
             codec_name,
             sample_rate=sample_rate,
-            bit_depth=bit_depth,
+            bit_depth=decoded_bit_depth(codec, bit_depth),
             channels=channels,
             codec_header=codec_header,
         )
@@ -689,4 +731,7 @@ __all__ = [
     "PcmPassthrough",
     "create_decoder",
     "create_encoder",
+    "decoded_bit_depth",
+    "flac_encoder_available",
+    "opus_available",
 ]

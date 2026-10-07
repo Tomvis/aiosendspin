@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import threading
 from collections import deque
 from dataclasses import dataclass
 from itertools import pairwise
@@ -13,17 +14,19 @@ from uuid import UUID
 
 import pytest
 
-from aiosendspin.models import unpack_binary_header
 from aiosendspin.models.core import (
+    ClientStatePayload,
     StreamClearMessage,
     StreamEndMessage,
-    StreamRequestFormatPayload,
     StreamStartMessage,
 )
 from aiosendspin.models.player import (
+    PLAYER_AUDIO_HEADER_SIZE,
     ClientHelloPlayerSupport,
-    StreamRequestFormatPlayer,
+    PlayerStatePayload,
     SupportedAudioFormat,
+    pack_player_audio_header,
+    unpack_player_audio_header,
 )
 from aiosendspin.models.types import AudioCodec, PlayerCommand, Roles
 from aiosendspin.server import push_stream as push_stream_module
@@ -32,6 +35,7 @@ from aiosendspin.server.audio_transformers import TransformerPool
 from aiosendspin.server.channels import MAIN_CHANNEL
 from aiosendspin.server.client import SendspinClient
 from aiosendspin.server.clock import LoopClock, ManualClock
+from aiosendspin.server.connection import SendspinConnection
 from aiosendspin.server.push_stream import (
     DEFAULT_INITIAL_DELAY_US,
     CachedChunk,
@@ -66,6 +70,11 @@ class _DummyGroup:
         self._push_stream: PushStream | None = None
         self.has_active_stream = False
 
+    group_name = "dummy group"
+
+    def _publish_if_name_changed(self, previous: str) -> None:  # noqa: ARG002
+        return
+
     def on_client_connected(self, client: SendspinClient) -> None:  # noqa: ARG002
         return
 
@@ -78,9 +87,9 @@ class _DummyGroup:
     def get_channel_for_player(self, player_id: str) -> UUID:  # noqa: ARG002
         return MAIN_CHANNEL
 
-    def on_role_format_changed(self, role: Any) -> None:
+    def on_role_format_changed(self, role: Any, *, resume_at_us: int | None = None) -> None:
         if self._push_stream is not None and not self._push_stream.is_stopped:
-            self._push_stream.on_role_format_changed(role)
+            self._push_stream.on_role_format_changed(role, resume_at_us=resume_at_us)
 
 
 class _FakeConnection:
@@ -107,12 +116,16 @@ class _FakeConnection:
         data: bytes,
         *,
         role: str,  # noqa: ARG002
-        timestamp_us: int,  # noqa: ARG002
+        timestamp_us: int,
         message_type: int,  # noqa: ARG002
         buffer_end_time_us: int | None = None,
         buffer_byte_count: int | None = None,
         duration_us: int | None = None,
+        player_audio_header: bool = False,
+        epoch_exempt: bool = False,  # noqa: ARG002
     ) -> bool:
+        if player_audio_header:
+            data = pack_player_audio_header(timestamp_us, 0) + data
         self.sent_binary.append(data)
         if (
             self.buffer_tracker is not None
@@ -124,17 +137,19 @@ class _FakeConnection:
 
 
 class _DummyRole:
+    role_family = "player"
+
     def __init__(
         self,
         requirements: AudioRequirements,
         *,
-        static_delay_us: int = 0,
+        output_delay_us: int = 0,
         replay_from_pcm_cache: bool = False,
         required_lead_time_us: int = DEFAULT_INITIAL_DELAY_US,
         min_buffer_us: int = 0,
     ) -> None:
         self._requirements = requirements
-        self._static_delay_us = static_delay_us
+        self._output_delay_us = output_delay_us
         self._replay_from_pcm_cache = replay_from_pcm_cache
         self._required_lead_time_us = required_lead_time_us
         self._min_buffer_us = min_buffer_us
@@ -147,8 +162,8 @@ class _DummyRole:
     def replay_from_pcm_cache(self) -> bool:
         return self._replay_from_pcm_cache
 
-    def get_static_delay_us(self) -> int:
-        return self._static_delay_us
+    def get_output_delay_us(self) -> int:
+        return self._output_delay_us
 
     def get_required_lead_time_us(self) -> int:
         return self._required_lead_time_us
@@ -177,6 +192,9 @@ class _DummyClient:
         self.is_connected = True
         self.active_roles = roles
         self.connection = _FakeConnection()
+
+    def awaits_role_state(self, role_family: str) -> bool:  # noqa: ARG002
+        return False
 
 
 def _expand_packed_s24_to_s32(data: bytes) -> bytes:
@@ -209,6 +227,7 @@ def _make_connected_player(
     hello = type("Hello", (), {})()
     hello.client_id = client_id
     hello.name = client_id
+    hello.device_info = None
     hello.player_support = ClientHelloPlayerSupport(
         supported_formats=[
             SupportedAudioFormat(
@@ -264,7 +283,7 @@ def _make_connected_player(
 
 
 @pytest.mark.asyncio
-async def test_late_join_target_includes_player_static_delay() -> None:
+async def test_late_join_target_includes_player_output_delay() -> None:
     """Late-join target should use raw timestamps far enough ahead for delayed players."""
     loop = asyncio.get_running_loop()
     clock = ManualClock(now_us_value=1_000_000)
@@ -272,11 +291,11 @@ async def test_late_join_target_includes_player_static_delay() -> None:
     client, _ = _make_connected_player(loop, group, "p1", clock=clock)
     role = client.role("player@v1")
     assert role is not None
-    role.static_delay_ms = 5_000
+    role.output_delay_ms = 5_000
 
     stream = PushStream(loop=loop, clock=clock, group=group)
 
-    # now + max(min_buffer=1000ms, required_lead=250ms) + static_delay=5s
+    # now + max(min_buffer=1000ms, required_lead=250ms) + output_delay=5s
     assert stream.get_late_join_target_timestamp_us(role=role) == 7_000_000
 
 
@@ -289,7 +308,7 @@ async def test_live_send_ahead_uses_min_buffer_not_required_lead() -> None:
     client, _ = _make_connected_player(loop, group, "p1", clock=clock)
     role = client.role("player@v1")
     assert role is not None
-    role.static_delay_ms = 0
+    role.output_delay_ms = 0
     role.min_buffer_ms = 200
     role.required_lead_time_ms = 400  # must be ignored for live
 
@@ -308,13 +327,13 @@ async def test_late_join_target_uses_required_lead_time() -> None:
     client, _ = _make_connected_player(loop, group, "p1", clock=clock)
     role = client.role("player@v1")
     assert role is not None
-    role.static_delay_ms = 5_000
+    role.output_delay_ms = 5_000
     role.required_lead_time_ms = 400
     role.min_buffer_ms = 100  # below required_lead, so required_lead is the binding floor
 
     stream = PushStream(loop=loop, clock=clock, group=group)
 
-    # now + max(100ms min_buffer, 400ms required_lead) + 5s static_delay
+    # now + max(100ms min_buffer, 400ms required_lead) + 5s output_delay
     assert stream.get_late_join_target_timestamp_us(role=role) == 6_400_000
 
 
@@ -332,7 +351,7 @@ async def test_late_join_target_matches_fresh_start_floor() -> None:
     client, _ = _make_connected_player(loop, group, "p1", clock=clock)
     role = client.role("player@v1")
     assert role is not None
-    role.static_delay_ms = 0
+    role.output_delay_ms = 0
     role.required_lead_time_ms = 250
     role.min_buffer_ms = 1_000
 
@@ -343,15 +362,15 @@ async def test_late_join_target_matches_fresh_start_floor() -> None:
 
 
 @pytest.mark.asyncio
-async def test_non_main_join_rebase_includes_player_static_delay() -> None:
-    """Solo-channel rejoin should clamp raw timing high enough for static delay."""
+async def test_non_main_join_rebase_includes_player_output_delay() -> None:
+    """Solo-channel rejoin should clamp raw timing high enough for output delay."""
     loop = asyncio.get_running_loop()
     clock = ManualClock(now_us_value=1_000_000)
     group = _DummyGroup(clients=[])
     client, _ = _make_connected_player(loop, group, "p1", clock=clock)
     role = client.role("player@v1")
     assert role is not None
-    role.static_delay_ms = 5_000
+    role.output_delay_ms = 5_000
 
     channel_id = UUID("77777777-7777-7777-7777-777777777777")
     stream = PushStream(loop=loop, clock=clock, group=group)
@@ -378,7 +397,7 @@ async def test_commit_audio_sends_stream_start_and_binary(mock_loop: Any) -> Non
 
     assert any(isinstance(m, StreamStartMessage) for m in conn.sent_json)
     assert conn.sent_binary, "expected at least one binary chunk"
-    header = unpack_binary_header(conn.sent_binary[0])
+    header = unpack_player_audio_header(conn.sent_binary[0])
     assert header.message_type == 4  # BinaryMessageType.AUDIO_CHUNK
     role = client.role("player@v1")
     assert role is not None
@@ -397,14 +416,14 @@ async def test_commit_audio_float_input_quantizes_at_output_edge(
     _client, conn = _make_connected_player(mock_loop, group, "p1")
 
     quantize_calls = 0
-    original_quantizer = push_stream_module._quantize_float_pcm  # noqa: SLF001
+    original_quantizer = push_stream_module._quantizer_state  # noqa: SLF001
 
     def _counted_quantizer(**kwargs: Any) -> object:
         nonlocal quantize_calls
         quantize_calls += 1
         return original_quantizer(**kwargs)
 
-    monkeypatch.setattr(push_stream_module, "_quantize_float_pcm", _counted_quantizer)
+    monkeypatch.setattr(push_stream_module, "_quantizer_state", _counted_quantizer)
 
     stream = PushStream(loop=mock_loop, clock=LoopClock(mock_loop), group=group)
     stream.prepare_audio(
@@ -638,14 +657,9 @@ async def test_stop_during_inflight_commit_suppresses_audio_delivery(mock_loop: 
     release_delivery.set()
     await commit_task
 
-    assert any(isinstance(m, StreamEndMessage) for m in conn.sent_json)
+    # The stream stopped before its first chunk, so it was never announced or ended.
+    assert not any(isinstance(m, (StreamStartMessage, StreamEndMessage)) for m in conn.sent_json)
     assert not conn.sent_binary
-
-    stream_end_index = next(
-        i for i, message in enumerate(conn.sent_json) if isinstance(message, StreamEndMessage)
-    )
-    post_end_messages = conn.sent_json[stream_end_index + 1 :]
-    assert not any(isinstance(message, StreamStartMessage) for message in post_end_messages)
 
 
 @pytest.mark.asyncio
@@ -691,7 +705,7 @@ async def test_role_leave_during_inflight_commit_suppresses_stale_audio(mock_loo
     release_transform.set()
     await commit_task
 
-    assert any(isinstance(m, StreamEndMessage) for m in conn.sent_json)
+    assert not any(isinstance(m, (StreamStartMessage, StreamEndMessage)) for m in conn.sent_json)
     assert not conn.sent_binary
 
 
@@ -834,8 +848,191 @@ async def test_clear_during_inflight_commit_suppresses_audio_delivery(mock_loop:
     release_delivery.set()
     await commit_task
 
-    assert any(isinstance(m, StreamClearMessage) for m in conn.sent_json)
+    assert not any(isinstance(m, (StreamStartMessage, StreamClearMessage)) for m in conn.sent_json)
     assert not conn.sent_binary
+
+
+class _BlockingTransformer:
+    """Transformer whose process() parks its thread until `release` is set."""
+
+    pending_timestamp_us: int | None = None
+    frame_duration_us = 25_000
+
+    def __init__(self) -> None:
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.process_thread: int | None = None
+        self.in_process = False
+        self.reset_calls = 0
+        self.reset_overlapped_process = False
+
+    def process(self, pcm: bytes, _ts: int, _dur: int) -> list[tuple[bytes, int]]:
+        self.process_thread = threading.get_ident()
+        self.in_process = True
+        self.entered.set()
+        self.release.wait()
+        self.in_process = False
+        return [(pcm, 25_000)]
+
+    def flush(self) -> list[tuple[bytes, int]]:
+        return []
+
+    def get_header(self) -> bytes | None:
+        return None
+
+    def reset(self) -> None:
+        self.reset_calls += 1
+        self.reset_overlapped_process |= self.in_process
+        # Unblock process() so an overlapping reset fails the test instead of hanging it.
+        self.release.set()
+
+
+class _ReleaseBeforeAcquire:
+    """Lock proxy that releases a parked transformer right before waiting for the lock."""
+
+    def __init__(self, lock: threading.Lock, release: threading.Event) -> None:
+        self._lock = lock
+        self._release = release
+
+    def __enter__(self) -> None:
+        self._release.set()
+        self._lock.acquire()
+
+    def __exit__(self, *_exc: object) -> None:
+        self._lock.release()
+
+
+def _blocking_transformer_stream(
+    mock_loop: Any,
+) -> tuple[PushStream, _DummyRole, _BlockingTransformer]:
+    transformer = _BlockingTransformer()
+    role = _DummyRole(
+        AudioRequirements(
+            sample_rate=48000,
+            bit_depth=16,
+            channels=2,
+            transformer=transformer,  # type: ignore[arg-type]
+            channel_id=MAIN_CHANNEL,
+            frame_duration_us=25_000,
+        )
+    )
+    group = _DummyGroup(clients=[])
+    group.clients.append(_DummyClient([role]))  # type: ignore[arg-type]
+    stream = PushStream(loop=mock_loop, clock=LoopClock(mock_loop), group=group)  # type: ignore[arg-type]
+    stream.prepare_audio(bytes(4800), AudioFormat(sample_rate=48000, bit_depth=16, channels=2))
+    return stream, role, transformer
+
+
+@pytest.mark.asyncio
+async def test_encode_runs_off_loop_and_stop_reset_waits_for_it(mock_loop: Any) -> None:
+    """Encoding runs on a worker thread, and stop() never resets a transformer mid-process()."""
+    stream, role, transformer = _blocking_transformer_stream(mock_loop)
+    commit_task = asyncio.create_task(stream.commit_audio())
+
+    # The loop keeps running while the worker is parked inside process().
+    assert await asyncio.to_thread(transformer.entered.wait, 5.0)
+    assert transformer.in_process
+    assert transformer.process_thread != threading.get_ident()
+
+    # The worker already holds the real lock; stop() goes through the proxy,
+    # which lets process() finish only once stop() is about to wait for it.
+    stream._transformer_lock = _ReleaseBeforeAcquire(  # type: ignore[assignment]  # noqa: SLF001
+        stream._transformer_lock,  # noqa: SLF001
+        transformer.release,
+    )
+    stream.stop()
+    await commit_task
+
+    assert transformer.reset_calls == 1
+    assert not transformer.reset_overlapped_process
+    assert role.received == []
+
+
+@pytest.mark.asyncio
+async def test_overlapping_commits_run_dsp_one_at_a_time_in_order(
+    mock_loop: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second commit waits for the first commit's worker before starting its own DSP."""
+    stream, role, transformer = _blocking_transformer_stream(mock_loop)
+    in_flight = 0
+    max_in_flight = 0
+    original_run_off_loop = push_stream_module._run_off_loop  # noqa: SLF001
+
+    async def _tracked_run_off_loop(func: Any, /, *args: object) -> Any:
+        nonlocal in_flight, max_in_flight
+        in_flight += 1
+        max_in_flight = max(max_in_flight, in_flight)
+        try:
+            return await original_run_off_loop(func, *args)
+        finally:
+            in_flight -= 1
+
+    monkeypatch.setattr(push_stream_module, "_run_off_loop", _tracked_run_off_loop)
+
+    first = asyncio.create_task(stream.commit_audio())
+    assert await asyncio.to_thread(transformer.entered.wait, 5.0)
+    stream.prepare_audio(bytes(4800), AudioFormat(sample_rate=48000, bit_depth=16, channels=2))
+    second = asyncio.create_task(stream.commit_audio())
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert in_flight == 1
+    assert stream._commit_dsp_lock.locked()  # noqa: SLF001
+
+    transformer.release.set()
+    first_start_us, second_start_us = await asyncio.gather(first, second)
+
+    assert max_in_flight == 1
+    assert first_start_us < second_start_us
+    assert [chunk.timestamp_us for chunk in role.received] == [first_start_us, second_start_us]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_commit_waits_for_its_worker(mock_loop: Any) -> None:
+    """Cancelling commit_audio() completes only once its worker thread has finished."""
+    stream, _role, transformer = _blocking_transformer_stream(mock_loop)
+    commit_task = asyncio.create_task(stream.commit_audio())
+    assert await asyncio.to_thread(transformer.entered.wait, 5.0)
+
+    for _ in range(2):
+        commit_task.cancel()
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert not commit_task.done()
+    assert stream._commit_in_flight == 1  # noqa: SLF001
+
+    transformer.release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await commit_task
+    assert not transformer.in_process
+    assert stream._commit_in_flight == 0  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_run_off_loop_retrieves_worker_error_after_cancel(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A worker that fails after its caller was cancelled is logged, not left unretrieved."""
+    entered = threading.Event()
+    release = threading.Event()
+
+    def _failing_worker() -> None:
+        entered.set()
+        release.wait()
+        raise ValueError("worker failed")
+
+    task = asyncio.create_task(push_stream_module._run_off_loop(_failing_worker))  # noqa: SLF001
+    assert await asyncio.to_thread(entered.wait, 5.0)
+    task.cancel()
+    await asyncio.sleep(0)
+    release.set()
+
+    with (
+        caplog.at_level("DEBUG", logger=push_stream_module.__name__),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await task
+    assert any(record.exc_info and record.exc_info[0] is ValueError for record in caplog.records)
 
 
 @pytest.mark.asyncio
@@ -1902,8 +2099,8 @@ async def test_late_join_uses_cached_chunks_across_role_recreation(mock_loop: An
 
 
 @pytest.mark.asyncio
-async def test_send_cached_chunks_keeps_chunk_overlapping_now(mock_loop: Any) -> None:
-    """Cached replay should keep/send chunks that overlap now, not only future chunks."""
+async def test_send_cached_chunks_skips_chunk_starting_in_the_past(mock_loop: Any) -> None:
+    """Cached replay sends only chunks whose start timestamp is still in the future."""
     group = _DummyGroup(clients=[])
     role = _DummyRole(
         AudioRequirements(
@@ -1935,8 +2132,7 @@ async def test_send_cached_chunks_keeps_chunk_overlapping_now(mock_loop: Any) ->
     stream._send_cached_chunks_to_role(  # noqa: SLF001
         role, [overlapping, future], now_us
     )
-    assert len(role.received) == 2
-    assert role.received[0].timestamp_us == overlapping.timestamp_us
+    assert [chunk.timestamp_us for chunk in role.received] == [future.timestamp_us]
 
 
 @pytest.mark.asyncio
@@ -2023,6 +2219,7 @@ def _make_connected_player_multi_format(
     hello = type("Hello", (), {})()
     hello.client_id = client_id
     hello.name = client_id
+    hello.device_info = None
     hello.player_support = ClientHelloPlayerSupport(
         supported_formats=[
             SupportedAudioFormat(
@@ -2055,20 +2252,87 @@ def _make_connected_player_multi_format(
     return client, conn
 
 
+def _format_state(sample_rate: int) -> ClientStatePayload:
+    """Return a client/state preferring PCM stereo 16-bit at `sample_rate`."""
+    return ClientStatePayload(
+        player=PlayerStatePayload(
+            format=SupportedAudioFormat(
+                codec=AudioCodec.PCM, channels=2, sample_rate=sample_rate, bit_depth=16
+            )
+        )
+    )
+
+
+class _JoiningGroup(_DummyGroup):
+    """Dummy group that joins a connected client's roles to the active stream."""
+
+    def on_client_connected(self, client: SendspinClient) -> None:
+        if self._push_stream is not None and not self._push_stream.is_stopped:
+            for role in client.active_roles:
+                if role.get_audio_requirements() is not None:
+                    self._push_stream.on_role_join(role)
+
+
+@pytest.mark.asyncio
+async def test_reconnect_announces_initial_state_format(
+    mock_loop: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reconnecting player's first stream/start carries its initial client/state format."""
+    group = _JoiningGroup(clients=[])
+    format_changes = MagicMock(wraps=group.on_role_format_changed)
+    monkeypatch.setattr(group, "on_role_format_changed", format_changes)
+    client, _conn = _make_connected_player_multi_format(mock_loop, group, "p1")
+    stream = PushStream(loop=mock_loop, clock=LoopClock(mock_loop), group=group)
+    group._push_stream = stream  # noqa: SLF001
+    group.has_active_stream = True
+    for _ in range(4):
+        stream.prepare_audio(
+            bytes(4800),
+            AudioFormat(sample_rate=48000, bit_depth=16, channels=2),
+        )
+        await stream.commit_audio()
+    role = client.role("player@v1")
+    assert role is not None
+    role.get_join_delay_s = MagicMock(return_value=0.0)  # type: ignore[method-assign]
+
+    hello = client.info
+    client.detach_connection(None)
+    conn = _FakeConnection()
+    client.attach_connection(
+        conn,
+        client_info=hello,
+        negotiated_roles=[Roles.PLAYER.value],
+        active_roles=[Roles.PLAYER.value],
+    )
+    dispatcher = SendspinConnection(
+        MagicMock(loop=mock_loop, clock=LoopClock(mock_loop)), wsock_client=MagicMock()
+    )
+    dispatcher._client = client  # noqa: SLF001
+    initial = _format_state(44100)
+    assert initial.player is not None
+    initial.available = True
+    initial.player.volume = 50
+    initial.player.muted = False
+    initial.player.output_delay_ms = 0
+    initial.player.required_lead_time_ms = 0
+    initial.player.min_buffer_ms = 0
+    initial.player.supported_commands = []
+
+    await dispatcher._handle_client_state(initial)  # noqa: SLF001
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    stream_starts = [msg for msg in conn.sent_json if isinstance(msg, StreamStartMessage)]
+    assert len(stream_starts) == 1
+    assert stream_starts[0].payload.player is not None
+    assert stream_starts[0].payload.player.sample_rate == 44100
+    assert conn.sent_binary
+    format_changes.assert_not_called()
+
+
 @pytest.mark.asyncio
 async def test_format_change_during_active_stream(mock_loop: Any) -> None:
-    """Mid-stream format change sends stream/start (deferred) with no stream/clear.
-
-    Full PushStream flow:
-    1. Create player with PCM 48kHz, start PushStream
-    2. Commit audio N times
-    3. Trigger format change via on_stream_request_format during active playback
-    4. Commit more audio
-    5. Assert: StreamStartMessage (with new format) in sent_json, NO StreamClearMessage
-    6. Binary audio continues after format change
-    7. Post-change audio resumes near now via new-format catch-up replay,
-       not at the pre-change tail
-    """
+    """A mid-stream format change continues the timeline after the last old-format chunk."""
     group = _DummyGroup(clients=[])
     client, conn = _make_connected_player_multi_format(mock_loop, group, "p1")
     clock = LoopClock(mock_loop)
@@ -2077,156 +2341,46 @@ async def test_format_change_during_active_stream(mock_loop: Any) -> None:
     group._push_stream = stream  # noqa: SLF001
     group.has_active_stream = True
 
-    # Commit enough 48kHz PCM that the channel tail runs well past the
-    # resume floor (25ms per chunk).
-    for _ in range(20):
+    # 30ms commits against 25ms frames leave the last frame ending inside a commit.
+    for _ in range(21):
         stream.prepare_audio(
-            bytes(4800),
+            bytes(5760),
             AudioFormat(sample_rate=48000, bit_depth=16, channels=2),
         )
         await stream.commit_audio()
 
     pre_change_binary_count = len(conn.sent_binary)
-    assert pre_change_binary_count > 0
-
-    # Record the last pre-change chunk's end timestamp
-    last_pre_header = unpack_binary_header(conn.sent_binary[-1])
-    # Duration of a 4800-byte PCM chunk at 48kHz stereo 16bit = 25ms = 25000us
-    pre_change_end_us = last_pre_header.timestamp_us + 25_000
-
-    # Clear sent_json to isolate format change messages
+    # A 4800-byte PCM frame at 48kHz stereo 16-bit lasts 25ms.
+    pre_change_end_us = unpack_player_audio_header(conn.sent_binary[-1]).timestamp_us + 25_000
     conn.sent_json.clear()
 
-    # Trigger mid-stream format change: PCM 48kHz -> PCM 44.1kHz
-    request = StreamRequestFormatPayload(
-        player=StreamRequestFormatPlayer(
-            codec=AudioCodec.PCM,
-            sample_rate=44100,
-            channels=2,
-            bit_depth=16,
-        )
-    )
     role = client.role("player@v1")
     assert role is not None
-    role.on_stream_request_format(request)
-
-    # No stream/clear. The stream/start may already have gone out with the
-    # first new-format catch-up chunk re-encoded by the join path.
-    assert not any(isinstance(msg, StreamClearMessage) for msg in conn.sent_json)
-
+    role.on_client_state(_format_state(44100))
     # Let the boundary-scheduled catch-up task deliver its replay chunks.
     for _ in range(5):
         await asyncio.sleep(0)
 
-    # Commit audio at the new format (44.1kHz)
-    # 1102 samples * 2 bytes * 2 channels = 4408 bytes (~24.99ms)
-    stream.prepare_audio(
-        bytes(4408),
-        AudioFormat(sample_rate=44100, bit_depth=16, channels=2),
-    )
-    await stream.commit_audio()
-
-    # Stream/start should now be sent (deferred until first chunk)
-    stream_starts = [msg for msg in conn.sent_json if isinstance(msg, StreamStartMessage)]
-    assert len(stream_starts) == 1
-    start_msg = stream_starts[0]
-    assert start_msg.payload.player is not None
-    assert start_msg.payload.player.sample_rate == 44100
-    assert start_msg.payload.player.codec == AudioCodec.PCM
-
-    # No stream/clear should have been sent
-    assert not any(isinstance(msg, StreamClearMessage) for msg in conn.sent_json)
-
-    # The change must evict queued old-format binary, as stream/clear does.
-    assert conn.dropped_pending_binary == [["player"]]
-
-    # Binary audio continued after the format change
-    assert len(conn.sent_binary) > pre_change_binary_count
-
-    # The client flushes its un-played buffer at the announcement, so the
-    # replacement audio must resume near now, not continue at the pre-change tail.
-    post_change_binary = conn.sent_binary[pre_change_binary_count:]
-    first_post_header = unpack_binary_header(post_change_binary[0])
-    now_us = clock.now_us()
-    assert now_us <= first_post_header.timestamp_us < pre_change_end_us, (
-        f"Post-change audio starts at {first_post_header.timestamp_us}us "
-        f"(now={now_us}us, pre-change tail={pre_change_end_us}us)"
-    )
-
-    # No old-format frames (9-byte header + 4800-byte 48kHz payload) may
-    # follow the boundary; replayed catch-up chunks are resampled to 44.1kHz
-    # so their exact size can vary slightly.
-    assert all(len(frame) != 9 + 4800 for frame in post_change_binary)
-
-
-@pytest.mark.asyncio
-async def test_format_flipflop_without_a_chunk_announces_the_return(mock_loop: Any) -> None:
-    """Returning to the last announced format must still announce the boundary.
-
-    Two requests with no chunk between them leave the client configured for
-    the format it is already playing, so the sent-format guard suppresses the
-    second stream/start. The boundary has meanwhile dropped the client's
-    queued audio and re-anchored near the playhead, so without the
-    announcement the client never flushes and plays the old buffer over the
-    replacement audio.
-    """
-    group = _DummyGroup(clients=[])
-    client, conn = _make_connected_player_multi_format(mock_loop, group, "p1")
-    clock = LoopClock(mock_loop)
-
-    stream = PushStream(loop=mock_loop, clock=clock, group=group)
-    group._push_stream = stream  # noqa: SLF001
-    group.has_active_stream = True
-
-    role = client.role("player@v1")
-    assert role is not None
-
-    def request_format(sample_rate: int) -> None:
-        role.on_stream_request_format(
-            StreamRequestFormatPayload(
-                player=StreamRequestFormatPlayer(
-                    codec=AudioCodec.PCM,
-                    sample_rate=sample_rate,
-                    channels=2,
-                    bit_depth=16,
-                )
-            )
-        )
-
-    for _ in range(20):
+    for _ in range(4):
         stream.prepare_audio(
-            bytes(4800),
+            bytes(5760),
             AudioFormat(sample_rate=48000, bit_depth=16, channels=2),
         )
         await stream.commit_audio()
 
-    pre_change_count = len(conn.sent_binary)
-    pre_change_end_us = unpack_binary_header(conn.sent_binary[-1]).timestamp_us + 25_000
-    conn.sent_json.clear()
-
-    request_format(44100)
-    request_format(48000)
-    for _ in range(5):
-        await asyncio.sleep(0)
-
-    stream.prepare_audio(
-        bytes(4800),
-        AudioFormat(sample_rate=48000, bit_depth=16, channels=2),
-    )
-    await stream.commit_audio()
-
-    post_change_binary = conn.sent_binary[pre_change_count:]
-    assert post_change_binary
-    first_post_header = unpack_binary_header(post_change_binary[0])
-    assert first_post_header.timestamp_us < pre_change_end_us
-
     stream_starts = [msg for msg in conn.sent_json if isinstance(msg, StreamStartMessage)]
-    assert len(stream_starts) == 1, (
-        f"Audio re-anchored to {first_post_header.timestamp_us}us behind the "
-        f"{pre_change_end_us}us tail with {len(stream_starts)} stream/start(s)"
-    )
+    assert len(stream_starts) == 1
     assert stream_starts[0].payload.player is not None
-    assert stream_starts[0].payload.player.sample_rate == 48000
+    assert stream_starts[0].payload.player.sample_rate == 44100
+    assert not any(isinstance(msg, StreamClearMessage) for msg in conn.sent_json)
+    assert conn.dropped_pending_binary == []
+
+    post_change_binary = conn.sent_binary[pre_change_binary_count:]
+    assert post_change_binary
+    assert all(len(frame) != PLAYER_AUDIO_HEADER_SIZE + 4800 for frame in post_change_binary)
+    timestamps = [unpack_player_audio_header(frame).timestamp_us for frame in post_change_binary]
+    assert timestamps[0] == pre_change_end_us
+    assert timestamps == sorted(set(timestamps))
 
 
 @pytest.mark.asyncio
@@ -2240,7 +2394,8 @@ async def test_format_change_during_inflight_commit_aborts_old_format_delivery(
     its first await, so a request processed during resampling previously let
     the commit deliver old-format chunks behind a stream/start built from the
     NEW requirements. The boundary synchronously defers the role to the join
-    path, which excludes it from that commit's live delivery.
+    path, which excludes it from that commit's live delivery and re-encodes
+    that commit's audio in the new format.
     """
     group = _DummyGroup(clients=[])
     client, conn = _make_connected_player_multi_format(mock_loop, group, "p1")
@@ -2264,6 +2419,7 @@ async def test_format_change_during_inflight_commit_aborts_old_format_delivery(
     old_tkey = stream._build_transform_key(  # noqa: SLF001
         role.get_audio_requirements(), MAIN_CHANNEL, role
     )
+    pre_change_end_us = unpack_player_audio_header(conn.sent_binary[-1]).timestamp_us + 25_000
     conn.sent_json.clear()
     conn.sent_binary.clear()
 
@@ -2280,16 +2436,7 @@ async def test_format_change_during_inflight_commit_aborts_old_format_delivery(
         nonlocal format_request_fired
         if not format_request_fired:
             format_request_fired = True
-            role.on_stream_request_format(
-                StreamRequestFormatPayload(
-                    player=StreamRequestFormatPlayer(
-                        codec=AudioCodec.PCM,
-                        sample_rate=44100,
-                        channels=2,
-                        bit_depth=16,
-                    )
-                )
-            )
+            role.on_client_state(_format_state(44100))
         return await original_resample(*args, **kwargs)
 
     monkeypatch.setattr(stream, "_resample_for_roles", resample_with_midflight_format_change)
@@ -2300,27 +2447,25 @@ async def test_format_change_during_inflight_commit_aborts_old_format_delivery(
     for _ in range(5):
         await asyncio.sleep(0)
 
-    # The changer gets only new-format replay from the boundary-scheduled
-    # join; the excluded commit must not have delivered old-format frames.
-    assert conn.sent_binary
-    assert all(len(frame) != 9 + 4800 for frame in conn.sent_binary)
-
-    # Nor may the excluded commit repopulate the evicted old-format cache.
+    # The excluded commit must not repopulate the evicted old-format cache.
     assert not stream._role_chunk_cache.get(old_tkey)  # noqa: SLF001
 
-    # The next commit delivers the deferred stream/start, then only new-format audio.
     stream.prepare_audio(
         bytes(4408),
         AudioFormat(sample_rate=44100, bit_depth=16, channels=2),
     )
     await stream.commit_audio()
+    for _ in range(5):
+        await asyncio.sleep(0)
 
     stream_starts = [msg for msg in conn.sent_json if isinstance(msg, StreamStartMessage)]
     assert len(stream_starts) == 1
     assert stream_starts[0].payload.player is not None
     assert stream_starts[0].payload.player.sample_rate == 44100
+    # Only new-format audio follows, re-encoded from where the last old-format chunk ended.
     assert conn.sent_binary
-    assert all(len(frame) != 9 + 4800 for frame in conn.sent_binary)
+    assert all(len(frame) != PLAYER_AUDIO_HEADER_SIZE + 4800 for frame in conn.sent_binary)
+    assert unpack_player_audio_header(conn.sent_binary[0]).timestamp_us == pre_change_end_us
 
 
 @pytest.mark.asyncio
@@ -2371,16 +2516,7 @@ async def test_format_change_preserves_peer_audio(
         nonlocal fired
         if not fired:
             fired = True
-            role_a.on_stream_request_format(
-                StreamRequestFormatPayload(
-                    player=StreamRequestFormatPlayer(
-                        codec=AudioCodec.PCM,
-                        sample_rate=44100,
-                        channels=2,
-                        bit_depth=16,
-                    )
-                )
-            )
+            role_a.on_client_state(_format_state(44100))
         return await original_resample(*args, **kwargs)
 
     monkeypatch.setattr(stream, "_resample_for_roles", resample_with_midflight_format_change)
@@ -2393,14 +2529,101 @@ async def test_format_change_preserves_peer_audio(
     # stream/start disruption of its own.
     peer_chunks = conn_b.sent_binary[peer_chunks_before:]
     assert len(peer_chunks) == 1
-    assert len(peer_chunks[0]) == 9 + 4800
-    prev_header = unpack_binary_header(conn_b.sent_binary[peer_chunks_before - 1])
-    this_header = unpack_binary_header(peer_chunks[0])
+    assert len(peer_chunks[0]) == PLAYER_AUDIO_HEADER_SIZE + 4800
+    prev_header = unpack_player_audio_header(conn_b.sent_binary[peer_chunks_before - 1])
+    this_header = unpack_player_audio_header(peer_chunks[0])
     assert this_header.timestamp_us == prev_header.timestamp_us + 25_000
     assert not any(isinstance(msg, StreamStartMessage) for msg in conn_b.sent_json)
 
     # The changing player got no old-format frame behind its boundary.
-    assert all(len(frame) != 9 + 4800 for frame in conn_a.sent_binary[peer_chunks_before:])
+    assert all(
+        len(frame) != PLAYER_AUDIO_HEADER_SIZE + 4800
+        for frame in conn_a.sent_binary[peer_chunks_before:]
+    )
+
+
+@pytest.mark.asyncio
+async def test_format_change_onto_a_peer_format_resends_no_audio(mock_loop: Any) -> None:
+    """Switching to the format a peer already streams sends nothing before the old end."""
+    group = _DummyGroup(clients=[])
+    client_a, conn_a = _make_connected_player_multi_format(mock_loop, group, "p1")
+    client_b, _conn_b = _make_connected_player_multi_format(mock_loop, group, "p2")
+    stream = PushStream(loop=mock_loop, clock=LoopClock(mock_loop), group=group)
+    group._push_stream = stream  # noqa: SLF001
+    group.has_active_stream = True
+    role_a = client_a.role("player@v1")
+    role_b = client_b.role("player@v1")
+    assert role_a is not None
+    assert role_b is not None
+    role_b.on_client_state(_format_state(44100))
+
+    for _ in range(20):
+        stream.prepare_audio(
+            bytes(4800),
+            AudioFormat(sample_rate=48000, bit_depth=16, channels=2),
+        )
+        await stream.commit_audio()
+    pre_change_count = len(conn_a.sent_binary)
+    pre_change_end_us = unpack_player_audio_header(conn_a.sent_binary[-1]).timestamp_us + 25_000
+
+    role_a.on_client_state(_format_state(44100))
+    for _ in range(5):
+        await asyncio.sleep(0)
+    for _ in range(4):
+        stream.prepare_audio(
+            bytes(4800),
+            AudioFormat(sample_rate=48000, bit_depth=16, channels=2),
+        )
+        await stream.commit_audio()
+
+    timestamps = [
+        unpack_player_audio_header(frame).timestamp_us
+        for frame in conn_a.sent_binary[pre_change_count:]
+    ]
+    assert timestamps
+    assert all(timestamp_us >= pre_change_end_us for timestamp_us in timestamps)
+
+
+@pytest.mark.asyncio
+async def test_format_change_into_a_peer_catch_up_resends_no_audio(mock_loop: Any) -> None:
+    """Joining the catch-up a late peer started sends nothing before the old end."""
+    group = _DummyGroup(clients=[])
+    client_a, conn_a = _make_connected_player_multi_format(mock_loop, group, "p1")
+    stream = PushStream(loop=mock_loop, clock=LoopClock(mock_loop), group=group)
+    group._push_stream = stream  # noqa: SLF001
+    group.has_active_stream = True
+    for _ in range(20):
+        stream.prepare_audio(
+            bytes(4800),
+            AudioFormat(sample_rate=48000, bit_depth=16, channels=2),
+        )
+        await stream.commit_audio()
+    pre_change_count = len(conn_a.sent_binary)
+    pre_change_end_us = unpack_player_audio_header(conn_a.sent_binary[-1]).timestamp_us + 25_000
+
+    client_b, _conn_b = _make_connected_player_multi_format(mock_loop, group, "p2")
+    role_a = client_a.role("player@v1")
+    role_b = client_b.role("player@v1")
+    assert role_a is not None
+    assert role_b is not None
+    # The peer's switch starts a near-playhead catch-up that the player then joins.
+    role_b.on_client_state(_format_state(44100))
+    role_a.on_client_state(_format_state(44100))
+    for _ in range(5):
+        await asyncio.sleep(0)
+    for _ in range(4):
+        stream.prepare_audio(
+            bytes(4800),
+            AudioFormat(sample_rate=48000, bit_depth=16, channels=2),
+        )
+        await stream.commit_audio()
+
+    timestamps = [
+        unpack_player_audio_header(frame).timestamp_us
+        for frame in conn_a.sent_binary[pre_change_count:]
+    ]
+    assert timestamps
+    assert all(timestamp_us >= pre_change_end_us for timestamp_us in timestamps)
 
 
 # --- Historical Audio Tests ---
@@ -3088,14 +3311,14 @@ async def test_multi_role_fanout_quantizes_once_per_pcm_key(
     group.clients.extend([_DummyClient([role1]), _DummyClient([role2])])
 
     quantize_calls = 0
-    original_quantizer = push_stream_module._quantize_float_pcm  # noqa: SLF001
+    original_quantizer = push_stream_module._quantizer_state  # noqa: SLF001
 
     def _counted_quantizer(**kwargs: Any) -> object:
         nonlocal quantize_calls
         quantize_calls += 1
         return original_quantizer(**kwargs)
 
-    monkeypatch.setattr(push_stream_module, "_quantize_float_pcm", _counted_quantizer)
+    monkeypatch.setattr(push_stream_module, "_quantizer_state", _counted_quantizer)
 
     stream = PushStream(loop=mock_loop, clock=LoopClock(mock_loop), group=group)
     stream.prepare_audio(
@@ -3629,15 +3852,15 @@ def test_soxr_fallback_caches_failure_per_format(
 
 
 # ---------------------------------------------------------------------------
-# Static delay send-ahead budget tests
+# Output delay send-ahead budget tests
 # ---------------------------------------------------------------------------
 
-_STATIC_DELAY_US = 5_000_000  # 5 s
+_OUTPUT_DELAY_US = 5_000_000  # 5 s
 
 
 def _make_role(
     *,
-    static_delay_us: int = 0,
+    output_delay_us: int = 0,
     required_lead_time_us: int = DEFAULT_INITIAL_DELAY_US,
     min_buffer_us: int = 0,
     channel_id: UUID = MAIN_CHANNEL,
@@ -3651,19 +3874,19 @@ def _make_role(
             channel_id=channel_id,
             frame_duration_us=25_000,
         ),
-        static_delay_us=static_delay_us,
+        output_delay_us=output_delay_us,
         required_lead_time_us=required_lead_time_us,
         min_buffer_us=min_buffer_us,
     )
 
 
 @pytest.mark.asyncio
-async def test_commit_audio_bootstrap_includes_static_delay() -> None:
+async def test_commit_audio_bootstrap_includes_output_delay() -> None:
     """First commit with a large-delay player pushes timeline forward."""
     loop = asyncio.get_running_loop()
     clock = ManualClock(now_us_value=1_000_000)
     group = _DummyGroup(clients=[])
-    role = _make_role(static_delay_us=_STATIC_DELAY_US)
+    role = _make_role(output_delay_us=_OUTPUT_DELAY_US)
     group.clients.append(_DummyClient([role]))
 
     stream = PushStream(loop=loop, clock=clock, group=group)
@@ -3671,17 +3894,17 @@ async def test_commit_audio_bootstrap_includes_static_delay() -> None:
     stream.prepare_audio(bytes(4800), fmt)
     play_start = await stream.commit_audio()
 
-    assert play_start >= clock.now_us() + DEFAULT_INITIAL_DELAY_US + _STATIC_DELAY_US
+    assert play_start >= clock.now_us() + DEFAULT_INITIAL_DELAY_US + _OUTPUT_DELAY_US
 
 
 @pytest.mark.asyncio
-async def test_mixed_delay_timeline_uses_largest_static_delay() -> None:
+async def test_mixed_delay_timeline_uses_largest_output_delay() -> None:
     """With 0 ms and 5 s delay players, timeline anchored for the largest."""
     loop = asyncio.get_running_loop()
     clock = ManualClock(now_us_value=1_000_000)
     group = _DummyGroup(clients=[])
-    role_fast = _make_role(static_delay_us=0)
-    role_slow = _make_role(static_delay_us=_STATIC_DELAY_US)
+    role_fast = _make_role(output_delay_us=0)
+    role_slow = _make_role(output_delay_us=_OUTPUT_DELAY_US)
     group.clients.extend([_DummyClient([role_fast]), _DummyClient([role_slow])])
 
     stream = PushStream(loop=loop, clock=clock, group=group)
@@ -3689,7 +3912,7 @@ async def test_mixed_delay_timeline_uses_largest_static_delay() -> None:
     stream.prepare_audio(bytes(4800), fmt)
     play_start = await stream.commit_audio()
 
-    assert play_start >= clock.now_us() + DEFAULT_INITIAL_DELAY_US + _STATIC_DELAY_US
+    assert play_start >= clock.now_us() + DEFAULT_INITIAL_DELAY_US + _OUTPUT_DELAY_US
 
 
 @pytest.mark.asyncio
@@ -3698,7 +3921,7 @@ async def test_commit_audio_uses_reported_lead_time() -> None:
     loop = asyncio.get_running_loop()
     clock = ManualClock(now_us_value=1_000_000)
     group = _DummyGroup(clients=[])
-    role = _make_role(required_lead_time_us=50_000, min_buffer_us=0, static_delay_us=0)
+    role = _make_role(required_lead_time_us=50_000, min_buffer_us=0, output_delay_us=0)
     group.clients.append(_DummyClient([role]))
 
     stream = PushStream(loop=loop, clock=clock, group=group)
@@ -3715,7 +3938,7 @@ async def test_commit_audio_min_buffer_floors_send_ahead() -> None:
     loop = asyncio.get_running_loop()
     clock = ManualClock(now_us_value=1_000_000)
     group = _DummyGroup(clients=[])
-    role = _make_role(required_lead_time_us=50_000, min_buffer_us=2_000_000, static_delay_us=0)
+    role = _make_role(required_lead_time_us=50_000, min_buffer_us=2_000_000, output_delay_us=0)
     group.clients.append(_DummyClient([role]))
 
     stream = PushStream(loop=loop, clock=clock, group=group)
@@ -3733,7 +3956,7 @@ async def test_buffered_source_floors_at_min_buffer_at_startup() -> None:
     loop = asyncio.get_running_loop()
     clock = ManualClock(now_us_value=1_000_000)
     group = _DummyGroup(clients=[])
-    role = _make_role(required_lead_time_us=0, min_buffer_us=15_000_000, static_delay_us=0)
+    role = _make_role(required_lead_time_us=0, min_buffer_us=15_000_000, output_delay_us=0)
     group.clients.append(_DummyClient([role]))
 
     stream = PushStream(loop=loop, clock=clock, group=group)
@@ -3752,7 +3975,7 @@ async def test_explicit_play_start_us_overrides_stale_channel_timing() -> None:
     loop = asyncio.get_running_loop()
     clock = ManualClock(now_us_value=1_000_000)
     group = _DummyGroup(clients=[])
-    role = _make_role(required_lead_time_us=0, min_buffer_us=0, static_delay_us=0)
+    role = _make_role(required_lead_time_us=0, min_buffer_us=0, output_delay_us=0)
     group.clients.append(_DummyClient([role]))
 
     stream = PushStream(loop=loop, clock=clock, group=group)
@@ -3783,9 +4006,9 @@ async def test_send_ahead_uses_largest_member_budget() -> None:
     loop = asyncio.get_running_loop()
     clock = ManualClock(now_us_value=1_000_000)
     group = _DummyGroup(clients=[])
-    role_low = _make_role(required_lead_time_us=100_000, min_buffer_us=0, static_delay_us=0)
+    role_low = _make_role(required_lead_time_us=100_000, min_buffer_us=0, output_delay_us=0)
     role_high = _make_role(
-        required_lead_time_us=0, min_buffer_us=1_500_000, static_delay_us=200_000
+        required_lead_time_us=0, min_buffer_us=1_500_000, output_delay_us=200_000
     )
     group.clients.extend([_DummyClient([role_low]), _DummyClient([role_high])])
 
@@ -3800,18 +4023,18 @@ async def test_send_ahead_uses_largest_member_budget() -> None:
 
 
 @pytest.mark.asyncio
-async def test_sleep_to_limit_buffer_accounts_for_static_delay() -> None:
-    """Buffer throttle allows extra lead equal to the largest static delay."""
+async def test_sleep_to_limit_buffer_accounts_for_output_delay() -> None:
+    """Buffer throttle allows extra lead equal to the largest output delay."""
     loop = asyncio.get_running_loop()
     clock = ManualClock(now_us_value=1_000_000)
     group = _DummyGroup(clients=[])
-    role = _make_role(static_delay_us=_STATIC_DELAY_US)
+    role = _make_role(output_delay_us=_OUTPUT_DELAY_US)
     group.clients.append(_DummyClient([role]))
 
     stream = PushStream(loop=loop, clock=clock, group=group)
-    # Timeline 5.25 s ahead — exactly DEFAULT + static_delay
+    # Timeline 5.25 s ahead — exactly DEFAULT + output_delay
     stream._channel_timing[MAIN_CHANNEL] = (  # noqa: SLF001
-        clock.now_us() + DEFAULT_INITIAL_DELAY_US + _STATIC_DELAY_US
+        clock.now_us() + DEFAULT_INITIAL_DELAY_US + _OUTPUT_DELAY_US
     )
 
     # With a 500 ms base buffer, effective limit = 500 ms + 5 s = 5.5 s.
@@ -3821,13 +4044,13 @@ async def test_sleep_to_limit_buffer_accounts_for_static_delay() -> None:
 
 
 @pytest.mark.asyncio
-async def test_historical_stale_filter_includes_static_delay() -> None:
-    """Historical chunk between DEFAULT and DEFAULT+static_delay is filtered."""
+async def test_historical_stale_filter_includes_output_delay() -> None:
+    """Historical chunk between DEFAULT and DEFAULT+output_delay is filtered."""
     loop = asyncio.get_running_loop()
     clock = ManualClock(now_us_value=1_000_000)
     channel = UUID("cccccccc-cccc-cccc-cccc-cccccccccccc")
     group = _DummyGroup(clients=[])
-    role = _make_role(static_delay_us=_STATIC_DELAY_US, channel_id=channel)
+    role = _make_role(output_delay_us=_OUTPUT_DELAY_US, channel_id=channel)
     group.clients.append(_DummyClient([role]))
 
     stream = PushStream(loop=loop, clock=clock, group=group)
@@ -3850,7 +4073,7 @@ async def test_zero_delay_regression_commit_audio_unchanged() -> None:
     loop = asyncio.get_running_loop()
     clock = ManualClock(now_us_value=1_000_000)
     group = _DummyGroup(clients=[])
-    role = _make_role(static_delay_us=0)
+    role = _make_role(output_delay_us=0)
     group.clients.append(_DummyClient([role]))
 
     stream = PushStream(loop=loop, clock=clock, group=group)

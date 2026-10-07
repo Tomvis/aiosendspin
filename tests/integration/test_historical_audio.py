@@ -8,9 +8,13 @@ from uuid import UUID
 
 import pytest
 
-from aiosendspin.models import unpack_binary_header
 from aiosendspin.models.core import StreamStartMessage
-from aiosendspin.models.player import ClientHelloPlayerSupport, SupportedAudioFormat
+from aiosendspin.models.player import (
+    ClientHelloPlayerSupport,
+    SupportedAudioFormat,
+    pack_player_audio_header,
+    unpack_player_audio_header,
+)
 from aiosendspin.models.types import AudioCodec, PlayerCommand, Roles
 from aiosendspin.server.audio import AudioFormat
 from aiosendspin.server.audio_transformers import TransformerPool
@@ -40,6 +44,11 @@ class _DummyGroup:
     def __init__(self, clients: list[SendspinClient]) -> None:
         self.clients = clients
         self.transformer_pool = TransformerPool()
+
+    group_name = "dummy group"
+
+    def _publish_if_name_changed(self, previous: str) -> None:  # noqa: ARG002
+        return
 
     def on_client_connected(self, client: SendspinClient) -> None:  # noqa: ARG002
         return
@@ -74,12 +83,16 @@ class _CaptureConnection:
         data: bytes,
         *,
         role: str,  # noqa: ARG002
-        timestamp_us: int,  # noqa: ARG002
+        timestamp_us: int,
         message_type: int,  # noqa: ARG002
         buffer_end_time_us: int | None = None,
         buffer_byte_count: int | None = None,
         duration_us: int | None = None,
+        player_audio_header: bool = False,
+        epoch_exempt: bool = False,  # noqa: ARG002
     ) -> bool:
+        if player_audio_header:
+            data = pack_player_audio_header(timestamp_us, 0) + data
         self.sent_binary.append(data)
         if (
             self.buffer_tracker is not None
@@ -106,6 +119,7 @@ def _make_connected_player(
     hello = type("Hello", (), {})()
     hello.client_id = client_id
     hello.name = client_id
+    hello.device_info = None
     hello.player_support = ClientHelloPlayerSupport(
         supported_formats=[
             SupportedAudioFormat(
@@ -209,7 +223,7 @@ async def test_historical_injection_enables_seamless_late_join() -> None:
     # New channel client should have received stream/start and audio
     assert any(isinstance(m, StreamStartMessage) for m in conn_new.sent_json)
     assert conn_new.sent_binary, "New channel client should have received historical + live audio"
-    first_chunk_ts = unpack_binary_header(conn_new.sent_binary[0]).timestamp_us
+    first_chunk_ts = unpack_player_audio_header(conn_new.sent_binary[0]).timestamp_us
     assert first_chunk_ts >= join_now_us
     assert first_chunk_ts - join_now_us <= 1_000_000
 

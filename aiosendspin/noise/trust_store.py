@@ -4,16 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 from abc import ABC, abstractmethod
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Final
 
-from aiosendspin.models.types import PairMethod, TrustLevel
+from aiosendspin.models.types import PairMethod
 
 from .keys import (
     PSK_SIZE,
@@ -24,12 +26,16 @@ from .keys import (
 )
 from .pairing_code import is_valid_static_pairing_code
 
-# Dynamic pairing-code pairing escalates to gesture-gating when its failure counter reaches
-# this value.
-PAIRING_CODE_ESCALATION_THRESHOLD: Final[int] = 5
+# Dynamic-pairing-code rounds since the last verified server_kc after which the client aborts
+# instead of retrying and holds attempts back until an operator action.
+PAIRING_ROUND_LIMIT: Final[int] = 20
+
+# Per-server pairing records a client store holds before a new pairing evicts one.
+_MIN_RECORD_CAPACITY: Final[int] = 5
+_DEFAULT_RECORD_CAPACITY: Final[int] = 16
 
 __all__ = [
-    "PAIRING_CODE_ESCALATION_THRESHOLD",
+    "PAIRING_ROUND_LIMIT",
     "ClientPairingConfig",
     "ClientPairingRecord",
     "ClientPairingStore",
@@ -43,11 +49,10 @@ __all__ = [
     "ServerPairingRecord",
     "ServerPairingStore",
     "StagedPairingPsk",
-    "StorageExhaustedError",
-    "StorageReport",
-    "TrustLevel",
     "TrustedUnpairedClient",
 ]
+
+logger = logging.getLogger(__name__)
 
 
 class PskCategory(StrEnum):
@@ -60,19 +65,29 @@ class PskCategory(StrEnum):
     SENTINEL = "sentinel"
     """The published Sentinel PSK — used for pairing-code pairing and unpaired playback."""
 
+    @property
+    def code(self) -> str:
+        """The two-letter identifier this category travels under in Noise message 1."""
+        return _PSK_CATEGORY_CODES[self]
 
-class StorageExhaustedError(Exception):
-    """A pairing cannot persist its record and has no shared-PSK fallback."""
+    @classmethod
+    def from_code(cls, code: str) -> PskCategory | None:
+        """Return the category a Noise message 1 code names, or None if it names none."""
+        return _PSK_CATEGORIES_BY_CODE.get(code)
 
 
-@dataclass(frozen=True, slots=True)
-class StorageReport:
-    """A bounded client's record-storage accounting."""
+# The wire codes are deliberately equal-length, so the encrypted payload's length does not
+# reveal which category the server referenced.
+_PSK_CATEGORY_CODES: dict[PskCategory, str] = {
+    PskCategory.LONG_TERM: "lt",
+    PskCategory.PAIRING: "pr",
+    PskCategory.SENTINEL: "sn",
+}
+_PSK_CATEGORIES_BY_CODE: dict[str, PskCategory] = {c: k for k, c in _PSK_CATEGORY_CODES.items()}
 
-    capacity: int
-    free: int
-    cost_individual: int
-    cost_shared: int
+
+class _UnknownPairMethodError(ValueError):
+    """A stored record names a pair method this version does not recognise."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,9 +162,11 @@ class ClientPairingRecord:
 
     psk_id: str
     psk: bytes
-    server_id: str | None = None
+    server_id: str
     used: bool = False
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    last_used_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    """When a handshake last matched this record; eviction picks the oldest."""
 
     def __post_init__(self) -> None:
         """Validate the PSK size."""
@@ -167,17 +184,23 @@ class ClientPairingRecord:
             "server_id": self.server_id,
             "used": self.used,
             "created_at": self.created_at.isoformat(),
+            "last_used_at": self.last_used_at.isoformat(),
         }
 
     @classmethod
     def from_dict(cls, data: Mapping[str, object]) -> ClientPairingRecord:
         """Reconstruct a record from ``to_dict`` output."""
+        created_at = datetime.fromisoformat(_str(data, "created_at"))
+        last_used_at = _opt_str(data, "last_used_at")
         return cls(
             psk_id=_str(data, "psk_id"),
             psk=b64url_decode(_str(data, "psk")),
-            server_id=_opt_str(data, "server_id"),
+            server_id=_str(data, "server_id"),
             used=_bool(data, "used"),
-            created_at=datetime.fromisoformat(_str(data, "created_at")),
+            created_at=created_at,
+            last_used_at=(
+                datetime.fromisoformat(last_used_at) if last_used_at is not None else created_at
+            ),
         )
 
 
@@ -185,32 +208,25 @@ class ClientPairingRecord:
 class ClientPairingConfig:
     """Pairing policy a client persists."""
 
-    pairing_psk_enabled: bool = True
     dynamic_pairing_code_enabled: bool = True
     static_pairing_code_enabled: bool = False
     unpaired_access_enabled: bool = False
-    record_mode_psk_id: str
-    """Shared-PSK record used as the storage-exhaustion fallback when pairing."""
 
     def to_dict(self) -> dict[str, object]:
         """Serialize to a JSON-friendly dict."""
         return {
-            "pairing_psk_enabled": self.pairing_psk_enabled,
             "dynamic_pin_enabled": self.dynamic_pairing_code_enabled,
             "static_pin_enabled": self.static_pairing_code_enabled,
             "unpaired_access_enabled": self.unpaired_access_enabled,
-            "record_mode_psk_id": self.record_mode_psk_id,
         }
 
     @classmethod
     def from_dict(cls, data: Mapping[str, object]) -> ClientPairingConfig:
         """Reconstruct from ``to_dict`` output (defaults for absent keys)."""
         return cls(
-            pairing_psk_enabled=_bool(data, "pairing_psk_enabled", default=True),
             dynamic_pairing_code_enabled=_bool(data, "dynamic_pin_enabled", default=True),
             static_pairing_code_enabled=_bool(data, "static_pin_enabled", default=False),
             unpaired_access_enabled=_bool(data, "unpaired_access_enabled", default=False),
-            record_mode_psk_id=_str(data, "record_mode_psk_id"),
         )
 
 
@@ -361,6 +377,11 @@ class ServerPairingStore(ABC):
 class ClientPairingStore(ABC):
     """Pairing state a client holds: long-term records plus its accepted Pairing PSKs."""
 
+    @property
+    def record_capacity(self) -> int:
+        """Return how many per-server records the store holds before a pairing evicts one."""
+        return _DEFAULT_RECORD_CAPACITY
+
     @abstractmethod
     async def resolve_by_psk_id(self, psk_id: str) -> ResolvedPsk | None:
         """Resolve a ``psk_id`` to its PSK for the handshake, or ``None``."""
@@ -371,7 +392,7 @@ class ClientPairingStore(ABC):
 
     @abstractmethod
     async def record_by_server_id(self, server_id: str) -> ClientPairingRecord | None:
-        """Return the stored-pubkey record bound to ``server_id``, if any."""
+        """Return the newest stored-pubkey record bound to ``server_id``, if any."""
 
     @abstractmethod
     async def store_record(self, record: ClientPairingRecord) -> None:
@@ -383,7 +404,7 @@ class ClientPairingStore(ABC):
 
     @abstractmethod
     async def mark_record_used(self, psk_id: str) -> None:
-        """Flag the record at ``psk_id`` as used (no-op if absent)."""
+        """Flag the record at ``psk_id`` as used now (no-op if absent)."""
 
     @abstractmethod
     async def list_records(self) -> Sequence[ClientPairingRecord]:
@@ -422,22 +443,22 @@ class ClientPairingStore(ABC):
         """Return the configured static pairing code, if any."""
 
     @abstractmethod
-    async def pairing_code_failure_count(self) -> int:
-        """Return the persisted dynamic-pairing-code failure count."""
+    async def pairing_round_count(self) -> int:
+        """Return the persisted dynamic-pairing-code round count since the last ``server_kc``."""
 
     @abstractmethod
-    async def record_pairing_code_failure(self) -> int:
-        """Increment the dynamic-pairing-code failure counter and return the new count."""
+    async def record_pairing_round(self) -> int:
+        """Count one more dynamic-pairing-code round and return the new count."""
 
     @abstractmethod
-    async def reset_pairing_code_failures(self) -> None:
-        """Reset the dynamic-pairing-code failure counter to zero (on ``server_kc`` success)."""
+    async def reset_pairing_rounds(self) -> None:
+        """Reset the round count to zero (on a verified ``server_kc`` or an operator action)."""
 
     @abstractmethod
-    async def is_pairing_code_escalated(self) -> bool:
-        """Return whether dynamic pairing code is escalated to gesture-gating.
+    async def is_pairing_round_limit_reached(self) -> bool:
+        """Return whether the round count has reached ``PAIRING_ROUND_LIMIT``.
 
-        Escalation begins when the failure count reaches the threshold.
+        While it has, the client aborts instead of retrying and holds attempts back.
         """
 
     @abstractmethod
@@ -448,71 +469,72 @@ class ClientPairingStore(ABC):
     async def set_last_playback_server_id(self, server_id: str | None) -> None:
         """Persist the last-playback server id."""
 
-    async def can_store_record(self) -> bool:
-        """Return whether the store can persist another record (default: unlimited)."""
-        return True
-
-    async def storage_accounting(self) -> StorageReport | None:
-        """Return record-storage accounting, or ``None`` if storage is unbounded/unknown."""
-        return None
-
     async def resolve_pairing_outcome(
         self,
         *,
         server_id: str,
-    ) -> tuple[bytes, ClientPairingRecord | None]:
-        """Decide a pairing's outcome: a fresh per-server record, or the shared-PSK fallback."""
-        if await self.can_store_record():
-            psk = generate_psk()
-            record = ClientPairingRecord(
-                psk_id=psk_id_for(psk),
-                psk=psk,
-                server_id=server_id,
-            )
-            return psk, record
-        # Storage exhausted: admit under the shared-PSK fallback record.
-        psk_id = (await self.get_pairing_config()).record_mode_psk_id
-        resolved = await self.resolve_by_psk_id(psk_id)
-        if resolved is None or not _is_shared_record(resolved):
-            msg = f"shared-PSK fallback record {psk_id!r} is missing or not shared"
-            raise StorageExhaustedError(msg)
-        return resolved.psk, None
-
-    async def set_record_mode_psk_id(self, psk_id: str) -> None:
-        """Set the shared-PSK fallback record; ``psk_id`` must name a shared record."""
-        resolved = await self.resolve_by_psk_id(psk_id)
-        if resolved is None:
-            msg = f"record_mode psk_id {psk_id!r} references no record"
-            raise ValueError(msg)
-        if not _is_shared_record(resolved):
-            msg = f"record_mode psk_id {psk_id!r} must reference a shared-PSK record"
-            raise ValueError(msg)
-        config = await self.get_pairing_config()
-        await self.store_pairing_config(replace(config, record_mode_psk_id=psk_id))
-
-    async def _record_mode_references(self, psk_id: str) -> bool:
-        """Return whether the record_mode fallback references ``psk_id``."""
-        return (await self.get_pairing_config()).record_mode_psk_id == psk_id
-
-    async def can_remove_record(self, psk_id: str) -> bool:
-        """Return whether the record at ``psk_id`` may be removed (not record_mode-referenced)."""
-        return not await self._record_mode_references(psk_id)
-
-    async def replace_record_for_server_id(self, record: ClientPairingRecord) -> None:
-        """Persist ``record``, dropping any prior removable record bound to the same server."""
-        stale = (
-            [
-                existing.psk_id
-                for existing in await self.list_records()
-                if existing.server_id == record.server_id and existing.psk_id != record.psk_id
-            ]
-            if record.server_id is not None
-            else []
+    ) -> tuple[bytes, ClientPairingRecord]:
+        """Decide a pairing's outcome: a fresh per-server record."""
+        psk = generate_psk()
+        record = ClientPairingRecord(
+            psk_id=psk_id_for(psk),
+            psk=psk,
+            server_id=server_id,
         )
+        return psk, record
+
+    async def replace_record_for_server_id(
+        self, record: ClientPairingRecord, *, protected: AbstractSet[str] = frozenset()
+    ) -> None:
+        """Persist ``record``, dropping any prior record bound to the same server.
+
+        Records whose ``psk_id`` is in ``protected`` (the records backing open connections)
+        are never removed, even the same server's prior record. Past ``record_capacity``
+        per-server records, the least recently used others are evicted. When nothing is
+        evictable, ``record`` is still persisted and the store exceeds its capacity.
+        """
+        stale = [
+            existing.psk_id
+            for existing in await self.list_records()
+            if existing.server_id == record.server_id
+            and existing.psk_id != record.psk_id
+            and existing.psk_id not in protected
+        ]
         await self.store_record(record)
         for psk_id in stale:
-            if await self.can_remove_record(psk_id):
-                await self.remove_record(psk_id)
+            await self.remove_record(psk_id)
+        await self._evict_over_capacity(keep={record.psk_id, *protected})
+
+    async def remove_superseded_records(self, *, protected: AbstractSet[str]) -> None:
+        """Remove per-server records a newer record for the same server replaced.
+
+        Records whose ``psk_id`` is in ``protected`` (the records backing open connections)
+        are kept.
+        """
+        records = await self.list_records()
+        newest = _newest_per_server(records)
+        for record in records:
+            if newest[record.server_id] is not record and record.psk_id not in protected:
+                await self.remove_record(record.psk_id)
+
+    async def _evict_over_capacity(self, *, keep: AbstractSet[str]) -> None:
+        """Evict least recently used per-server records outside ``keep`` down to capacity."""
+        per_server = await self.list_records()
+        excess = len(per_server) - self.record_capacity
+        if excess <= 0:
+            return
+        evictable = sorted(
+            (r for r in per_server if r.psk_id not in keep), key=lambda r: r.last_used_at
+        )
+        for record in evictable[:excess]:
+            logger.info("Evicting the pairing record for server %s", record.server_id)
+            await self.remove_record(record.psk_id)
+        if len(evictable) < excess:
+            logger.warning(
+                "Pairing records exceed the capacity of %d; the remaining records are backed "
+                "by open connections",
+                self.record_capacity,
+            )
 
 
 class _ServerPairingStoreBase(ServerPairingStore):
@@ -607,9 +629,12 @@ class FileServerPairingStore(_ServerPairingStoreBase):
         data = await asyncio.to_thread(_read_json_object, self._path)
         if data is None:
             return
-        self._records = {
-            cid: ServerPairingRecord.from_dict(v) for cid, v in _section(data, "records").items()
-        }
+        self._records = {}
+        for cid, v in _section(data, "records").items():
+            try:
+                self._records[cid] = ServerPairingRecord.from_dict(v)
+            except _UnknownPairMethodError as err:
+                logger.warning("Skipping pairing record for client %s: %s", cid, err)
         self._staged = {
             cid: StagedPairingPsk.from_dict(v)
             for cid, v in _section(data, "staged_pairing_psks").items()
@@ -633,17 +658,29 @@ class FileServerPairingStore(_ServerPairingStoreBase):
 class _ClientPairingStoreBase(ClientPairingStore):
     """Shared query/mutation logic for client pairing stores; subclasses add persistence."""
 
-    def __init__(self) -> None:
-        """Start with empty state; subclasses provision the shared-PSK fallback record."""
+    def __init__(self, *, record_capacity: int = _DEFAULT_RECORD_CAPACITY) -> None:
+        """Start with empty state and the default pairing policy.
+
+        Raises ValueError when ``record_capacity`` is below the spec minimum of 5.
+        """
+        if record_capacity < _MIN_RECORD_CAPACITY:
+            msg = f"record_capacity must be at least {_MIN_RECORD_CAPACITY}, got {record_capacity}"
+            raise ValueError(msg)
+        self._record_capacity = record_capacity
         self._records: dict[str, ClientPairingRecord] = {}
         self._pairing_psk: PairingPsk | None = None
         self._static_pairing_code: str | None = None
-        self._pin_failures = 0
-        self._pairing_config: ClientPairingConfig | None = None
+        self._pairing_rounds = 0
+        self._pairing_config = ClientPairingConfig()
         self._last_playback_server_id: str | None = None
 
     async def _save(self) -> None:
         """Flush mutated state to durable storage; a no-op for non-persistent stores."""
+
+    @property
+    def record_capacity(self) -> int:
+        """Return how many per-server records the store holds before a pairing evicts one."""
+        return self._record_capacity
 
     async def get_last_playback_server_id(self) -> str | None:
         """Return the persisted last-playback server id, if any."""
@@ -675,11 +712,8 @@ class _ClientPairingStoreBase(ClientPairingStore):
         return self._records.get(psk_id)
 
     async def record_by_server_id(self, server_id: str) -> ClientPairingRecord | None:
-        """Return the stored-pubkey record bound to ``server_id`` (linear scan)."""
-        for record in self._records.values():
-            if record.server_id == server_id:
-                return record
-        return None
+        """Return the newest stored-pubkey record bound to ``server_id`` (linear scan)."""
+        return _newest_per_server(self._records.values()).get(server_id)
 
     async def store_record(self, record: ClientPairingRecord) -> None:
         """Persist a long-term record keyed by its ``psk_id``."""
@@ -692,10 +726,10 @@ class _ClientPairingStoreBase(ClientPairingStore):
             await self._save()
 
     async def mark_record_used(self, psk_id: str) -> None:
-        """Flag the record at ``psk_id`` as used (no-op if absent or already used)."""
+        """Flag the record at ``psk_id`` as used now (no-op if absent)."""
         record = self._records.get(psk_id)
-        if record is not None and not record.used:
-            self._records[psk_id] = replace(record, used=True)
+        if record is not None:
+            self._records[psk_id] = replace(record, used=True, last_used_at=datetime.now(UTC))
             await self._save()
 
     async def list_records(self) -> Sequence[ClientPairingRecord]:
@@ -704,7 +738,6 @@ class _ClientPairingStoreBase(ClientPairingStore):
 
     async def get_pairing_config(self) -> ClientPairingConfig:
         """Return the pairing policy."""
-        assert self._pairing_config is not None, "store is not initialized"
         return self._pairing_config
 
     async def store_pairing_config(self, config: ClientPairingConfig) -> None:
@@ -744,52 +777,51 @@ class _ClientPairingStoreBase(ClientPairingStore):
         """Return the configured static pairing code, if any."""
         return self._static_pairing_code
 
-    async def pairing_code_failure_count(self) -> int:
-        """Return the dynamic-pairing-code failure count."""
-        return self._pin_failures
+    async def pairing_round_count(self) -> int:
+        """Return the dynamic-pairing-code rounds since the last verified ``server_kc``."""
+        return self._pairing_rounds
 
-    async def record_pairing_code_failure(self) -> int:
-        """Increment the dynamic-pairing-code failure counter and return the new count."""
-        self._pin_failures += 1
+    async def record_pairing_round(self) -> int:
+        """Count one more dynamic-pairing-code round and return the new count."""
+        self._pairing_rounds += 1
         await self._save()
-        return self._pin_failures
+        return self._pairing_rounds
 
-    async def reset_pairing_code_failures(self) -> None:
-        """Reset the dynamic-pairing-code failure counter to zero (no-op if already zero)."""
-        if self._pin_failures:
-            self._pin_failures = 0
+    async def reset_pairing_rounds(self) -> None:
+        """Reset the round count to zero (no-op if already zero)."""
+        if self._pairing_rounds:
+            self._pairing_rounds = 0
             await self._save()
 
-    async def is_pairing_code_escalated(self) -> bool:
-        """Return whether dynamic pairing code has escalated to gesture-gating."""
-        return self._pin_failures >= PAIRING_CODE_ESCALATION_THRESHOLD
+    async def is_pairing_round_limit_reached(self) -> bool:
+        """Return whether the round count has reached ``PAIRING_ROUND_LIMIT``."""
+        return self._pairing_rounds >= PAIRING_ROUND_LIMIT
 
 
 class InMemoryClientPairingStore(_ClientPairingStoreBase):
     """In-memory reference ``ClientPairingStore`` (tests, ephemeral clients); not persisted."""
 
-    def __init__(self) -> None:
-        """Start with a pre-provisioned shared-PSK fallback record and no other state."""
-        super().__init__()
-        shared_psk = generate_psk()
-        shared = ClientPairingRecord(psk_id=psk_id_for(shared_psk), psk=shared_psk)
-        self._records[shared.psk_id] = shared
-        self._pairing_config = ClientPairingConfig(record_mode_psk_id=shared.psk_id)
-
 
 class FileClientPairingStore(_ClientPairingStoreBase):
     """A ``ClientPairingStore`` persisted atomically to a single JSON file."""
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(
+        self, path: str | Path, *, record_capacity: int = _DEFAULT_RECORD_CAPACITY
+    ) -> None:
         """Internal-only; call ``open()`` to load the store instead."""
-        super().__init__()
+        super().__init__(record_capacity=record_capacity)
         self._path = Path(path)
         self._lock = asyncio.Lock()
 
     @classmethod
-    async def open(cls, path: str | Path) -> FileClientPairingStore:
-        """Load the store."""
-        store = cls(path)
+    async def open(
+        cls, path: str | Path, *, record_capacity: int = _DEFAULT_RECORD_CAPACITY
+    ) -> FileClientPairingStore:
+        """Load the store.
+
+        Raises ValueError when ``record_capacity`` is below the spec minimum of 5.
+        """
+        store = cls(path, record_capacity=record_capacity)
         await store._load()
         return store
 
@@ -797,12 +829,16 @@ class FileClientPairingStore(_ClientPairingStoreBase):
         """Populate state from the JSON file, seeding a fresh store if absent."""
         data = await asyncio.to_thread(_read_json_object, self._path)
         if data is None:
-            await self._seed()
+            await self._save()
             return
-        self._records = {
-            psk_id: ClientPairingRecord.from_dict(v)
-            for psk_id, v in _section(data, "records").items()
-        }
+        self._records = {}
+        for psk_id, v in _section(data, "records").items():
+            # DEPRECATED(spec-pr-183): remove in aiosendspin <version>
+            # Stores written before 10.0 hold shared record-mode records with no server_id.
+            if v.get("server_id") is None:
+                logger.info("Dropping the shared pairing record %s", psk_id)
+                continue
+            self._records[psk_id] = ClientPairingRecord.from_dict(v)
         self._pairing_config = ClientPairingConfig.from_dict(_object(data, "pairing_config"))
         raw_psk = data.get("pairing_psk")
         self._pairing_psk = PairingPsk.from_dict(raw_psk) if isinstance(raw_psk, Mapping) else None
@@ -811,31 +847,23 @@ class FileClientPairingStore(_ClientPairingStoreBase):
         if isinstance(raw_failures, Mapping):
             # Pre-escalation format kept per-method counters; carry over the
             # dynamic pairing-code counter.
-            raw_failures = raw_failures.get(PairMethod.DYNAMIC_PAIRING_CODE.value, 0)
+            # DEPRECATED(spec-pr-179): remove in aiosendspin <version>
+            raw_failures = raw_failures.get("dynamic_pin", 0)
         if isinstance(raw_failures, bool) or not isinstance(raw_failures, int):
             msg = "pairing store 'pin_failures' must be an integer"
             raise TypeError(msg)
-        self._pin_failures = raw_failures
+        self._pairing_rounds = raw_failures
         self._last_playback_server_id = _opt_str(data, "last_playback_server_id")
-
-    async def _seed(self) -> None:
-        """Provision the default pre-provisioned shared-PSK fallback record (spec §Record mode)."""
-        shared_psk = generate_psk()
-        shared = ClientPairingRecord(psk_id=psk_id_for(shared_psk), psk=shared_psk)
-        self._records[shared.psk_id] = shared
-        self._pairing_config = ClientPairingConfig(record_mode_psk_id=shared.psk_id)
-        await self._save()
 
     async def _save(self) -> None:
         """Atomically write the current state to the JSON file."""
         async with self._lock:
-            assert self._pairing_config is not None
             payload: dict[str, object] = {
                 "records": {psk_id: r.to_dict() for psk_id, r in self._records.items()},
                 "pairing_config": self._pairing_config.to_dict(),
                 "pairing_psk": self._pairing_psk.to_dict() if self._pairing_psk else None,
                 "static_pin": self._static_pairing_code,
-                "pin_failures": self._pin_failures,
+                "pin_failures": self._pairing_rounds,
                 "last_playback_server_id": self._last_playback_server_id,
             }
             await asyncio.to_thread(_atomic_write_json, self._path, payload)
@@ -844,9 +872,14 @@ class FileClientPairingStore(_ClientPairingStoreBase):
 # --- private helpers -----------------------------------------------------
 
 
-def _is_shared_record(resolved: ResolvedPsk) -> bool:
-    """Return whether ``resolved`` is a shared-PSK record (long-term, no counterparty)."""
-    return resolved.category is PskCategory.LONG_TERM and resolved.counterparty_id is None
+def _newest_per_server(records: Iterable[ClientPairingRecord]) -> dict[str, ClientPairingRecord]:
+    """Map each server to its newest record, the later-stored one on equal creation times."""
+    newest: dict[str, ClientPairingRecord] = {}
+    for record in records:
+        current = newest.get(record.server_id)
+        if current is None or record.created_at >= current.created_at:
+            newest[record.server_id] = record
+    return newest
 
 
 def _check_psk(psk: bytes) -> None:
@@ -936,6 +969,13 @@ def _opt_str(data: Mapping[str, object], key: str) -> str | None:
     return value
 
 
+# DEPRECATED(spec-pr-179): remove in aiosendspin <version>
+_LEGACY_PAIR_METHODS: Final[dict[str, PairMethod]] = {
+    "dynamic_pin": PairMethod.DYNAMIC_PAIRING_CODE,
+    "static_pin": PairMethod.STATIC_PAIRING_CODE,
+}
+
+
 def _pair_methods(data: Mapping[str, object], key: str) -> list[PairMethod]:
     value = data.get(key, [])
     if not isinstance(value, list):
@@ -946,5 +986,11 @@ def _pair_methods(data: Mapping[str, object], key: str) -> list[PairMethod]:
         if not isinstance(item, str):
             msg = f"{key!r} entries must be strings, got {type(item).__name__}"
             raise TypeError(msg)
-        methods.append(PairMethod(item))
+        try:
+            method = _LEGACY_PAIR_METHODS.get(item) or PairMethod(item)
+        except ValueError as err:
+            msg = f"unknown pair method {item!r}"
+            raise _UnknownPairMethodError(msg) from err
+        if method not in methods:
+            methods.append(method)
     return methods

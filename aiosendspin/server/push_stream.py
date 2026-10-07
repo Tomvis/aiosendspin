@@ -7,6 +7,7 @@ __all__ = ["MAIN_CHANNEL", "PushStream"]
 import asyncio
 import contextlib
 import logging
+import threading
 import weakref
 from collections import defaultdict, deque
 from dataclasses import dataclass
@@ -30,6 +31,9 @@ from aiosendspin.server.roles.player.audio_transformers import PcmPassthrough
 from aiosendspin.util import create_task
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+    from collections.abc import Set as AbstractSet
+
     import av
 
     from aiosendspin.clock import Clock
@@ -228,6 +232,27 @@ def _encode_for_transform_key(
         result.append((data, ts, dur))
         ts += dur
     return result
+
+
+async def _run_off_loop[T, *Ts](func: Callable[[*Ts], T], /, *args: *Ts) -> T:
+    """
+    Run func on a worker thread and return its result.
+
+    A cancelled caller still waits for the thread to finish before CancelledError is
+    re-raised, so the work never outlives the coroutine that started it.
+    """
+    future = asyncio.get_running_loop().run_in_executor(None, func, *args)
+    cancelled: asyncio.CancelledError | None = None
+    while not future.done():
+        try:
+            await asyncio.wait((future,))
+        except asyncio.CancelledError as err:
+            cancelled = err
+    if cancelled is None:
+        return future.result()
+    if not future.cancelled() and (exc := future.exception()) is not None:
+        _LOGGER.debug("Worker failed after its caller was cancelled", exc_info=exc)
+    raise cancelled
 
 
 class _ResamplerKey(NamedTuple):
@@ -578,17 +603,15 @@ def _flush_resampler(resampler_state: _ResamplerState) -> _ResampledPCM:
     )
 
 
-def _quantize_float_pcm(
+def _quantizer_state(
     *,
     channel_id: UUID,
-    pcm_data: bytes,
-    output_ts: int,
     sample_rate: int,
     channels: int,
     target_bit_depth: int,
     resampler_cache: dict[_ResamplerKey, _ResamplerState],
-) -> _ResampledPCM:
-    """Convert float32 PCM to integer output format using the provided cache."""
+) -> _ResamplerState:
+    """Return the cached float32-to-integer quantizer for this output shape."""
     source_format = AudioFormat(
         sample_rate=sample_rate,
         bit_depth=32,
@@ -616,7 +639,28 @@ def _quantize_float_pcm(
     if state is None:
         state = _create_resampler_state(resampler_key, source_format, target_format)
         resampler_cache[resampler_key] = state
-    return _resample_pcm_standalone(state, pcm_data, source_format, output_ts)
+    return state
+
+
+def _quantize_float_pcm(
+    *,
+    channel_id: UUID,
+    pcm_data: bytes,
+    output_ts: int,
+    sample_rate: int,
+    channels: int,
+    target_bit_depth: int,
+    resampler_cache: dict[_ResamplerKey, _ResamplerState],
+) -> _ResampledPCM:
+    """Convert float32 PCM to integer output format using the provided cache."""
+    state = _quantizer_state(
+        channel_id=channel_id,
+        sample_rate=sample_rate,
+        channels=channels,
+        target_bit_depth=target_bit_depth,
+        resampler_cache=resampler_cache,
+    )
+    return _resample_pcm_standalone(state, pcm_data, state.key.source_format, output_ts)
 
 
 def _processing_format_for_roles(
@@ -672,6 +716,27 @@ class CachedPCMChunk:
     bit_depth: int
     channels: int
     sample_type: Literal["int", "float"] = "int"
+
+
+def _trim_pcm_chunk_start(chunk: CachedPCMChunk, start_us: int) -> CachedPCMChunk:
+    """Drop the frames of `chunk` that start before `start_us`."""
+    frame_stride = chunk.bit_depth // 8 * chunk.channels
+    total_frames = len(chunk.pcm_data) // frame_stride
+    skip_frames = min(
+        total_frames, -(-(start_us - chunk.timestamp_us) * chunk.sample_rate // 1_000_000)
+    )
+    if skip_frames <= 0:
+        return chunk
+    timestamp_us = chunk.timestamp_us + -(-skip_frames * 1_000_000 // chunk.sample_rate)
+    return CachedPCMChunk(
+        timestamp_us=timestamp_us,
+        duration_us=max(0, chunk.timestamp_us + chunk.duration_us - timestamp_us),
+        pcm_data=chunk.pcm_data[skip_frames * frame_stride :],
+        sample_rate=chunk.sample_rate,
+        bit_depth=chunk.bit_depth,
+        channels=chunk.channels,
+        sample_type=chunk.sample_type,
+    )
 
 
 class StreamStoppedError(Exception):
@@ -747,8 +812,17 @@ class PushStream:
         self._transform_key_cache: dict[tuple[int, int], TransformKey] = {}
         # Last encoded input end timestamp per TransformKey for long-gap reset handling.
         self._transform_last_input_end_us: dict[TransformKey, int] = {}
+        # Live encoding runs on a worker thread. Transformer resets from the loop
+        # take this lock so a reset never interleaves with an in-progress encode.
+        self._transformer_lock = threading.Lock()
+        # Overlapping commit_audio() calls run their DSP one at a time, in the order they
+        # reach delivery, so cached resampler and transformer state is never driven from
+        # two threads.
+        self._commit_dsp_lock = asyncio.Lock()
         # Roles awaiting delayed join; excluded from live delivery until join executes.
         self._pending_join_roles: weakref.WeakSet[Role] = weakref.WeakSet()
+        # Where a role's timeline continues after a format change, until live audio passes it.
+        self._resume_at_us: weakref.WeakKeyDictionary[Role, int] = weakref.WeakKeyDictionary()
         # >0 while commit_audio() is between the _channel_timing advance and _role_chunk_cache
         # update, joiners should be delayed during that
         self._commit_in_flight: int = 0
@@ -797,6 +871,8 @@ class PushStream:
     @classmethod
     def _role_in_audio_pipeline(cls, client: SendspinClient, role: Role) -> bool:
         """Whether a specific role should participate in transform/delivery processing."""
+        if client.awaits_role_state(role.role_family):
+            return False
         if cls._client_in_audio_pipeline(client):
             return True
         if not client.has_cold_preinitialized_roles:
@@ -817,26 +893,26 @@ class PushStream:
                 result.append((client, role))
         return result
 
-    def _max_active_static_delay_us(self) -> int:
-        """Return the largest static delay among active audio roles."""
+    def _max_active_output_delay_us(self) -> int:
+        """Return the largest output delay among active audio roles."""
         roles = self._get_audio_roles()
         if not roles:
             return 0
-        return max(role.get_static_delay_us() for _, role in roles)
+        return max(role.get_output_delay_us() for _, role in roles)
 
     def _role_send_ahead_us(self, role: Role) -> int:
         """Per-role send-ahead floor.
 
-        Both cases floor at min_buffer + static. Buffered streams extend the lead
-        toward required_lead (it adds no latency once the queue grows past
+        Both cases floor at min_buffer + output_delay. Buffered streams extend the
+        lead toward required_lead (it adds no latency once the queue grows past
         min_buffer); live streams do not, since a realtime queue cannot grow after
         playback begins and extra lead would only add latency.
         """
         min_buffer_us = role.get_min_buffer_us()
-        static_us = role.get_static_delay_us()
+        output_delay_us = role.get_output_delay_us()
         if self._is_live:
-            return min_buffer_us + static_us
-        return max(min_buffer_us, role.get_required_lead_time_us()) + static_us
+            return min_buffer_us + output_delay_us
+        return max(min_buffer_us, role.get_required_lead_time_us()) + output_delay_us
 
     def _min_send_ahead_us(self) -> int:
         """Return the common send-ahead floor across active audio roles."""
@@ -921,7 +997,7 @@ class PushStream:
         max_timing_us = max(active_timings)
         now_us = self._clock.now_us()
         ahead_us = max_timing_us - now_us
-        effective_limit_us = max_buffer_us + self._max_active_static_delay_us()
+        effective_limit_us = max_buffer_us + self._max_active_output_delay_us()
         if ahead_us > effective_limit_us:
             await asyncio.sleep(min((ahead_us - effective_limit_us) / 1_000_000, 1.0))
 
@@ -1445,12 +1521,14 @@ class PushStream:
         ],
         prepared: dict[UUID, tuple[bytes, AudioFormat]],
         channel_play_start: dict[UUID, int],
+        *,
+        commit_generation: int | None = None,
     ) -> dict[tuple[UUID, int, int, int], _ResampledPCM]:
         """Resample PCM once per unique PCM key. Returns (channel, rate, depth, ch) -> (pcm, ts).
 
-        Resampler state (PyAV objects) is cached and must stay on a single thread.
-        Running cached resamplers across a worker pool can deadlock depending on
-        thread scheduling, so resampling runs synchronously on the loop thread.
+        Cache lookups stay on the loop thread; only the resample itself runs on a
+        worker thread, one call at a time, so no resampler state is ever driven
+        from two threads at once.
         """
         if not roles_by_pcm:
             return {}
@@ -1505,9 +1583,12 @@ class PushStream:
                 results[pcm_key] = empty
                 continue
 
-            resampled = _resample_pcm_standalone(
-                state, source_pcm, source_format, input_timestamp_us
+            resampled = await _run_off_loop(
+                _resample_pcm_standalone, state, source_pcm, source_format, input_timestamp_us
             )
+            if not self._is_generation_active(commit_generation):
+                # clear() emptied the cache while we were off-loop; do not repopulate it.
+                return results
             shared_results_by_resampler[resampler_key] = resampled
             results[pcm_key] = resampled
         return results
@@ -1595,6 +1676,29 @@ class PushStream:
         self._transform_last_input_end_us[tkey] = output_ts + duration_us
         return encoded
 
+    def _encode_transforms(
+        self,
+        encode_tasks: dict[TransformKey, tuple[AudioTransformer | None, bytes, int, int]],
+        commit_generation: int | None,
+    ) -> dict[TransformKey, list[tuple[bytes, int, int]]]:
+        """Encode every pending TransformKey. Runs on a worker thread."""
+        transformed: dict[TransformKey, list[tuple[bytes, int, int]]] = {}
+        with self._transformer_lock:
+            # stop()/clear() bump the generation before they take this lock, so a
+            # check inside it guarantees a freshly reset transformer is not
+            # re-dirtied by a commit that already lost the race.
+            if not self._is_generation_active(commit_generation):
+                return transformed
+            for tkey, (transformer, pcm_data, output_ts, duration_us) in encode_tasks.items():
+                transformed[tkey] = self._encode_transform_for_key(
+                    tkey,
+                    transformer,
+                    pcm_data,
+                    output_ts,
+                    duration_us,
+                )
+        return transformed
+
     async def _transform_and_deliver(  # noqa: PLR0915
         self,
         roles_by_pcm: dict[
@@ -1606,7 +1710,7 @@ class PushStream:
     ) -> dict[TransformKey, list[CachedChunk]]:
         """Transform PCM, deliver live chunks to roles, and return cache results.
 
-        Encoding runs sequentially on the event loop, yielding every few keys.
+        Quantization and encoding run on a worker thread; delivery stays on the loop.
         """
         # Collect unique encoding tasks: tkey -> (transformer, pcm_data, output_ts, duration_us)
         encode_tasks: dict[TransformKey, tuple[AudioTransformer | None, bytes, int, int]] = {}
@@ -1625,15 +1729,22 @@ class PushStream:
             # output_start_ts and sample_count ensures downstream timestamps reflect
             # any buffering or trimming introduced by the quantizer graph.
             if resampled.sample_type == "float":
-                edge_quantized = _quantize_float_pcm(
+                quantizer = _quantizer_state(
                     channel_id=channel_id,
-                    pcm_data=pcm_data,
-                    output_ts=output_ts,
                     sample_rate=rate,
                     channels=_channels,
                     target_bit_depth=depth,
                     resampler_cache=self._resamplers,
                 )
+                edge_quantized = await _run_off_loop(
+                    _resample_pcm_standalone,
+                    quantizer,
+                    pcm_data,
+                    quantizer.key.source_format,
+                    output_ts,
+                )
+                if not self._is_generation_active(commit_generation):
+                    return {}
                 pcm_data = edge_quantized.pcm_data
                 output_ts = edge_quantized.output_start_ts
                 duration_us = int(edge_quantized.sample_count * 1_000_000 / rate) if rate > 0 else 0
@@ -1670,23 +1781,11 @@ class PushStream:
         transformed: dict[TransformKey, list[tuple[bytes, int, int]]] = {}
 
         if encode_tasks:
-            for processed, (tkey, (transformer, pcm_data, output_ts, duration_us)) in enumerate(
-                encode_tasks.items(), start=1
-            ):
-                if not self._is_generation_active(commit_generation):
-                    return {}
-                transformed[tkey] = self._encode_transform_for_key(
-                    tkey,
-                    transformer,
-                    pcm_data,
-                    output_ts,
-                    duration_us,
-                )
-                if processed % 2 == 0:
-                    # Keep the loop responsive during large multi-role commits.
-                    await asyncio.sleep(0)
-                    if not self._is_generation_active(commit_generation):
-                        return {}
+            transformed = await _run_off_loop(
+                self._encode_transforms, encode_tasks, commit_generation
+            )
+            if not self._is_generation_active(commit_generation):
+                return {}
 
         cache_results: defaultdict[TransformKey, list[CachedChunk]] = defaultdict(list)
         active_roles = {role for _client, role in self._get_audio_roles()}
@@ -1709,7 +1808,6 @@ class PushStream:
             cache_results[tkey].extend(cached_for_key)
 
             # Deliver live chunks directly; connection layer enforces late-drop/backpressure.
-            # Share one AudioChunk across roles so its packed frame is built once.
             audio_chunks = [
                 AudioChunk(
                     data=cached_chunk.payload,
@@ -1725,7 +1823,13 @@ class PushStream:
                 self._ensure_role_started(role)
                 if role not in self._started_roles:
                     continue
+                not_before_us = self._resume_at_us.get(role)
                 for audio_chunk in audio_chunks:
+                    if not_before_us is not None:
+                        if audio_chunk.timestamp_us < not_before_us:
+                            continue
+                        del self._resume_at_us[role]
+                        not_before_us = None
                     role.on_audio_chunk(audio_chunk)
 
         return cache_results
@@ -1748,20 +1852,22 @@ class PushStream:
         Returns:
             Dict of TransformKey -> list of CachedChunk for late joiners.
         """
-        roles_by_pcm = self._group_roles_by_pcm_requirements(prepared)
-        if not roles_by_pcm:
-            return {}
-
-        if not self._is_generation_active(commit_generation):
-            return {}
-        resampled = await self._resample_for_roles(roles_by_pcm, prepared, channel_play_start)
-        if not self._is_generation_active(commit_generation):
-            return {}
-        return await self._transform_and_deliver(
-            roles_by_pcm,
-            resampled,
-            commit_generation=commit_generation,
-        )
+        async with self._commit_dsp_lock:
+            if not self._is_generation_active(commit_generation):
+                return {}
+            roles_by_pcm = self._group_roles_by_pcm_requirements(prepared)
+            if not roles_by_pcm:
+                return {}
+            resampled = await self._resample_for_roles(
+                roles_by_pcm, prepared, channel_play_start, commit_generation=commit_generation
+            )
+            if not self._is_generation_active(commit_generation):
+                return {}
+            return await self._transform_and_deliver(
+                roles_by_pcm,
+                resampled,
+                commit_generation=commit_generation,
+            )
 
     def _prune_role_chunk_cache(self) -> None:
         """Remove old chunks from the role-based cache."""
@@ -1813,11 +1919,15 @@ class PushStream:
         role: Role,
         cached_chunks: list[CachedChunk],
         now_us: int,
+        *,
+        not_before_us: int | None = None,
     ) -> None:
-        """Send cached chunks to a role, skipping chunks that are already late."""
+        """Send cached chunks to a role, skipping chunks whose start is not in the future."""
         skipped_late = 0
         for cached_chunk in cached_chunks:
-            if cached_chunk.timestamp_us + cached_chunk.duration_us <= now_us:
+            if not_before_us is not None and cached_chunk.timestamp_us < not_before_us:
+                continue
+            if cached_chunk.timestamp_us <= now_us:
                 skipped_late += 1
                 continue
 
@@ -1843,6 +1953,7 @@ class PushStream:
         """Remove role-specific state so re-joins get fresh stream/start."""
         self._started_roles.discard(role)
         self._pending_join_roles.discard(role)
+        self._resume_at_us.pop(role, None)
         req = role.get_audio_requirements()
         if req is not None:
             channel_id = req.channel_id or MAIN_CHANNEL
@@ -1851,7 +1962,8 @@ class PushStream:
                 self._role_chunk_cache.pop(tkey, None)
                 self._transform_last_input_end_us.pop(tkey, None)
                 if req.transformer is not None:
-                    req.transformer.reset()
+                    with self._transformer_lock:
+                        req.transformer.reset()
             if not self._other_roles_share_resampler_shape(req, channel_id, role):
                 # Drop orphan resampler so a rejoin sees no stale FIR state.
                 for rkey in list(self._resamplers.keys()):
@@ -1881,13 +1993,13 @@ class PushStream:
         for stale_tkey in stale_transform_keys:
             self._transform_last_input_end_us.pop(stale_tkey, None)
 
-    def on_role_format_changed(self, role: Role) -> None:
-        """Re-anchor a role whose audio format changed mid-stream.
+    def on_role_format_changed(self, role: Role, *, resume_at_us: int | None = None) -> None:
+        """Rejoin a role whose audio format changed mid-stream.
 
-        The role stays active (unlike on_role_leave()) but is treated as a
-        late joiner: stale transform-key work is discarded and the join path
-        re-anchors it near the playhead in the new format. In-flight commits
-        need no abort: the synchronous join deferral moves the role into
+        The role stays active (unlike on_role_leave()) but rejoins through the
+        late-join path: stale transform-key work is discarded and the new format
+        starts at `resume_at_us`, or near the playhead when it is None. In-flight
+        commits need no abort: the synchronous join deferral moves the role into
         _pending_join_roles, which excludes it from live delivery.
         """
         # Invalidate transform key cache entries for this role
@@ -1905,7 +2017,8 @@ class PushStream:
                 self._role_chunk_cache.pop(stale_tkey, None)
                 transformer = self._group.transformer_pool.get(stale_tkey)
                 if transformer is not None:
-                    transformer.reset()
+                    with self._transformer_lock:
+                        transformer.reset()
 
         # Clean up any catchup state referencing this role
         for tkey in list(self._catchup_roles.keys()):
@@ -1918,11 +2031,10 @@ class PushStream:
                 if task is not None:
                     task.cancel()
 
-        # The changing role's client discards its un-played buffer at the new
-        # stream/start, so re-anchor it near the playhead via the late-join
-        # path: the buffered content is re-encoded in the new format and
-        # handed off to live at the tail, leaving the shared channel timeline
-        # untouched for unchanged roles.
+        if resume_at_us is None:
+            self._resume_at_us.pop(role, None)
+        else:
+            self._resume_at_us[role] = resume_at_us
         self.on_role_join(role)
 
     def has_cached_chunks(self) -> bool:
@@ -1950,6 +2062,7 @@ class PushStream:
     def _do_role_join(self, role: Role) -> None:
         """Execute role join with cached chunk replay."""
         self._pending_join_roles.discard(role)
+        resume_at_us = self._resume_at_us.get(role)
         # A rejoining role (e.g. warm reconnect) must receive on_stream_start()
         # again so the new transport gets stream/start before any audio chunks.
         self._started_roles.discard(role)
@@ -1976,10 +2089,14 @@ class PushStream:
             ):
                 channel_pcm_cache = self._pcm_chunk_cache.get(channel_id.int)
                 if channel_pcm_cache:
-                    late_join_target_us = self.get_late_join_target_timestamp_us(
-                        role=role,
-                        channel_id=channel_id,
-                        align_to_channel_tail=(channel_id != MAIN_CHANNEL),
+                    late_join_target_us = (
+                        resume_at_us
+                        if resume_at_us is not None
+                        else self.get_late_join_target_timestamp_us(
+                            role=role,
+                            channel_id=channel_id,
+                            align_to_channel_tail=(channel_id != MAIN_CHANNEL),
+                        )
                     )
                     latest_cached_end_us = (
                         channel_pcm_cache[-1].timestamp_us + channel_pcm_cache[-1].duration_us
@@ -2019,15 +2136,21 @@ class PushStream:
             return
 
         now_us = self._clock.now_us()
-        min_timestamp_us = self.get_late_join_target_timestamp_us(
-            role=role,
-            channel_id=channel_id,
-            align_to_channel_tail=False,
+        min_timestamp_us = (
+            resume_at_us
+            if resume_at_us is not None
+            else self.get_late_join_target_timestamp_us(
+                role=role,
+                channel_id=channel_id,
+                align_to_channel_tail=False,
+            )
         )
 
+        # Late joiners get chunks that start at or after the target only; a chunk
+        # straddling it is skipped rather than sent partly in the past.
         start_index = 0
         for chunk in cached:
-            if chunk.timestamp_us + chunk.duration_us > min_timestamp_us:
+            if chunk.timestamp_us >= min_timestamp_us:
                 break
             start_index += 1
 
@@ -2380,7 +2503,7 @@ class PushStream:
             for data, ts, dur in encoded_frames
         ]
 
-    async def _start_catchup_encoding(  # noqa: PLR0915
+    async def _start_catchup_encoding(  # noqa: PLR0912, PLR0915
         self,
         role: Role,
         req: AudioRequirements,
@@ -2406,19 +2529,25 @@ class PushStream:
             self._transform_last_input_end_us.pop(cache_key, None)
             pcm_chunks = list(self._pcm_chunk_cache.get(channel_int, []))
             align_to_channel_tail = channel_id != MAIN_CHANNEL
-            target_ts = self.get_late_join_target_timestamp_us(
-                role=role,
-                channel_id=channel_id,
-                align_to_channel_tail=align_to_channel_tail,
-            )
-            encode_start_ts = target_ts
-            if encoder is not None and align_to_channel_tail:
-                encode_start_ts = max(0, target_ts - ENCODER_CATCHUP_WARMUP_US)
+            resume_at_us = self._resume_at_us.get(role)
+            if resume_at_us is not None:
+                target_ts = encode_start_ts = resume_at_us
+            else:
+                target_ts = self.get_late_join_target_timestamp_us(
+                    role=role,
+                    channel_id=channel_id,
+                    align_to_channel_tail=align_to_channel_tail,
+                )
+                encode_start_ts = target_ts
+                if encoder is not None and align_to_channel_tail:
+                    encode_start_ts = max(0, target_ts - ENCODER_CATCHUP_WARMUP_US)
             eligible = [
                 chunk
                 for chunk in pcm_chunks
                 if chunk.timestamp_us + chunk.duration_us > encode_start_ts
             ]
+            if resume_at_us is not None and eligible:
+                eligible[0] = _trim_pcm_chunk_start(eligible[0], resume_at_us)
 
             if not eligible:
                 if self._channel_timing:
@@ -2529,7 +2658,9 @@ class PushStream:
             encoded_cache: deque[CachedChunk] = self._role_chunk_cache.get(cache_key, deque())
             chunks_to_send = list(encoded_cache)
             for r in self._catchup_roles.get(cache_key, {role}):
-                self._send_cached_chunks_to_role(r, chunks_to_send, now_us)
+                self._send_cached_chunks_to_role(
+                    r, chunks_to_send, now_us, not_before_us=self._resume_at_us.get(r)
+                )
 
             self._catchup_state[cache_key] = "live"
         finally:
@@ -2542,7 +2673,8 @@ class PushStream:
                 self._role_chunk_cache.pop(cache_key, None)
                 self._transform_last_input_end_us.pop(cache_key, None)
                 if encoder is not None:
-                    encoder.reset()
+                    with self._transformer_lock:
+                        encoder.reset()
             self._catchup_tasks.pop(cache_key, None)
 
     def _cancel_catchup_tasks(self) -> None:
@@ -2580,8 +2712,9 @@ class PushStream:
                 channel_id = req.channel_id or MAIN_CHANNEL
                 tkey = self._build_transform_key(req, channel_id, role)
                 transformers_by_key.setdefault(tkey, req.transformer)
-        for transformer in transformers_by_key.values():
-            transformer.reset()
+        with self._transformer_lock:
+            for transformer in transformers_by_key.values():
+                transformer.reset()
 
         if not keep_stream:
             # Send stream/end to all roles with audio requirements via hooks
@@ -2591,6 +2724,7 @@ class PushStream:
         # Clear role tracking state
         self._started_roles.clear()
         self._pending_join_roles.clear()
+        self._resume_at_us.clear()
         self._cancel_catchup_tasks()
         self._pcm_chunk_cache.clear()
         self._historical_buffers.clear()
@@ -2598,12 +2732,13 @@ class PushStream:
         self._transform_last_input_end_us.clear()
         self._channels_with_committed_audio.clear()
 
-    def clear(self) -> None:
+    def clear(self, *, end_roles: AbstractSet[Role] = frozenset()) -> None:
         """
         Clear all pending audio and reset timing.
 
         This is used for seek operations or track changes where buffered
-        audio is discarded. Sends stream/clear to all roles via hooks.
+        audio is discarded. Sends stream/clear to all roles via hooks, except
+        that roles in ``end_roles`` get stream/end instead.
         """
         # Bump the stream generation so any in-flight commit_audio()
         # coroutine bails out before delivering chunks under the new epoch.
@@ -2623,8 +2758,8 @@ class PushStream:
         # Clear chunk cache
         self._role_chunk_cache.clear()
         self._pending_join_roles.clear()
+        self._resume_at_us.clear()
         self._pcm_chunk_cache.clear()
-        self._transform_last_input_end_us.clear()
         self._cancel_catchup_tasks()
 
         # Reset inline resamplers
@@ -2639,12 +2774,17 @@ class PushStream:
                 tkey = self._build_transform_key(req, channel_id, role)
                 reset_transformers.setdefault(tkey, req.transformer)
 
-        for transformer in reset_transformers.values():
-            transformer.reset()
+        with self._transformer_lock:
+            for transformer in reset_transformers.values():
+                transformer.reset()
+            self._transform_last_input_end_us.clear()
 
         # Clear role tracking state
         self._started_roles.clear()
 
         # Send stream/clear to all roles with audio requirements via hooks
         for _client, role in self._get_audio_roles():
-            role.on_stream_clear()
+            if role in end_roles:
+                role.on_stream_end()
+            else:
+                role.on_stream_clear()

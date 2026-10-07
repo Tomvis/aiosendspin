@@ -6,7 +6,9 @@ Each binary message carries exactly one frame of one type. The role emits:
 - `f_peak` (msg 18) — per audio chunk
 - `spectrum` (msg 19) — per audio chunk
 - `peak` (msg 20) — per audio chunk when the onset detector fires
-- `pitch` (msg 21) — per audio chunk when a confident pitch is detected
+- `pitch` (msg 21) — per audio chunk when a confident pitch is detected, only
+  on connections whose hello carried the pre-#195 stream configuration
+  (deprecated: the spec reserves type 21)
 
 `beat` is *deferred* from `stream/start.types` until the first non-empty
 schedule actually lands. While beats are still being computed upstream
@@ -32,6 +34,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from aiosendspin.models.core import (
+    ClientStatePayload,
     StreamClearMessage,
     StreamClearPayload,
     StreamEndMessage,
@@ -47,6 +50,7 @@ from aiosendspin.models.visualizer import (
     ClientHelloVisualizerSupport,
     StreamStartVisualizer,
     SupportedVisualizerType,
+    VisualizerStatePayload,
 )
 from aiosendspin.server.audio import BufferTracker
 from aiosendspin.server.roles.base import (
@@ -70,15 +74,48 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 
+# DEPRECATED(spec-pr-86): remove in aiosendspin <version>
+_pitch_deprecation_logged = False
+
+
+# DEPRECATED(spec-pr-86): remove in aiosendspin <version>
+def warn_pitch_deprecated() -> None:
+    """Log, once per process, that the visualizer `pitch` type is deprecated."""
+    global _pitch_deprecation_logged  # noqa: PLW0603
+    if _pitch_deprecation_logged:
+        return
+    _pitch_deprecation_logged = True
+    _LOGGER.warning(
+        "The visualizer 'pitch' type is deprecated: it uses binary type 21, which the "
+        "spec reserves. It is only sent to legacy visualizer@v1 clients on servers "
+        "that allow non-compliant clients, and will be removed in a future release"
+    )
+
+
 # Types the reference implementation knows how to compute. Unsupported
-# types requested by the client are silently dropped per spec.
+# types requested by the client are silently omitted per spec.
 _IMPLEMENTED_TYPES: frozenset[SupportedVisualizerType] = frozenset(
-    {"loudness", "f_peak", "spectrum", "beat", "peak", "pitch"}
+    {
+        "loudness",
+        "f_peak",
+        "spectrum",
+        "beat",
+        "peak",
+        # DEPRECATED(spec-pr-86): remove in aiosendspin <version>
+        "pitch",
+    }
 )
 # Types whose computation requires the FFT extractor. `beat` is the only
 # supplied-externally type and does not require the extractor.
 _FFT_DRIVEN_TYPES: frozenset[SupportedVisualizerType] = frozenset(
-    {"loudness", "f_peak", "spectrum", "peak", "pitch"}
+    {
+        "loudness",
+        "f_peak",
+        "spectrum",
+        "peak",
+        # DEPRECATED(spec-pr-86): remove in aiosendspin <version>
+        "pitch",
+    }
 )
 # Periodic frames for a beat-wanting client are held to this lead ahead of the
 # playhead. Keeping the wire-ts cursor near the playhead means a beat schedule
@@ -99,7 +136,9 @@ class VisualizerV1Role(Role):
         self._client = client
         self._stream_started = False
         self._buffer_tracker: BufferTracker | None = None
-        self._support: ClientHelloVisualizerSupport | None = None
+        self._buffer_capacity = 0
+        # The client's requested stream configuration; None until one is known.
+        self._request: VisualizerStatePayload | None = None
         self._stream_config: StreamStartVisualizer | None = None
         self._extractor: VisualizerFeatureExtractor | None = None
         # Beats queued for delivery on the next audio chunk's drain.
@@ -142,14 +181,14 @@ class VisualizerV1Role(Role):
     def wants_beats(self) -> bool:
         """True if the client negotiated `beat` and beats are not unavailable.
 
-        Reads the client's requested types (`_support`), not the exposed
+        Reads the client's requested types (`_request`), not the exposed
         `stream/start` types, so it is True from the moment the client
         asks for beats — before the first schedule activates the type on
         the wire.
         """
         return (
-            self._support is not None
-            and "beat" in self._support.types
+            self._request is not None
+            and "beat" in self._request.types
             and self._beat_availability is not BeatAvailability.UNAVAILABLE
         )
 
@@ -178,6 +217,7 @@ class VisualizerV1Role(Role):
             BinaryMessageType.VISUALIZATION_F_PEAK,
             BinaryMessageType.VISUALIZATION_SPECTRUM,
             BinaryMessageType.VISUALIZATION_PEAK,
+            # DEPRECATED(spec-pr-86): remove in aiosendspin <version>
             BinaryMessageType.VISUALIZATION_PITCH,
         ):
             if message_type == member.value:
@@ -215,9 +255,10 @@ class VisualizerV1Role(Role):
             # after a few seconds of audio is not dropped behind the cursor.
             self._rearm_warmup_holdback()
         if (
-            self._support is None
-            or "beat" not in self._support.types
+            self._request is None
+            or "beat" not in self._request.types
             or self._stream_config is None
+            or not self._stream_started
         ):
             return
         if previous_beat_in_types != self._beat_in_negotiated_types():
@@ -231,10 +272,7 @@ class VisualizerV1Role(Role):
         reset would under-count, disabling backpressure until the real
         client buffer overflowed.
         """
-        if self._support is None:
-            self._buffer_tracker = None
-            return
-        capacity = max(1, self._support.buffer_capacity)
+        capacity = max(1, self._buffer_capacity)
         if self._buffer_tracker is None:
             self._buffer_tracker = BufferTracker(
                 clock=self._client._server.clock,  # noqa: SLF001
@@ -248,9 +286,22 @@ class VisualizerV1Role(Role):
         """Visualizer receives server binary, gated on the client's initial state."""
         return True
 
+    def requires_activation_state(self) -> bool:
+        """Visualizer waits for its client/state request unless the hello configured it."""
+        support = self._client.info.visualizer_support
+        # DEPRECATED(spec-pr-195): remove in aiosendspin <version>
+        return support is None or not support.has_stream_config
+
     def on_connect(self) -> None:
-        """Initialize stream config and subscribe to group role."""
-        self._init_stream_config()
+        """Load the hello's visualizer support and subscribe to group role."""
+        support = self._client.info.visualizer_support
+        if support is None:
+            raise ValueError("visualizer support object missing for visualizer@v1 role")
+        self._buffer_capacity = support.buffer_capacity
+        # A current client's request arrives in client/state; no stream starts before it.
+        legacy_request = self._legacy_hello_request(support)
+        self._request = None if legacy_request is None else self._filter_request(legacy_request)
+        self._stream_config = None
         self._subscribe_to_group_role()
 
     def on_deactivate(self) -> None:
@@ -274,16 +325,21 @@ class VisualizerV1Role(Role):
         self.reset_binary_timing()
 
     def on_stream_start(self) -> None:
-        """Start extractor state and emit `stream/start` on a fresh stream."""
-        if self._support is None:
+        """Start extractor state and emit `stream/start` on a fresh stream.
+
+        No-op until the client's requested configuration is known and the client is available.
+        """
+        if self._request is None or not self._client.available:
             return
         # Rebuild the config so any beats that landed before this
         # `on_stream_start` (mid-stream join replay) are reflected.
         self._stream_config = self._build_stream_config()
         self.reset_binary_timing()
-        # Prime the wire-ts cursor to the current playhead so a stale
-        # replayed beat can't poison the cursor backward into the past.
-        self._last_wire_emit_ts_us = self._client._server.clock.now_us()  # noqa: SLF001
+        # Advance the wire-ts cursor to the current playhead so a stale
+        # replayed beat can't poison the cursor backward into the past. It only
+        # moves forward: a restart within an announced stream must not let
+        # timestamps decrease.
+        self._reserve_wire_ts(self._client._server.clock.now_us())  # noqa: SLF001
         # Arm the warmup holdback if beats are wanted but none have landed yet.
         self._cancel_release_timer()
         self._pending_frames.clear()
@@ -297,6 +353,15 @@ class VisualizerV1Role(Role):
         self._rebuild_extractor()
         self._stream_started = True
         self._ensure_buffer_tracker()
+
+    def on_availability_changed(
+        self,
+        old_available: bool,  # noqa: ARG002, FBT001
+        new_available: bool,  # noqa: FBT001
+    ) -> None:
+        """Join the group's running stream once the client becomes available."""
+        if new_available and not self._stream_started:
+            self._client.join_active_stream(self)
 
     def _rebuild_extractor(self) -> None:
         """Create the FFT extractor when at least one FFT-driven type is negotiated.
@@ -390,6 +455,7 @@ class VisualizerV1Role(Role):
                 end_time_us=end_time_us,
                 duration_us=duration_us,
             )
+        # DEPRECATED(spec-pr-86): remove in aiosendspin <version>
         if (
             "pitch" in types
             and frame.pitch_midi_q88 is not None
@@ -431,6 +497,10 @@ class VisualizerV1Role(Role):
         duration_us: int,
     ) -> None:
         """Reserve the wire ts and enqueue a periodic binary frame for sending."""
+        last = self._last_wire_emit_ts_us
+        # Strict `<`: the periodic types of one extractor frame share a timestamp.
+        if last is not None and ts_us < last:
+            return
         self._reserve_wire_ts(ts_us)
         self._client.send_binary(
             message,
@@ -459,8 +529,8 @@ class VisualizerV1Role(Role):
         track change keeps streaming the same continuous audio, so parked frames
         are still valid and must keep flowing, and a late beat landing below the
         cursor is dropped by the `<=` guard rather than emitted out of order.
-        Genuine resets (`on_stream_clear` for a seek, `on_stream_request_format`)
-        drop the parked frames and reset the cursor themselves.
+        `on_stream_clear` (a seek) drops the parked frames and resets the cursor
+        itself; a stream config change drops the parked frames and keeps the cursor.
         """
         self._holdback_active = self._holdback_should_be_active()
         self._arm_release_timer()
@@ -533,7 +603,7 @@ class VisualizerV1Role(Role):
         `stream/start` so the client sees `beat` added to the negotiated
         types.
         """
-        if self._support is None or "beat" not in self._support.types:
+        if self._request is None or "beat" not in self._request.types:
             return
         if self._beat_availability is BeatAvailability.UNAVAILABLE:
             return
@@ -551,7 +621,7 @@ class VisualizerV1Role(Role):
 
     def _reissue_stream_start(self) -> None:
         """Rebuild stream config from current state and re-send `stream/start`."""
-        if self._support is None:
+        if self._request is None:
             return
         self._stream_config = self._build_stream_config()
         self._send_stream_start()
@@ -573,9 +643,14 @@ class VisualizerV1Role(Role):
 
         While the near-playhead cap is active, beats drain only up to the cap
         cutoff, so a far-ahead audio chunk cannot push the cursor past beats a
-        later mid-stream schedule will need to sit at.
+        later mid-stream schedule will need to sit at. Outside an announced
+        stream, beats stay queued.
         """
-        if self._stream_config is None or "beat" not in self._stream_config.types:
+        if (
+            not self._stream_started
+            or self._stream_config is None
+            or "beat" not in self._stream_config.types
+        ):
             return
         if self._holdback_active:
             max_ts_us = min(max_ts_us, self._warmup_cutoff_us())
@@ -618,7 +693,10 @@ class VisualizerV1Role(Role):
             )
 
     def on_stream_clear(self) -> None:
-        """Reset extractor state, drop pending beats, notify client."""
+        """Reset extractor state, drop pending beats, notify client.
+
+        `stream/clear` is sent only for a stream this role announced.
+        """
         if self._extractor is not None:
             self._extractor.reset()
         self._pending_beats.clear()
@@ -633,7 +711,8 @@ class VisualizerV1Role(Role):
         self._pending_frames.clear()
         self._rearm_warmup_holdback()
         self._last_wire_emit_ts_us = None
-        self.send_message(StreamClearMessage(payload=StreamClearPayload(roles=["visualizer"])))
+        if self._stream_started:
+            self.send_message(StreamClearMessage(payload=StreamClearPayload(roles=["visualizer"])))
         self.reset_binary_timing()
         if self._buffer_tracker is not None:
             self._buffer_tracker.reset()
@@ -643,21 +722,63 @@ class VisualizerV1Role(Role):
             self._reissue_stream_start()
 
     def on_stream_end(self) -> None:
-        """End the visualizer stream and reset state."""
+        """End the visualizer stream and reset state.
+
+        `stream/end` is sent only for a stream this role announced.
+        """
+        announced = self._stream_started
         self._extractor = None
         self._stream_started = False
         self._pending_beats.clear()
         self._has_beats_landed = False
+        self._last_wire_emit_ts_us = None
         self._cancel_release_timer()
         self._pending_frames.clear()
         self._holdback_active = False
-        self.send_message(StreamEndMessage(payload=StreamEndPayload(roles=["visualizer"])))
+        if announced:
+            self.send_message(StreamEndMessage(payload=StreamEndPayload(roles=["visualizer"])))
         self.reset_binary_timing()
         if self._buffer_tracker is not None:
             self._buffer_tracker.reset()
 
+    def initial_state_deviations(self, payload: ClientStatePayload) -> list[str]:
+        """Report a missing visualizer object in the initial client/state."""
+        support = self._client.info.visualizer_support
+        # DEPRECATED(spec-pr-195): remove in aiosendspin <version>
+        # A pre-#195 client configures its stream in the hello, which is flagged already.
+        if support is not None and support.has_stream_config:
+            return []
+        if payload.visualizer is None:
+            return ["has an active visualizer role but no visualizer state"]
+        return []
+
+    def client_state_deviations(self, payload: ClientStatePayload) -> list[str]:
+        """Report visualizer fields in a client/state that violate the spec."""
+        state = payload.visualizer
+        if state is None:
+            return []
+        reasons: list[str] = []
+        if "spectrum" in state.types and state.spectrum is None:
+            reasons.append("requested visualizer 'spectrum' without a spectrum configuration")
+        if state.rate_max <= 0:
+            reasons.append(f"sent a non-positive visualizer rate_max: {state.rate_max}")
+        return reasons
+
+    def on_client_state(self, payload: ClientStatePayload) -> None:
+        """Apply the visualizer stream configuration from client/state."""
+        state = payload.visualizer
+        # A non-positive rate_max was flagged by client_state_deviations; keep the prior request.
+        if state is None or state.rate_max <= 0:
+            return
+        self._apply_request(self._filter_request(state))
+
+    def on_initial_client_state(self, payload: ClientStatePayload) -> None:
+        """Store the requested configuration so the stream join announces it from the start."""
+        self.on_client_state(payload)
+
+    # DEPRECATED(spec-pr-195): remove in aiosendspin <version>
     def on_stream_request_format(self, payload: StreamRequestFormatPayload) -> None:
-        """Apply mid-stream renegotiation. All v1 fields are optional and merged."""
+        """Merge a pre-#195 visualizer request into the requested configuration."""
         request = payload.visualizer
         if request is None:
             return
@@ -682,34 +803,49 @@ class VisualizerV1Role(Role):
             )
             return
 
-        if self._stream_config is None or self._support is None:
+        if self._request is None:
             return
 
-        # Build the merged payload as a plain dict so the support
-        # dataclass's `__post_init__` validation only runs once after
-        # normalization — avoiding a "spectrum in types without spectrum
-        # config" ValueError during intermediate `replace()` calls.
-        merged: dict[str, object] = self._support.to_dict()
-        if request.types is not None:
-            merged["types"] = list(request.types)
-        if request.rate_max is not None:
-            merged["rate_max"] = request.rate_max
         if request.buffer_capacity is not None:
-            merged["buffer_capacity"] = request.buffer_capacity
-        if request.spectrum is not None:
-            merged["spectrum"] = request.spectrum.to_dict()
+            self._buffer_capacity = request.buffer_capacity
+            if self._stream_started:
+                self._ensure_buffer_tracker()
 
-        normalized = self._normalize_support_payload(merged)
-        new_support = ClientHelloVisualizerSupport.from_dict(normalized)
-        kept: list[str] = [t for t in new_support.types if t in _IMPLEMENTED_TYPES]
-        if not kept:
-            kept = ["loudness"]
-        new_support = replace(new_support, types=kept)
-        self._support = new_support
+        merged = VisualizerStatePayload(
+            types=list(request.types) if request.types is not None else self._request.types,
+            rate_max=request.rate_max or self._request.rate_max,
+            spectrum=request.spectrum or self._request.spectrum,
+        )
+        self._apply_request(self._filter_request(merged))
 
-        # No active stream: remember the requested config for the next stream/start;
-        # the server MUST NOT start a stream in response.
-        if not self._stream_started:
+    def _apply_request(self, request: VisualizerStatePayload) -> None:
+        """Store the client's requested configuration and apply it.
+
+        An active stream gets a new `stream/start` only when the derived config
+        changed; with no active stream the request applies to the next one. The
+        first request known on this connection joins a stream the group is
+        already running.
+        """
+        if request == self._request:
+            return
+        first_request = self._request is None
+        beats_were_wanted = self.wants_beats
+        self._request = request
+
+        if self._stream_started:
+            self._apply_request_to_stream()
+        if self.wants_beats and not beats_were_wanted:
+            # The group role replays its beat schedule on join only to members
+            # that want beats, so rejoin it now that this role does.
+            self._unsubscribe_from_group_role()
+            self._subscribe_to_group_role()
+        if first_request and not self._stream_started:
+            self._client.join_active_stream(self)
+
+    def _apply_request_to_stream(self) -> None:
+        """Re-derive the active stream's config; send `stream/start` only when it changed."""
+        if self._build_stream_config() == self._stream_config:
+            self._sync_holdback()
             return
 
         # Pending beats are pinned to the old config (e.g. stale rate);
@@ -718,69 +854,73 @@ class VisualizerV1Role(Role):
         self._pending_beats.clear()
         self._has_beats_landed = False
 
+        # Rebuilt after the reset, which can drop `beat` from the config.
         self._stream_config = self._build_stream_config()
         # Held frames carry old-config payloads (e.g. stale spectrum bins);
-        # drop them and re-evaluate the warmup cap against the new support.
+        # drop them and re-evaluate the warmup cap against the new request.
         self._cancel_release_timer()
         self._pending_frames.clear()
         self._holdback_active = self._holdback_should_be_active()
-        # rate_max / types change rebuilds the extractor (new hop). Drop
-        # the wire-ts guard so the new config takes effect immediately.
-        self._last_wire_emit_ts_us = None
+        # rate_max / types change rebuilds the extractor (new hop). The wire-ts
+        # cursor is kept: the stream continues, so timestamps must not decrease.
+        # The new extractor's first frame lands at the next chunk's end.
         self._rebuild_extractor()
         self._ensure_buffer_tracker()
         self._send_stream_start()
 
-    def _init_stream_config(self) -> None:
-        """Parse visualizer support config from client/hello."""
-        support_raw = self._client.info.visualizer_support
-        if support_raw is None:
-            raise ValueError("visualizer support object missing for visualizer@v1 role")
-        self._support = ClientHelloVisualizerSupport.from_dict(
-            self._normalize_support_payload(support_raw)
+    def _sync_holdback(self) -> None:
+        """Arm or lift the near-playhead cap to match whether beats are wanted."""
+        if self._holdback_should_be_active():
+            if not self._holdback_active:
+                self._rearm_warmup_holdback()
+        elif self._holdback_active:
+            self._end_holdback()
+
+    def _filter_request(self, request: VisualizerStatePayload) -> VisualizerStatePayload:
+        """Reduce a requested configuration to the types this role can stream."""
+        types = [t for t in request.types if t in _IMPLEMENTED_TYPES]
+        if "spectrum" in types and request.spectrum is None:
+            # Flagged as a deviation; a lenient server streams the other types.
+            types.remove("spectrum")
+        # DEPRECATED(spec-pr-86): remove in aiosendspin <version>
+        # `pitch` rides spec-reserved binary type 21. Only a lenient server streams
+        # it, and only to a connection whose hello carried the pre-#195 stream
+        # configuration: #195 postdates the reservation, so a client/state client
+        # is on a wire where 21 is reserved.
+        if "pitch" in types:
+            support = self._client.info.visualizer_support
+            legacy = support is not None and support.has_stream_config
+            if legacy and self._client._server.allow_noncompliant_clients:  # noqa: SLF001
+                warn_pitch_deprecated()
+            else:
+                types = [t for t in types if t != "pitch"]
+        return replace(request, types=types)
+
+    # DEPRECATED(spec-pr-195): remove in aiosendspin <version>
+    @staticmethod
+    def _legacy_hello_request(
+        support: ClientHelloVisualizerSupport,
+    ) -> VisualizerStatePayload | None:
+        """Return the stream configuration a pre-#195 hello carried, or None without one."""
+        if not support.has_stream_config:
+            return None
+        return VisualizerStatePayload(
+            types=["loudness", "f_peak"] if support.types is None else list(support.types),
+            rate_max=30 if support.rate_max is None else support.rate_max,
+            spectrum=support.spectrum,
         )
-        kept: list[str] = [t for t in self._support.types if t in _IMPLEMENTED_TYPES]
-        dropped = [t for t in self._support.types if t not in _IMPLEMENTED_TYPES]
-        if dropped:
-            _LOGGER.warning(
-                "client %s requested unimplemented visualizer types %s; ignoring",
-                self._client.client_id,
-                dropped,
-            )
-        # `pitch` rides spec-reserved binary type 21, so a compliance-strict server
-        # drops it up front (not just from stream/start). A client left with no
-        # compliant type has no visualizer capability and gets no stream at all.
-        if not self._client._server.allow_noncompliant_clients:  # noqa: SLF001
-            compliant = [t for t in kept if t != "pitch"]
-            if not compliant:
-                _LOGGER.info(
-                    "client %s supports only the reserved 'pitch' visualizer type; not streaming",
-                    self._client.client_id,
-                )
-                self._support = None
-                self._stream_config = None
-                return
-            kept = compliant
-        if not kept:
-            _LOGGER.warning(
-                "client %s requested no implemented visualizer types; falling back to ['loudness']",
-                self._client.client_id,
-            )
-            kept = ["loudness"]
-        self._support = replace(self._support, types=kept)
-        self._stream_config = self._build_stream_config()
 
     def _beat_in_negotiated_types(self) -> bool:
         """Whether `beat` is currently exposed in `stream/start.types`."""
         return (
-            self._support is not None
-            and "beat" in self._support.types
+            self._request is not None
+            and "beat" in self._request.types
             and self._has_beats_landed
             and self._beat_availability is not BeatAvailability.UNAVAILABLE
         )
 
     def _build_stream_config(self) -> StreamStartVisualizer:
-        """Derive the current `stream/start` config from support + beat state.
+        """Derive the current `stream/start` config from the request + beat state.
 
         `beat` is deferred: it is exposed only once a non-empty beat
         schedule has actually landed for the current stream (and the
@@ -791,30 +931,30 @@ class VisualizerV1Role(Role):
         Exception: beat-only clients (`types == ["beat"]`) get `beat`
         from the start — there is no FFT-driven type to fall back to.
         """
-        if self._support is None:
-            raise ValueError("support must be initialised before building stream config")
-        client_types = list(self._support.types)
+        if self._request is None:
+            raise ValueError("request must be known before building stream config")
+        client_types = list(self._request.types)
         beat_only = client_types == ["beat"]
         if beat_only or self._beat_in_negotiated_types():
             exposed_types = client_types
         else:
             exposed_types = [t for t in client_types if t != "beat"]
+        # DEPRECATED(spec-pr-86): remove in aiosendspin <version>
         # Server-wide pitch shed: drop the (heavy) pitch feature unless it is
-        # the only exposed type. stream/start must keep at least one, and we
-        # cannot add a type the client did not request. The pitch toggle is
-        # ignored when the server rejects non-compliant clients, since pitch
-        # rides spec-reserved binary type 21.
-        server = self._client._server  # noqa: SLF001
-        pitch_enabled = server.visualizer_pitch_enabled and server.allow_noncompliant_clients
-        if not pitch_enabled:
-            without_pitch = [t for t in exposed_types if t != "pitch"]
+        # the only exposed type, so a pitch-only client still gets its data.
+        # Only a legacy connection on a lenient server gets here with pitch
+        # (`_filter_request`).
+        if not self._client._server.visualizer_pitch_enabled:  # noqa: SLF001
+            without_pitch: list[SupportedVisualizerType] = [
+                t for t in exposed_types if t != "pitch"
+            ]
             if without_pitch:
                 exposed_types = without_pitch
-        derived_support = replace(self._support, types=exposed_types)
-        return StreamStartVisualizer.from_support(
-            derived_support, tracks_downbeats=self._tracks_downbeats
+        return StreamStartVisualizer.from_request(
+            replace(self._request, types=exposed_types), tracks_downbeats=self._tracks_downbeats
         )
 
+    # DEPRECATED(spec-pr-86): remove in aiosendspin <version>
     def refresh_pitch_setting(self) -> None:
         """Re-apply the server-wide pitch toggle to the live stream config.
 
@@ -822,43 +962,17 @@ class VisualizerV1Role(Role):
         the config and, if the exposed types changed, rebuilds the extractor and
         re-emits `stream/start` so the client sees the new set.
         """
-        if self._support is None or self._stream_config is None:
+        if self._request is None or self._stream_config is None:
             return
         new_config = self._build_stream_config()
         if new_config.types == self._stream_config.types:
             return
         self._stream_config = new_config
-        # Types changed (pitch added/removed) — let the new config take effect
-        # immediately rather than being blocked by the prior wire-ts cursor.
-        self._last_wire_emit_ts_us = None
+        # Types changed (pitch added/removed). The wire-ts cursor is kept so an
+        # in-stream `stream/start` never lets timestamps decrease.
         self._rebuild_extractor()
         if self._stream_started:
             self._send_stream_start()
-
-    def _normalize_support_payload(self, support_raw: object) -> dict[str, object]:
-        """Normalize a client/hello support payload to the v1 schema."""
-        if isinstance(support_raw, dict):
-            payload: dict[str, object] = dict(support_raw)
-        elif isinstance(support_raw, ClientHelloVisualizerSupport):
-            payload = support_raw.to_dict()
-        else:
-            raise TypeError("visualizer support object must be a JSON object")
-
-        if "types" not in payload:
-            payload["types"] = ["loudness", "f_peak"]
-        if "rate_max" not in payload or payload.get("rate_max") is None:
-            payload["rate_max"] = 30
-
-        raw_types = payload.get("types")
-        if isinstance(raw_types, list):
-            normalized_types = [v for v in raw_types if isinstance(v, str)]
-            if "spectrum" in normalized_types and payload.get("spectrum") is None:
-                normalized_types = [v for v in normalized_types if v != "spectrum"]
-            if not normalized_types:
-                normalized_types = ["loudness", "f_peak"]
-            payload["types"] = normalized_types
-
-        return payload
 
     def _send_stream_start(self) -> None:
         """Send `stream/start` with the negotiated visualizer configuration."""

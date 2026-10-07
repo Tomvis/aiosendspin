@@ -52,6 +52,8 @@ class _DummyServer:
 
 
 class _DummyConnection:
+    clears_role_state_with_null = False
+
     def __init__(self) -> None:
         self.sent_json: list[object] = []
         self.sent_binary: list[bytes] = []
@@ -78,6 +80,8 @@ class _DummyConnection:
         buffer_end_time_us: int | None = None,  # noqa: ARG002
         buffer_byte_count: int | None = None,  # noqa: ARG002
         duration_us: int | None = None,  # noqa: ARG002
+        player_audio_header: bool = False,  # noqa: ARG002
+        epoch_exempt: bool = False,  # noqa: ARG002
     ) -> bool:
         self.sent_binary.append(data)
         return True
@@ -343,7 +347,7 @@ async def test_reconnect_with_new_format_drops_stale_cached_audio() -> None:
     assert stream_starts[0].payload.player is not None
     assert stream_starts[0].payload.player.bit_depth == 24
     assert reconnect_conn.sent_binary
-    assert all(len(chunk) == 7_209 for chunk in reconnect_conn.sent_binary)
+    assert all(len(chunk) == 7_200 for chunk in reconnect_conn.sent_binary)
 
 
 @pytest.mark.asyncio
@@ -659,7 +663,7 @@ async def test_preferred_format_override_survives_role_recreation() -> None:
 
 @pytest.mark.asyncio
 async def test_set_active_roles_notifies_group_of_stream_membership() -> None:
-    """set_active_roles drops deactivated roles from the stream and joins activated ones."""
+    """set_active_roles drops deactivated roles; activated ones join once their state arrives."""
     loop = asyncio.get_running_loop()
     server = _DummyServer(loop=loop, clock=LoopClock(loop))
     client = SendspinClient(server, client_id="player-1")
@@ -683,8 +687,44 @@ async def test_set_active_roles_notifies_group_of_stream_membership() -> None:
         assert activated.call_count == 0
 
         client.set_active_roles([Roles.PLAYER.value])
-        assert activated.call_count == 1
-        assert activated.call_args.args[0].role_id == Roles.PLAYER.value
+        assert client.awaits_role_state("player")
+        assert activated.call_count == 0
+
+        role = client.role(Roles.PLAYER.value)
+        assert role is not None
+        client.release_role_hold("player")
+        client.join_active_stream(role)
+        activated.assert_called_once_with(role)
+
+
+@pytest.mark.asyncio
+async def test_join_active_stream_requires_connected_active_role() -> None:
+    """join_active_stream joins only an active role of a connected client."""
+    loop = asyncio.get_running_loop()
+    server = _DummyServer(loop=loop, clock=LoopClock(loop))
+    client = SendspinClient(server, client_id="player-1")
+    group = SendspinGroup(server, client)
+
+    client.attach_connection(
+        _DummyConnection(),
+        client_info=_player_hello("player-1"),
+        negotiated_roles=[Roles.PLAYER.value],
+        active_roles=[Roles.PLAYER.value],
+    )
+    role = client.role(Roles.PLAYER.value)
+    assert role is not None
+
+    with patch.object(group, "on_role_activated") as activated:
+        client.join_active_stream(role)
+        activated.assert_not_called()
+
+        client.mark_connected()
+        client.join_active_stream(role)
+        activated.assert_called_once_with(role)
+
+        client.set_active_roles([])
+        client.join_active_stream(role)
+        activated.assert_called_once_with(role)
 
 
 @pytest.mark.asyncio

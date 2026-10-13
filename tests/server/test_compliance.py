@@ -349,3 +349,155 @@ async def test_unimplemented_roles_notice_names_the_device(
         "Client Kitchen ERROR forged (Acme, software 1.2.3) offered roles/versions "
         "this server does not implement: ['player@v99']"
     ) in caplog.messages
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("strict", [False, True])
+async def test_hello_wire_type_deviation_is_flagged_before_attach(
+    strict: bool,  # noqa: FBT001
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A tolerated wire type in client/hello is flagged, and a strict server never attaches it."""
+    server = _make_server(allow_noncompliant_clients=not strict)
+    raw = orjson.dumps(
+        {
+            "type": "client/hello",
+            "payload": {
+                "name": "Kitchen",
+                "supported_roles": [],
+                "unpaired_access": {"enabled": "false"},
+            },
+        }
+    ).decode()
+    conn = SendspinConnection(server, wsock_client=AsyncMock())
+    psk = generate_psk()
+    conn._client_id = "dev"  # noqa: SLF001
+    conn._noise_psk = ResolvedPsk(  # noqa: SLF001
+        psk_id=psk_id_for(psk),
+        psk=psk,
+        category=PskCategory.LONG_TERM,
+        counterparty_id="dev",
+    )
+    reason = "client/hello sent a string for 'unpaired_access.enabled' instead of a boolean"
+
+    with caplog.at_level(logging.WARNING):
+        if strict:
+            with pytest.raises(ClientComplianceError):
+                await conn._ingest_client_hello_checked(raw)  # noqa: SLF001
+        else:
+            assert await conn._ingest_client_hello_checked(raw) is True  # noqa: SLF001
+    client = server.get_client("dev")
+    await server.close()
+
+    if strict:
+        assert client is None
+        assert f"rejecting non-compliant client Kitchen: {reason}" in caplog.messages
+    else:
+        assert client is not None
+        assert client.info.unpaired_access.enabled is False
+        assert f"non-compliant client Kitchen: {reason}" in caplog.messages
+
+
+_OPUS_FORMAT = {"codec": "opus", "channels": 2, "sample_rate": 48000, "bit_depth": 16}
+
+
+@pytest.mark.parametrize(
+    ("overrides", "reason"),
+    [
+        pytest.param(
+            {"trust_level": "user"},
+            "client/hello sent the removed trust_level key",
+            id="trust-level",
+        ),
+        pytest.param(
+            {"supported_roles": ["controller@v1", "metadata"]},
+            "client/hello listed roles not of the form role@version",
+            id="unversioned-role",
+        ),
+        pytest.param(
+            {
+                "supported_roles": ["player@v1"],
+                "player@v1_support": {"supported_formats": [_OPUS_FORMAT], "buffer_capacity": 1},
+            },
+            "client/hello player@v1_support listed neither flac nor pcm",
+            id="opus-only-player",
+        ),
+        pytest.param(
+            {"device_info": {"mac_address": "AA:BB:CC:DD:EE:FF"}},
+            "client/hello sent a mac_address not in lowercase colon-separated form",
+            id="uppercase-mac",
+        ),
+        pytest.param(
+            {"unpaired_access": {}},
+            "client/hello omitted the required unpaired_access.enabled",
+            id="unpaired-access-without-enabled",
+        ),
+        pytest.param(
+            {"supported_pair_methods": None},
+            "client/hello omitted the required supported_pair_methods",
+            id="no-pair-methods",
+        ),
+        pytest.param(
+            {"supported_pair_methods": {"static_pairing_code": {}}},
+            "client/hello did not offer the pairing_psk method",
+            id="no-pairing-psk",
+        ),
+        pytest.param(
+            {
+                "supported_pair_methods": {
+                    "pairing_psk": {},
+                    "dynamic_pairing_code": {"formats": [], "out_channels": ["display"]},
+                }
+            },
+            "client/hello sent a malformed pair-method descriptor",
+            id="empty-formats",
+        ),
+        pytest.param(
+            {"supported_pair_methods": {"pairing_psk": {"locations": "device"}}},
+            "client/hello sent a malformed pair-method descriptor",
+            id="non-list-locations",
+        ),
+        pytest.param(
+            {
+                "supported_pair_methods": {
+                    "pairing_psk": {},
+                    "dynamic_pairing_code": {"formats": ["qr_code"], "out_channels": ["speaker"]},
+                }
+            },
+            "client/hello offered qr_code without a display out_channel",
+            id="qr-code-without-display",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_strict_server_rejects_hello_deviation_before_attach(
+    overrides: dict[str, object], reason: str
+) -> None:
+    """Each hello deviation rejects an encrypted client before it is attached."""
+    server = _make_server(allow_noncompliant_clients=False)
+    payload: dict[str, object] = {
+        "name": "Kitchen",
+        "supported_roles": ["controller@v1"],
+        "supported_pair_methods": {"pairing_psk": {}},
+        "unpaired_access": {"enabled": False},
+        **overrides,
+    }
+    # A None override omits the key.
+    payload = {key: value for key, value in payload.items() if value is not None}
+    conn = SendspinConnection(server, wsock_client=AsyncMock())
+    psk = generate_psk()
+    conn._client_id = "dev"  # noqa: SLF001
+    conn._noise_psk = ResolvedPsk(  # noqa: SLF001
+        psk_id=psk_id_for(psk),
+        psk=psk,
+        category=PskCategory.LONG_TERM,
+        counterparty_id="dev",
+    )
+
+    raw = orjson.dumps({"type": "client/hello", "payload": payload}).decode()
+    with pytest.raises(ClientComplianceError) as excinfo:
+        await conn._ingest_client_hello_checked(raw)  # noqa: SLF001
+    await server.close()
+
+    assert str(excinfo.value) == reason
+    assert server.get_client("dev") is None

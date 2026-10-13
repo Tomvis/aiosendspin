@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import struct
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
@@ -11,6 +12,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from aiohttp import WSMessage, WSMsgType
 
 from aiosendspin.client import SendspinClient
 from aiosendspin.client.connection import SendspinConnection
@@ -31,6 +33,7 @@ from aiosendspin.models.core import (
     ServerCommandPayload,
     ServerHelloPayload,
     ServerStatePayload,
+    ServerTimeMessage,
     ServerTimePayload,
     StreamClearMessage,
     StreamClearPayload,
@@ -79,6 +82,8 @@ from aiosendspin.noise.trust_store import (
     PskCategory,
     ResolvedPsk,
 )
+from aiosendspin.noise.wire import EncryptedWebSocket
+from tests.noise.conftest import FakeWebSocket, make_paired_sessions
 
 from .conftest import make_sdk_client
 
@@ -518,14 +523,13 @@ async def test_activation_admissibility(
 
 
 @pytest.mark.asyncio
-async def test_unrecognized_activity_is_ignored_and_activation_applies() -> None:
-    """A server/activate naming an unknown activity still applies its known fields."""
-    connection = await _connection(PskCategory.LONG_TERM)
-    handled: list[ServerActivatePayload] = []
+async def test_unrecognized_activity_rejects_activation() -> None:
+    """An unknown activity is never an allowed set, so unauthorized wins over pairing_required."""
+    connection = await _connection(PskCategory.SENTINEL)
+    reasons: list[GoodbyeReason | None] = []
 
     async def _record(payload: ServerActivatePayload) -> None:
-        handled.append(payload)
-        assert await connection._apply_activation(payload) is None  # noqa: SLF001
+        reasons.append(await connection._apply_activation(payload))  # noqa: SLF001
 
     connection._handle_server_activate = _record  # type: ignore[method-assign]  # noqa: SLF001
 
@@ -533,19 +537,14 @@ async def test_unrecognized_activity_is_ignored_and_activation_applies() -> None
         json.dumps(
             {
                 "type": "server/activate",
-                "payload": {
-                    "activities": ["playback", "teleport"],
-                    "active_roles": [Roles.PLAYER.value],
-                },
+                "payload": {"activities": ["playback", "teleport"], "active_roles": []},
             }
-        )
+        ),
+        connection.now_us(),
     )
 
-    (payload,) = handled
-    assert payload.activities == [Activity.PLAYBACK]
-    assert payload.ignored_activities == ["teleport"]
-    assert connection._activities == [Activity.PLAYBACK]  # noqa: SLF001
-    assert connection._active_roles == [Roles.PLAYER.value]  # noqa: SLF001
+    assert reasons == [GoodbyeReason.UNAUTHORIZED]
+    assert connection._activities == []  # noqa: SLF001
 
 
 @pytest.mark.parametrize(
@@ -1462,12 +1461,14 @@ async def test_server_command_out_of_range_output_delay_is_clamped() -> None:
                 "type": "server/command",
                 "payload": {"player": {"command": "set_output_delay", "output_delay_ms": 6000}},
             }
-        )
+        ),
+        connection.now_us(),
     )
 
     assert client.output_delay_us == 5_000_000
 
 
+# DEPRECATED(spec-pr-164): remove in aiosendspin <version>
 async def test_server_command_pre_rename_delay_applies_and_notifies() -> None:
     """A pre-rename server/command set_static_delay updates the offset and fires the callback."""
     client = make_sdk_client(
@@ -1530,6 +1531,55 @@ async def test_server_command_without_player_only_notifies() -> None:
     assert received == [payload]
 
 
+async def test_server_time_is_timed_before_decryption(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The time filter gets the server/time arrival time, not the time after decrypting it."""
+    clock = ManualClock(now_us_value=1_000_000)
+    connection = await _connection(PskCategory.LONG_TERM, clock=clock)
+    initiator, responder = make_paired_sessions()
+    raw = FakeWebSocket()
+    connection._ws = EncryptedWebSocket(raw, responder)  # noqa: SLF001
+    connection._time_filter = MagicMock(is_synchronized=False)  # noqa: SLF001
+    connection.disconnect = AsyncMock()  # type: ignore[method-assign]
+    decrypt = responder.decrypt
+
+    def decrypt_slowly(data: bytes) -> bytes:
+        clock.advance_us(500)
+        return decrypt(data)
+
+    monkeypatch.setattr(responder, "decrypt", decrypt_slowly)
+    server_time = ServerTimeMessage(
+        payload=ServerTimePayload(
+            client_transmitted=990_000, server_received=995_000, server_transmitted=996_000
+        )
+    )
+    await raw.push(
+        WSMessage(WSMsgType.BINARY, initiator.encrypt(b"\x00" + server_time.to_json().encode()), "")
+    )
+    await raw.push(None)
+
+    await connection._reader_loop()  # noqa: SLF001
+
+    connection._time_filter.update.assert_called_once_with(500, 4_500, 1_000_000)  # type: ignore[attr-defined]  # noqa: SLF001
+
+
+async def test_reader_stops_quietly_after_a_handler_disconnects(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A disconnect from inside a message handler ends the reader without logging an error."""
+    connection = await _connection(PskCategory.LONG_TERM)
+    _, responder = make_paired_sessions()
+    raw = FakeWebSocket()
+    connection._ws = EncryptedWebSocket(raw, responder)  # noqa: SLF001
+    connection._connected = True  # noqa: SLF001
+    await raw.push(WSMessage(WSMsgType.ERROR, RuntimeError("transport failed"), ""))
+    await raw.push(None)
+
+    with caplog.at_level(logging.ERROR):
+        await connection._reader_loop()  # noqa: SLF001
+
+    assert "WebSocket reader encountered an error" not in caplog.text
+
+
 _SERVER_TIME = ServerTimePayload(client_transmitted=0, server_received=0, server_transmitted=0)
 
 
@@ -1570,7 +1620,7 @@ async def test_player_initial_state_unavailable_until_clock_synchronizes() -> No
     connection, sent = await _state_connection([Roles.PLAYER.value])
 
     await connection.start()
-    await connection._handle_server_time(_SERVER_TIME)  # noqa: SLF001
+    await connection._handle_server_time(_SERVER_TIME, connection.now_us())  # noqa: SLF001
 
     assert [(state["available"], "player" in state) for state in sent] == [
         (False, True),
@@ -1583,7 +1633,7 @@ async def test_player_reported_unavailable_stays_unavailable_after_sync() -> Non
     connection, sent = await _state_connection([Roles.PLAYER.value])
 
     await connection.send_player_state(available=False, volume=50, muted=False)
-    await connection._handle_server_time(_SERVER_TIME)  # noqa: SLF001
+    await connection._handle_server_time(_SERVER_TIME, connection.now_us())  # noqa: SLF001
 
     assert [(state["available"], "player" in state) for state in sent] == [
         (False, True),
@@ -1644,7 +1694,7 @@ async def test_player_available_withheld_until_clock_synchronizes(
     await report(connection)
     assert sent[-1]["available"] is False
 
-    await connection._handle_server_time(_SERVER_TIME)  # noqa: SLF001
+    await connection._handle_server_time(_SERVER_TIME, connection.now_us())  # noqa: SLF001
     await report(connection)
     assert sent[-1]["available"] is True
 
@@ -1658,7 +1708,7 @@ async def test_player_and_source_states_carry_source_object() -> None:
     )
 
     await connection.start()
-    await connection._handle_server_time(_SERVER_TIME)  # noqa: SLF001
+    await connection._handle_server_time(_SERVER_TIME, connection.now_us())  # noqa: SLF001
 
     assert [(state["available"], "player" in state, state.get("source")) for state in sent] == [
         (False, True, {}),
@@ -1679,7 +1729,7 @@ async def test_source_signal_requires_line_sense(
         roles=[Roles.SOURCE],
         source_support=ClientHelloSourceSupport(features=features),
     )
-    await connection._handle_server_time(_SERVER_TIME)  # noqa: SLF001
+    await connection._handle_server_time(_SERVER_TIME, connection.now_us())  # noqa: SLF001
 
     with pytest.raises(RuntimeError, match="line_sense"):
         await connection.send_source_signal(SignalState.PRESENT)
@@ -1697,7 +1747,7 @@ async def test_source_signal_is_reported_with_line_sense() -> None:
             features=ClientHelloSourceFeatures(line_sense=True)
         ),
     )
-    await connection._handle_server_time(_SERVER_TIME)  # noqa: SLF001
+    await connection._handle_server_time(_SERVER_TIME, connection.now_us())  # noqa: SLF001
 
     await connection.send_source_signal(SignalState.PRESENT)
 

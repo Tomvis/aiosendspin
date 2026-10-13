@@ -107,6 +107,7 @@ class SendspinClient:
         self._connected: bool = False
         self._added_event_fired: bool = False
         self._roles_warm_disconnected: bool = False
+        self._roles_warm_reattached: bool = False
         self._roles_cold_preinitialized: bool = False
         self._roles_attached: bool = False
         # Families of roles activated on the current connection that still wait for
@@ -142,6 +143,7 @@ class SendspinClient:
         self._cleanup_handle: asyncio.Handle | None = None
         # True when we intentionally retain a disconnected client after ANOTHER_SERVER goodbye.
         self._cleanup_on_mdns_removal: bool = False
+        self._last_goodbye_reason: GoodbyeReason | None = None
 
     def flag_noncompliance(self, reason: str) -> None:
         """Log a tolerated spec violation once, or reject it when the server is strict."""
@@ -266,6 +268,11 @@ class SendspinClient:
     def has_warm_disconnected_roles(self) -> bool:
         """Whether role instances are retained while transport is down."""
         return self._roles_warm_disconnected and self._connection is None
+
+    @property
+    def has_warm_reattached_roles(self) -> bool:
+        """Whether retained role instances were reattached and await the initial client/state."""
+        return self._roles_warm_reattached and self._connection is not None and not self._connected
 
     @property
     def has_cold_preinitialized_roles(self) -> bool:
@@ -489,6 +496,7 @@ class SendspinClient:
         self._connected = False  # set True once initial state is received (spec)
         self._roles_awaiting_state.clear()
         self._cleanup_on_mdns_removal = False
+        self._last_goodbye_reason = None
         on_transport_attached = getattr(self._server, "on_client_transport_attached", None)
         if callable(on_transport_attached):
             on_transport_attached(self._client_id)
@@ -504,6 +512,7 @@ class SendspinClient:
             self._hard_detach_roles()
         self._connect_active_roles(active_roles)
 
+        self._roles_warm_reattached = self._roles_warm_disconnected
         self._roles_warm_disconnected = False
         self._roles_cold_preinitialized = False
         self._roles_attached = True
@@ -685,6 +694,7 @@ class SendspinClient:
     def detach_connection(self, goodbye_reason: GoodbyeReason | None) -> None:
         """Detach the current connection and apply BufferTracker reset policy."""
         self._connected = False
+        self._last_goodbye_reason = goodbye_reason
 
         warm_disconnect = goodbye_reason in {None, GoodbyeReason.RESTART}
         if warm_disconnect:

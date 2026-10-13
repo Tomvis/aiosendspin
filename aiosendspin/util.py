@@ -10,12 +10,19 @@ import warnings
 from collections.abc import Coroutine
 from typing import Any
 
+import orjson
+
 _LOGGER = logging.getLogger(__name__)
 
 # Check if eager_start is supported (Python 3.12+)
 _SUPPORTS_EAGER_START = sys.version_info >= (3, 12)
 
 TASKS: set[asyncio.Task[Any]] = set()
+
+# Quiet period between repeats of a throttled warning. Each warning reports how
+# many occurrences it stands for, so a sustained fault keeps its magnitude visible
+# at default level without emitting one line per event.
+WARN_INTERVAL_S = 30.0
 
 # APIs whose deprecation this process has already reported.
 _WARNED_DEPRECATIONS: set[str] = set()
@@ -89,6 +96,16 @@ async def finish_despite_cancel[T](coro: Coroutine[None, None, T]) -> tuple[T, b
             if task.cancelled():
                 raise
             cancelled = True
+
+
+def _peek_message_type(text: str) -> str | None:
+    """Return the envelope ``type`` of a JSON message, or ``None`` if it has none."""
+    try:
+        decoded = orjson.loads(text)
+    except orjson.JSONDecodeError:
+        return None
+    message_type = decoded.get("type") if isinstance(decoded, dict) else None
+    return message_type if isinstance(message_type, str) else None
 
 
 def get_local_ip() -> str | None:

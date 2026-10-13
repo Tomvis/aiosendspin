@@ -55,6 +55,22 @@ MAX_RECONNECT_BACKOFF_S = 300.0
 # Only consider a connection stable if it lasts at least this long, otherwise
 # a successful but broken session may cause a reconnection every second.
 STABLE_SERVER_INITIATED_SESSION_S = 10.0
+_NO_REDIAL_GOODBYE_REASONS: frozenset[GoodbyeReason] = frozenset(
+    {
+        GoodbyeReason.ANOTHER_SERVER,
+        GoodbyeReason.USER_REQUEST,
+        GoodbyeReason.UNAUTHORIZED,
+        GoodbyeReason.PAIRING_REQUIRED,
+        GoodbyeReason.UNPAIRED,
+    }
+)
+_NO_PLAYBACK_RECLAIM_GOODBYE_REASONS: frozenset[GoodbyeReason] = frozenset(
+    {
+        GoodbyeReason.UNAUTHORIZED,
+        GoodbyeReason.PAIRING_REQUIRED,
+        GoodbyeReason.UNPAIRED,
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,6 +173,15 @@ def _get_first_valid_ip(addresses: list[str]) -> str | None:
     return None
 
 
+def _ended_without_redial(conn: SendspinConnection) -> bool:
+    """Return whether a dial's session leaves redialing to an explicit call."""
+    reason = conn.goodbye_reason
+    # With no goodbye and no server-side close, a non-playback session dropped.
+    return reason in _NO_REDIAL_GOODBYE_REASONS or (
+        reason is None and not conn._closing  # noqa: SLF001
+    )
+
+
 class SendspinServer:
     """Sendspin Server implementation to connect to and manage many Sendspin clients."""
 
@@ -187,11 +212,12 @@ class SendspinServer:
             pairing_store: Persistent store for pairing records and config.
             allow_unencrypted: Accept legacy unencrypted clients over the non-spec
                 transition-mode hello, off by default. Enable it only to bridge
-                pre-encryption clients during migration.
+                pre-encryption clients during migration. Has no effect when
+                ``allow_noncompliant_clients`` is False.
             allow_noncompliant_clients: Tolerate and log deviations from clients
                 built against pre-1.0 spec drafts when True, reject the client when
-                False. Tolerance is transitional and will be removed in a future
-                version.
+                False, unencrypted clients included. Tolerance is transitional and will
+                be removed in a future version.
             languages: BCP 47 tags in descending operator preference, sent to clients
                 in server/hello, or None to declare none.
             clock: Clock source, or None for the default monotonic clock.
@@ -218,6 +244,11 @@ class SendspinServer:
         self._pairing_store = pairing_store
         self._allow_unencrypted = allow_unencrypted
         self._allow_noncompliant_clients = allow_noncompliant_clients
+        if allow_unencrypted and not allow_noncompliant_clients:
+            logger.warning(
+                "allow_unencrypted has no effect: allow_noncompliant_clients=False "
+                "rejects unencrypted clients"
+            )
         self._clock: Clock = clock or RawMonotonicClock()
 
         self._clients: dict[str, SendspinClient] = {}
@@ -256,6 +287,11 @@ class SendspinServer:
         self._pending_connections = set()
 
         self._mdns_client_urls: dict[str, str] = {}
+        # mDNS URLs whose client said goodbye with a no-reconnect reason.
+        self._mdns_goodbye_urls: set[str] = set()
+        self._dial_connections: dict[str, SendspinConnection] = {}
+        # URLs dialed explicitly while their dial task's connection was closing.
+        self._redial_urls: set[str] = set()
         self._app: web.Application | None = None
         self._app_runner: web.AppRunner | None = None
         self._tcp_site: web.TCPSite | None = None
@@ -543,10 +579,27 @@ class SendspinServer:
         A ``PLAYBACK`` reason applies to the next connection only. Later reconnects use
         ``DISCOVERY``.
         """
-        self._set_connection_options(url, retry_initial_connection=retry_initial_connection)
         # DEPRECATED(spec-pr-183): remove in aiosendspin <version>
         if connection_reason is ConnectionReason.MANAGEMENT:
             warn_deprecated("ConnectionReason.MANAGEMENT", MANAGEMENT_DEPRECATION)
+        self._redial_if_closing(url)
+        self._dial(
+            url,
+            connection_reason=connection_reason,
+            retry_initial_connection=retry_initial_connection,
+            pairing_attempt=pairing_attempt,
+        )
+
+    def _dial(
+        self,
+        url: str,
+        *,
+        connection_reason: ConnectionReason,
+        retry_initial_connection: bool = False,
+        pairing_attempt: PairingAttempt | None = None,
+    ) -> None:
+        self._mdns_goodbye_urls.discard(url)
+        self._set_connection_options(url, retry_initial_connection=retry_initial_connection)
         self._connection_reasons[url] = connection_reason
         prev_task = self._connection_tasks.get(url)
         if prev_task is not None:
@@ -586,6 +639,8 @@ class SendspinServer:
             TimeoutError: If the initial connection attempt times out.
             Exception: Other unexpected errors during the initial connection attempt.
         """
+        self._redial_if_closing(url)
+        self._mdns_goodbye_urls.discard(url)
         self._set_connection_options(url, retry_initial_connection=retry_initial_connection)
         # DEPRECATED(spec-pr-183): remove in aiosendspin <version>
         if connection_reason is ConnectionReason.MANAGEMENT:
@@ -613,6 +668,19 @@ class SendspinServer:
 
         await waiter
 
+    def _redial_if_closing(self, url: str) -> None:
+        conn = self._dial_connections.get(url)
+        if (
+            conn is None
+            or not conn._disconnecting  # noqa: SLF001
+            or conn.should_retry_server_initiated_connection
+        ):
+            return
+        self._redial_urls.add(url)
+        self._initial_connect_succeeded.discard(url)
+        if retry_event := self._retry_events.get(url):
+            retry_event.set()
+
     async def initiate_pairing(self, client_id: str, attempt: PairingAttempt) -> None:
         """Run a pairing attempt on a connected client.
 
@@ -620,8 +688,8 @@ class SendspinServer:
         paired one leaves playback and its roles first.
 
         A pair abort, a server-side timeout or ``InvalidPairingCodeError`` raises with pairing
-        already left, keeping the connection unless the abort reason closes it; other failures
-        disconnect.
+        already left, or with the connection closed when the abort reason closes it; other
+        failures disconnect.
         """
         connection = self._connection_for(client_id)
         try:
@@ -768,6 +836,13 @@ class SendspinServer:
         """Request that a disconnected client connect for playback."""
         external_cb = self._external_stream_start_cbs.get(client_id)
         if external_cb is None:
+            client = self._clients.get(client_id)
+            if (
+                client is not None
+                and client._last_goodbye_reason  # noqa: SLF001
+                in _NO_PLAYBACK_RECLAIM_GOODBYE_REASONS
+            ):
+                return False
             return self.reclaim_client_for_playback(client_id)
 
         request = ExternalStreamStartRequest(
@@ -892,6 +967,9 @@ class SendspinServer:
         try:
             while True:
                 retry_event = self._retry_events.get(url)
+                # A dial while this attempt connects is served by it, not a redial.
+                self._dial_connections.pop(url, None)
+                self._redial_urls.discard(url)
                 try:
                     async with self._client_session.ws_connect(
                         url,
@@ -913,14 +991,21 @@ class SendspinServer:
                             pairing_attempt=pairing_attempt,
                         )
                         pairing_attempt = None
+                        self._dial_connections[url] = conn
                         await conn.handle_client()
                         session_duration_s = time.monotonic() - connection_started_s
 
                     if session_duration_s >= STABLE_SERVER_INITIATED_SESSION_S:
                         backoff = 1.0
 
-                    if not conn.should_retry_server_initiated_connection:
+                    if url in self._redial_urls:
+                        logger.debug("Redialing %s on request after the connection closed", url)
+                        # Handle the redial like the initial attempt of a new dial.
+                        first_connection_succeeded = False
+                    elif not conn.should_retry_server_initiated_connection:
                         reason = conn.goodbye_reason
+                        if url in self._mdns_client_urls.values() and _ended_without_redial(conn):
+                            self._mdns_goodbye_urls.add(url)
                         logger.debug(
                             "Not reconnecting to %s (goodbye reason: %s)",
                             url,
@@ -977,6 +1062,8 @@ class SendspinServer:
         finally:
             self._connection_tasks.pop(url, None)
             self._retry_events.pop(url, None)
+            self._dial_connections.pop(url, None)
+            self._redial_urls.discard(url)
             self._pending_pairing_attempts.pop(url, None)
             self._initial_connect_succeeded.discard(url)
             self._connection_options.pop(url, None)
@@ -1013,8 +1100,20 @@ class SendspinServer:
                 port=port,
             )
             await self._tcp_site.start()
-            logger.info("Sendspin server started successfully on %s:%d", host, port)
+        except OSError as e:
+            logger.error("Failed to start server on %s:%d: %s", host, port, e)
+            if self._app_runner:
+                # cleanup() already stops/unregisters any site added to this runner.
+                await self._app_runner.cleanup()
+                self._app_runner = None
+            self._tcp_site = None
+            if self._app:
+                await self._app.shutdown()
+                self._app = None
+            raise
+        logger.info("Sendspin server started successfully on %s:%d", host, port)
 
+        try:
             self._zc = AsyncZeroconf(
                 ip_version=IPVersion.V4Only,
                 interfaces=[host] if host != "0.0.0.0" else InterfaceChoice.Default,
@@ -1041,17 +1140,8 @@ class SendspinServer:
             if discover_clients:
                 await self._start_mdns_discovery()
         except OSError as e:
-            logger.error("Failed to start server on %s:%d: %s", host, port, e)
+            logger.error("Server is running without mDNS advertising and discovery: %s", e)
             await self._stop_mdns()
-            if self._app_runner:
-                # cleanup() already stops/unregisters any site added to this runner.
-                await self._app_runner.cleanup()
-                self._app_runner = None
-            self._tcp_site = None
-            if self._app:
-                await self._app.shutdown()
-                self._app = None
-            raise
 
     async def stop_server(self) -> None:
         """Stop the server HTTP listener and mDNS services."""
@@ -1158,13 +1248,19 @@ class SendspinServer:
         if state_change in (ServiceStateChange.Added, ServiceStateChange.Updated):
 
             def _schedule_add() -> None:
-                create_task(self._handle_service_added(zeroconf, service_type, name))
+                create_task(self._handle_service_added(zeroconf, service_type, name, state_change))
 
             self._loop.call_soon_threadsafe(_schedule_add)
         elif state_change is ServiceStateChange.Removed:
             self._loop.call_soon_threadsafe(lambda: self._handle_service_removed(name))
 
-    async def _handle_service_added(self, zeroconf: Zeroconf, service_type: str, name: str) -> None:
+    async def _handle_service_added(
+        self,
+        zeroconf: Zeroconf,
+        service_type: str,
+        name: str,
+        state_change: ServiceStateChange,
+    ) -> None:
         info = AsyncServiceInfo(service_type, name)
         if not info.load_from_cache(zeroconf):
             await info.async_request(zeroconf, 3000)
@@ -1191,8 +1287,20 @@ class SendspinServer:
         if path is None or not str(path).startswith("/"):
             return
 
-        url = f"ws://{address}:{port}{path}"
+        host = f"[{address}]" if ip_address(address).version == 6 else address
+        url = f"ws://{host}:{port}{path}"
         old_url = self._mdns_client_urls.get(name)
+        if state_change is ServiceStateChange.Updated and (
+            old_url in self._mdns_goodbye_urls or self._is_closing_without_redial(old_url)
+        ):
+            logger.debug("Not redialing %s after its goodbye on an mDNS update", name)
+            if url != old_url:
+                self._mdns_goodbye_urls.discard(old_url)
+                self._mdns_goodbye_urls.add(url)
+                self._mdns_client_urls[name] = url
+                for client_id in [c for c, u in self._client_urls.items() if u == old_url]:
+                    self.register_client_url(client_id, url)
+            return
         if old_url is not None and old_url != url and old_url in self._connection_tasks:
             old_parts = urlsplit(old_url)
             if (
@@ -1215,12 +1323,23 @@ class SendspinServer:
                 url,
             )
         self._mdns_client_urls[name] = url
-        self.connect_to_client(url, connection_reason=self.get_connection_reason(url))
+        self._dial(url, connection_reason=self.get_connection_reason(url))
+
+    def _is_closing_without_redial(self, url: str | None) -> bool:
+        conn = self._dial_connections.get(url) if url is not None else None
+        return (
+            conn is not None
+            and conn._disconnecting  # noqa: SLF001
+            and not conn.should_retry_server_initiated_connection
+            and url not in self._redial_urls
+            and _ended_without_redial(conn)
+        )
 
     def _handle_service_removed(self, name: str) -> None:
         url = self._mdns_client_urls.pop(name, None)
         if url is None:
             return
+        self._mdns_goodbye_urls.discard(url)
         # Keep the retry loop alive if a normal client still wants to be reached.
         # mDNS can drop ahead of the device coming back, and the device may not
         # re-announce until something else nudges it (router-side delay, ESP

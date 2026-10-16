@@ -6,6 +6,7 @@ import asyncio
 import logging
 import time
 from collections.abc import Callable, Sequence
+from collections.abc import Set as AbstractSet
 from contextlib import suppress
 from dataclasses import dataclass
 from ipaddress import ip_address
@@ -25,6 +26,7 @@ from zeroconf import (
     NonUniqueNameException,
     ServiceStateChange,
     Zeroconf,
+    current_time_millis,
 )
 from zeroconf.asyncio import AsyncServiceBrowser, AsyncServiceInfo, AsyncZeroconf
 
@@ -55,6 +57,9 @@ MAX_RECONNECT_BACKOFF_S = 300.0
 # Only consider a connection stable if it lasts at least this long, otherwise
 # a successful but broken session may cause a reconnection every second.
 STABLE_SERVER_INITIATED_SESSION_S = 10.0
+# Continued mDNS querying while no client is known, doubling up to RFC 6762's 60 minute cap.
+_MDNS_REQUERY_FIRST_S = 30.0
+_MDNS_REQUERY_MAX_S = 3600.0
 _NO_REDIAL_GOODBYE_REASONS: frozenset[GoodbyeReason] = frozenset(
     {
         GoodbyeReason.ANOTHER_SERVER,
@@ -176,6 +181,9 @@ def _get_first_valid_ip(addresses: list[str]) -> str | None:
 def _ended_without_redial(conn: SendspinConnection) -> bool:
     """Return whether a dial's session leaves redialing to an explicit call."""
     reason = conn.goodbye_reason
+    if reason is GoodbyeReason.CONCURRENT_ATTEMPT:
+        # A client rejected before its hello is not kept, so mDNS keeps redialing it.
+        return conn._client_info is not None  # noqa: SLF001
     # With no goodbye and no server-side close, a non-playback session dropped.
     return reason in _NO_REDIAL_GOODBYE_REASONS or (
         reason is None and not conn._closing  # noqa: SLF001
@@ -298,6 +306,7 @@ class SendspinServer:
         self._zc: AsyncZeroconf | None = None
         self._mdns_service: AsyncServiceInfo | None = None
         self._mdns_browser: AsyncServiceBrowser | None = None
+        self._mdns_requery_handle: asyncio.TimerHandle | None = None
 
         logger.debug("SendspinServer initialized: id=%s, name=%s", self._id, server_name)
 
@@ -535,6 +544,10 @@ class SendspinServer:
         self, client_id: str, goodbye_reason: GoodbyeReason | None
     ) -> None:
         """Emit a ClientDisconnectedEvent (called from SendspinClient)."""
+        client = self._clients.get(client_id)
+        if client is not None and goodbye_reason is GoodbyeReason.CONCURRENT_ATTEMPT:
+            # A rejected dial can close before the initial client/state.
+            self._fire_client_added_event_once(client)
         self._signal_event(ClientDisconnectedEvent(client_id, goodbye_reason))
 
     async def on_client_connect(self, request: web.Request) -> web.StreamResponse:
@@ -742,9 +755,19 @@ class SendspinServer:
         await connection.refresh_trusted_unpaired()
         connection.unpair()
 
-    async def trust_unpaired(self, client_id: str) -> None:
-        """Approve ``client_id`` for unpaired playback, re-activating it if connected."""
-        await self.pairing_store.add_trusted_unpaired(TrustedUnpairedClient(client_id=client_id))
+    async def trust_unpaired(
+        self, client_id: str, *, approved_roles: AbstractSet[str] | None = None
+    ) -> None:
+        """Approve ``client_id`` for unpaired playback, re-activating it if connected.
+
+        ``approved_roles`` replaces the approved pairing-required families. ``None`` keeps them.
+        """
+        if approved_roles is None:
+            existing = await self.pairing_store.trusted_unpaired(client_id)
+            approved_roles = existing.approved_roles if existing is not None else frozenset()
+        await self.pairing_store.add_trusted_unpaired(
+            TrustedUnpairedClient(client_id=client_id, approved_roles=frozenset(approved_roles))
+        )
         await self._refresh_trusted_unpaired(client_id)
 
     async def untrust_unpaired(self, client_id: str) -> None:
@@ -819,7 +842,8 @@ class SendspinServer:
         """Attempt to reconnect to a client for playback.
 
         Returns True if reconnection was initiated, False if no URL available.
-        Used when starting playback to reclaim clients that disconnected with 'another_server'.
+        Used when starting playback to reclaim clients that disconnected with 'another_server'
+        or 'concurrent_attempt'.
 
         The client must reconnect within timeout_s seconds; otherwise it is
         fully unregistered from this server.
@@ -1242,6 +1266,23 @@ class SendspinServer:
             service_type,
             handlers=[self._on_mdns_service_state_change],
         )
+        self._schedule_mdns_requery(_MDNS_REQUERY_FIRST_S)
+
+    def _schedule_mdns_requery(self, delay_s: float) -> None:
+        if self._mdns_requery_handle is not None:
+            self._mdns_requery_handle.cancel()
+        self._mdns_requery_handle = self._loop.call_later(delay_s, self._mdns_requery, delay_s)
+
+    def _mdns_requery(self, delay_s: float) -> None:
+        self._mdns_requery_handle = None
+        browser = self._mdns_browser
+        if browser is None or self._mdns_client_urls:
+            return
+        # python-zeroconf stops querying after its startup queries while its cache is empty.
+        browser.query_scheduler.async_send_ready_queries(
+            first_request=False, now_millis=current_time_millis(), ready_types=browser.types
+        )
+        self._schedule_mdns_requery(min(delay_s * 2, _MDNS_REQUERY_MAX_S))
 
     def _on_mdns_service_state_change(
         self,
@@ -1344,6 +1385,8 @@ class SendspinServer:
         url = self._mdns_client_urls.pop(name, None)
         if url is None:
             return
+        if not self._mdns_client_urls:
+            self._schedule_mdns_requery(_MDNS_REQUERY_FIRST_S)
         self._mdns_goodbye_urls.discard(url)
         # Keep the retry loop alive if a normal client still wants to be reached.
         # mDNS can drop ahead of the device coming back, and the device may not
@@ -1363,7 +1406,7 @@ class SendspinServer:
         return False
 
     async def _cleanup_retained_clients_for_removed_mdns_url(self, url: str) -> None:
-        """Remove retained ANOTHER_SERVER clients when their mDNS URL disappears."""
+        """Remove clients retained after their goodbye when their mDNS URL disappears."""
         client_ids = [
             client_id for client_id, known_url in self._client_urls.items() if known_url == url
         ]
@@ -1385,6 +1428,9 @@ class SendspinServer:
     async def _stop_mdns(self) -> None:
         if self._zc is None:
             return
+        if self._mdns_requery_handle is not None:
+            self._mdns_requery_handle.cancel()
+            self._mdns_requery_handle = None
         try:
             if self._mdns_browser is not None:
                 await self._mdns_browser.async_cancel()

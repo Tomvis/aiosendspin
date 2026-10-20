@@ -1029,18 +1029,28 @@ async def test_mdns_removal_cancels_connection_when_no_persistent_client() -> No
 
 
 @pytest.mark.parametrize(
-    ("addresses", "port", "path", "has_task", "expected_url", "expect_reconnect"),
+    ("addresses", "port", "path", "has_task", "connected", "expected_url", "expect_reconnect"),
     [
         # Address reorder, old IP still advertised, task alive -> keep existing.
-        (["10.0.0.3", "10.0.0.2"], 9999, "/sendspin", True, "ws://10.0.0.2:9999/sendspin", False),
+        (
+            ["10.0.0.3", "10.0.0.2"],
+            9999,
+            "/sendspin",
+            True,
+            False,
+            "ws://10.0.0.2:9999/sendspin",
+            False,
+        ),
+        # Partial list without the old IP while connected -> keep existing.
+        (["10.0.0.3"], 9999, "/sendspin", True, True, "ws://10.0.0.2:9999/sendspin", False),
         # Same IP, port/path changed -> reconnect.
-        (["10.0.0.2"], 10000, "/other", True, "ws://10.0.0.2:10000/other", True),
+        (["10.0.0.2"], 10000, "/other", True, True, "ws://10.0.0.2:10000/other", True),
         # Old IP gone from advertised set -> reconnect.
-        (["10.0.0.5"], 9999, "/sendspin", True, "ws://10.0.0.5:9999/sendspin", True),
+        (["10.0.0.5"], 9999, "/sendspin", True, False, "ws://10.0.0.5:9999/sendspin", True),
         # URL changed but no active task -> reconnect.
-        (["10.0.0.3"], 9999, "/sendspin", False, "ws://10.0.0.3:9999/sendspin", True),
+        (["10.0.0.3"], 9999, "/sendspin", False, False, "ws://10.0.0.3:9999/sendspin", True),
         # IPv6-only client -> bracketed literal.
-        (["fd00::3"], 9999, "/sendspin", False, "ws://[fd00::3]:9999/sendspin", True),
+        (["fd00::3"], 9999, "/sendspin", False, False, "ws://[fd00::3]:9999/sendspin", True),
     ],
 )
 @pytest.mark.asyncio
@@ -1050,6 +1060,7 @@ async def test_mdns_update_reconnect_decision(
     port: int,
     path: str,
     has_task: bool,  # noqa: FBT001
+    connected: bool,  # noqa: FBT001
     expected_url: str,
     expect_reconnect: bool,  # noqa: FBT001
 ) -> None:
@@ -1068,6 +1079,7 @@ async def test_mdns_update_reconnect_decision(
     if has_task:
         connection_task = asyncio.create_task(asyncio.sleep(3600))
         server._connection_tasks[old_url] = connection_task  # noqa: SLF001
+        server._dial_connections[old_url] = MagicMock(_disconnecting=not connected)  # noqa: SLF001
     server._dial = MagicMock()  # type: ignore[method-assign]  # noqa: SLF001
 
     try:
@@ -1264,6 +1276,74 @@ async def test_mdns_address_change_while_connection_closes(
     assert dialed == [expect_dial]
     assert (new_url in server._mdns_goodbye_urls) is not expect_dial  # noqa: SLF001
     for url in (old_url, new_url):
+        server.disconnect_from_client(url)
+        await _wait_for_connection_task_cleanup(server, url)
+
+
+@pytest.mark.asyncio
+async def test_reconnect_follows_mdns_address_that_expired_without_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reconnects follow each address left after the dialed one expired, until one connects."""
+    first_url = "ws://10.0.0.2:9999/sendspin"
+    unreachable_url = "ws://10.0.0.7:9999/sendspin"
+    final_url = "ws://10.0.0.9:9999/sendspin"
+    dialed_urls: list[str] = []
+
+    class _RecordingSession(_PersistentSuccessfulSession):
+        def ws_connect(self, url: str, *_args: object, **_kwargs: object) -> object:
+            dialed_urls.append(url)
+            if url == unreachable_url:
+                _FakeAsyncServiceInfo.addresses = ["10.0.0.9"]
+                raise ClientConnectionError("unreachable")
+            return super().ws_connect()
+
+    server = _make_server(_RecordingSession())
+    server._zc = MagicMock()  # noqa: SLF001
+    service_name = "service._sendspin._tcp.local."
+    service_type = "_sendspin._tcp.local."
+
+    _FakeAsyncServiceInfo.addresses = ["10.0.0.2"]
+    _FakeAsyncServiceInfo.port = 9999
+    _FakeAsyncServiceInfo.properties = {b"path": b"/sendspin"}
+    monkeypatch.setattr("aiosendspin.server.server.AsyncServiceInfo", _FakeAsyncServiceInfo)
+    monkeypatch.setattr("aiosendspin.server.server.MAX_RECONNECT_BACKOFF_S", 0.01)
+
+    class _DroppedConnection:
+        """Connection double whose socket drops after the client moved to a new address."""
+
+        goodbye_reason = None
+        should_retry_server_initiated_connection = True
+        _closing = False
+        _disconnecting = False
+
+        def __init__(self, _server: SendspinServer, **_kwargs: object) -> None:
+            pass
+
+        async def handle_client(self) -> None:
+            if dialed_urls[-1] == final_url:
+                await asyncio.Event().wait()
+            _FakeAsyncServiceInfo.addresses = ["10.0.0.7", "10.0.0.2"]
+            await server._handle_service_added(  # noqa: SLF001
+                MagicMock(), service_type, service_name, ServiceStateChange.Updated
+            )
+            _FakeAsyncServiceInfo.addresses = ["10.0.0.7"]
+
+    monkeypatch.setattr("aiosendspin.server.server.SendspinConnection", _DroppedConnection)
+    server.register_client_url("moving-client", first_url)
+    server.register_client_url("stale-client", final_url)
+
+    await server._handle_service_added(  # noqa: SLF001
+        MagicMock(), service_type, service_name, ServiceStateChange.Added
+    )
+    for _ in range(50):
+        if final_url in dialed_urls:
+            break
+        await asyncio.sleep(0.01)
+
+    assert dialed_urls == [first_url, unreachable_url, final_url]
+    assert server.get_client_id_for_url(final_url) == "moving-client"
+    for url in (first_url, unreachable_url, final_url):
         server.disconnect_from_client(url)
         await _wait_for_connection_task_cleanup(server, url)
 

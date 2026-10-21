@@ -1317,7 +1317,7 @@ class SendspinServer:
         try:
             self._zc = AsyncZeroconf(
                 ip_version=IPVersion.V4Only,
-                interfaces=[host] if host != "0.0.0.0" else InterfaceChoice.Default,
+                interfaces=[host] if host != "0.0.0.0" else InterfaceChoice.All,
             )
 
             if advertise_addresses is not None:

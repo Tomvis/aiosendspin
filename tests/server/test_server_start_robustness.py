@@ -8,6 +8,7 @@ import socket
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from zeroconf import InterfaceChoice
 
 from aiosendspin.noise.keys import Identity
 from aiosendspin.noise.trust_store import InMemoryServerPairingStore
@@ -85,6 +86,39 @@ async def test_start_server_survives_invalid_advertise_address(
         await writer.wait_closed()
     finally:
         await server.close()  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_start_server_on_all_addresses_uses_every_interface(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Binding 0.0.0.0 must run mDNS on every interface, not just the default route's.
+
+    On a multi-homed host (a container on a bridge plus a LAN macvlan) the default
+    route can point away from the LAN, so client queries would never reach it.
+    """
+    calls: list[dict[str, object]] = []
+
+    def _recording_zeroconf(*args: object, **kwargs: object) -> _FakeAsyncZeroconf:
+        calls.append(kwargs)
+        return _FakeAsyncZeroconf(*args, **kwargs)
+
+    monkeypatch.setattr("aiosendspin.server.server.AsyncZeroconf", _recording_zeroconf)
+    monkeypatch.setattr("aiosendspin.server.server.AsyncServiceBrowser", _FakeAsyncServiceBrowser)
+
+    server = _make_server()
+    await server.start_server(port=_free_port(), host="0.0.0.0", advertise_addresses=[])
+    try:
+        assert calls[-1]["interfaces"] is InterfaceChoice.All
+    finally:
+        await server.close()
+
+    server = _make_server()
+    await server.start_server(port=_free_port(), host="127.0.0.1", advertise_addresses=[])
+    try:
+        assert calls[-1]["interfaces"] == ["127.0.0.1"]
+    finally:
+        await server.close()
 
 
 def _raise_enodev(*_args: object, **_kwargs: object) -> None:

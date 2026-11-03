@@ -12,8 +12,9 @@ import orjson
 import pytest
 
 from aiosendspin.models.core import ClientHelloPayload, DeviceInfo
-from aiosendspin.models.types import ConnectionReason
+from aiosendspin.models.types import ConnectionReason, PairMethod
 from aiosendspin.noise.keys import Identity, generate_psk, psk_id_for
+from aiosendspin.noise.pairing import PairingAttempt
 from aiosendspin.noise.trust_store import (
     InMemoryServerPairingStore,
     PskCategory,
@@ -67,8 +68,8 @@ async def test_flag_noncompliance_lenient_dedups_per_reason(
         client.flag_noncompliance("other thing")
     hits = [r for r in caplog.records if "non-compliant client" in r.message]
     assert [r.message for r in hits] == [
-        "non-compliant client dev: legacy thing",
-        "non-compliant client dev: other thing",
+        "[dev] non-compliant client dev: legacy thing",
+        "[dev] non-compliant client dev: other thing",
     ]
     assert all(r.levelno == logging.WARNING for r in hits)
 
@@ -86,7 +87,7 @@ async def test_flag_noncompliance_strict_raises_and_logs_error(
     hits = [r for r in caplog.records if "non-compliant client" in r.message]
     assert len(hits) == 1
     assert hits[0].levelno == logging.ERROR
-    assert hits[0].message == "rejecting non-compliant client Kitchen (Acme): legacy thing"
+    assert hits[0].message == "[dev] rejecting non-compliant client Kitchen (Acme): legacy thing"
 
 
 # DEPRECATED(spec-pr-183): remove in aiosendspin <version>
@@ -200,7 +201,7 @@ async def test_flag_noncompliance_names_the_device_and_its_software(
     with caplog.at_level(logging.WARNING):
         client.flag_noncompliance("legacy thing")
     assert caplog.messages == [
-        "non-compliant client Kitchen (Acme Speaker One, software 1.2.3): legacy thing"
+        "[dev] non-compliant client Kitchen (Acme Speaker One, software 1.2.3): legacy thing"
     ]
 
 
@@ -214,7 +215,7 @@ async def test_flag_noncompliance_without_device_info_stays_clean(
     client.preload_hello(_hello("Kitchen"))
     with caplog.at_level(logging.WARNING):
         client.flag_noncompliance("legacy thing")
-    assert caplog.messages == ["non-compliant client Kitchen: legacy thing"]
+    assert caplog.messages == ["[dev] non-compliant client Kitchen: legacy thing"]
 
 
 @pytest.mark.asyncio
@@ -227,7 +228,7 @@ async def test_flag_noncompliance_with_partial_device_info_stays_clean(
     client.preload_hello(_hello("Kitchen", DeviceInfo(manufacturer="Acme")))
     with caplog.at_level(logging.WARNING):
         client.flag_noncompliance("legacy thing")
-    assert caplog.messages == ["non-compliant client Kitchen (Acme): legacy thing"]
+    assert caplog.messages == ["[dev] non-compliant client Kitchen (Acme): legacy thing"]
 
 
 @pytest.mark.asyncio
@@ -239,7 +240,7 @@ async def test_flag_noncompliance_before_any_hello_names_the_client_id(
     client = server.get_or_create_client("dev")
     with caplog.at_level(logging.WARNING):
         client.flag_noncompliance("legacy thing")
-    assert caplog.messages == ["non-compliant client dev: legacy thing"]
+    assert caplog.messages == ["[dev] non-compliant client dev: legacy thing"]
 
 
 def test_noncompliance_subject_degrades_without_a_description() -> None:
@@ -259,7 +260,7 @@ async def test_flag_noncompliance_reports_the_latest_hello(
     client.preload_hello(_hello("Kitchen", DeviceInfo(software_version="2.0.0")))
     with caplog.at_level(logging.WARNING):
         client.flag_noncompliance("legacy thing")
-    assert caplog.messages == ["non-compliant client Kitchen (software 2.0.0): legacy thing"]
+    assert caplog.messages == ["[dev] non-compliant client Kitchen (software 2.0.0): legacy thing"]
 
 
 @pytest.mark.asyncio
@@ -301,7 +302,7 @@ async def test_hello_time_deviation_names_the_device_before_attach(
 
     assert any(
         r.message.startswith(
-            "non-compliant client Kitchen (Acme, software 1.2.3): "
+            "[dev] non-compliant client Kitchen (Acme, software 1.2.3): "
             "client/hello used unversioned support keys"
         )
         for r in caplog.records
@@ -346,7 +347,7 @@ async def test_unimplemented_roles_notice_names_the_device(
     await server.close()
 
     assert (
-        "Client Kitchen ERROR forged (Acme, software 1.2.3) offered roles/versions "
+        "[dev] Client Kitchen ERROR forged (Acme, software 1.2.3) offered roles/versions "
         "this server does not implement: ['player@v99']"
     ) in caplog.messages
 
@@ -391,11 +392,13 @@ async def test_hello_wire_type_deviation_is_flagged_before_attach(
 
     if strict:
         assert client is None
-        assert f"rejecting non-compliant client Kitchen: {reason}" in caplog.messages
+        assert (
+            f"[unknown-client] rejecting non-compliant client Kitchen: {reason}" in caplog.messages
+        )
     else:
         assert client is not None
         assert client.info.unpaired_access.enabled is False
-        assert f"non-compliant client Kitchen: {reason}" in caplog.messages
+        assert f"[unknown-client] non-compliant client Kitchen: {reason}" in caplog.messages
 
 
 _OPUS_FORMAT = {"codec": "opus", "channels": 2, "sample_rate": 48000, "bit_depth": 16}
@@ -458,6 +461,11 @@ _OPUS_FORMAT = {"codec": "opus", "channels": 2, "sample_rate": 48000, "bit_depth
             id="non-list-locations",
         ),
         pytest.param(
+            {"supported_pair_methods": {"pairing_psk": {"locations": None}}},
+            "client/hello sent a malformed pair-method descriptor",
+            id="null-locations",
+        ),
+        pytest.param(
             {
                 "supported_pair_methods": {
                     "pairing_psk": {},
@@ -501,3 +509,60 @@ async def test_strict_server_rejects_hello_deviation_before_attach(
 
     assert str(excinfo.value) == reason
     assert server.get_client("dev") is None
+
+
+@pytest.mark.parametrize(
+    ("pair_methods", "method", "legacy_hello", "strict"),
+    [
+        pytest.param(None, PairMethod.STATIC_PAIRING_CODE, False, False, id="no-pair-methods"),
+        pytest.param(
+            {"static_pairing_code": {}},
+            PairMethod.PAIRING_PSK,
+            False,
+            False,
+            id="no-pairing-psk",
+        ),
+        pytest.param(
+            {
+                "pairing_psk": {},
+                "static_pairing_code": {},
+                "dynamic_pairing_code": {"formats": ["digits"], "out_channels": ["display"]},
+            },
+            PairMethod.STATIC_PAIRING_CODE,
+            False,
+            True,
+            id="both-pairing-code-methods-strict",
+        ),
+        pytest.param(
+            {"pairing_psk": {}},
+            PairMethod.STATIC_PAIRING_CODE,
+            True,
+            False,
+            id="management-capable",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_server_passes_through_a_method_the_parsed_hello_lacks(
+    pair_methods: dict[str, object] | None, method: PairMethod, *, legacy_hello: bool, strict: bool
+) -> None:
+    """The server keeps the pass-through for a method the hello offered or may offer."""
+    server = _make_server(allow_noncompliant_clients=not strict)
+    payload: dict[str, object] = {"name": "Kitchen", "supported_roles": []}
+    if pair_methods is not None:
+        payload["supported_pair_methods"] = pair_methods
+    conn = SendspinConnection(server, wsock_client=AsyncMock())
+    conn._client_info = ClientHelloPayload.from_dict(payload)  # noqa: SLF001
+    psk = generate_psk()
+    conn._noise_psk = ResolvedPsk(  # noqa: SLF001
+        psk_id=psk_id_for(psk), psk=psk, category=PskCategory.LONG_TERM, counterparty_id="dev"
+    )
+    conn._legacy_hello = legacy_hello  # noqa: SLF001
+    attempt = (
+        PairingAttempt(method=method, pairing_psk=psk, client_id="dev")
+        if method is PairMethod.PAIRING_PSK
+        else PairingAttempt(method=method, pairing_code_provider=AsyncMock(return_value="1234"))
+    )
+
+    conn._refuse_unadvertised_pairing(attempt)  # noqa: SLF001
+    await server.close()

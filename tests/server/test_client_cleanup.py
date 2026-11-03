@@ -159,11 +159,20 @@ async def test_delayed_cleanup_on_reconnectable_disconnect(
 
 
 @pytest.mark.asyncio
-async def test_no_cleanup_on_another_server_disconnect(
-    mock_server: _MockServer, client: SendspinClient
+@pytest.mark.parametrize(
+    "reason",
+    [
+        GoodbyeReason.ANOTHER_SERVER,
+        GoodbyeReason.UNPAIRED,
+        GoodbyeReason.PAIRING_REQUIRED,
+        GoodbyeReason.UNAUTHORIZED,
+    ],
+)
+async def test_no_cleanup_on_retained_disconnect(
+    mock_server: _MockServer, client: SendspinClient, reason: GoodbyeReason
 ) -> None:
-    """Client remains in registry indefinitely after ANOTHER_SERVER disconnect."""
-    client.detach_connection(GoodbyeReason.ANOTHER_SERVER)
+    """Client remains in registry indefinitely after a retained goodbye."""
+    client.detach_connection(reason)
 
     await asyncio.sleep(0)
     await asyncio.sleep(client_module.CLIENT_CLEANUP_DELAY + 0.1)
@@ -172,10 +181,19 @@ async def test_no_cleanup_on_another_server_disconnect(
 
 
 @pytest.mark.asyncio
-async def test_another_server_disconnect_ungroups_client(
-    mock_server: _MockServer, client: SendspinClient
+@pytest.mark.parametrize(
+    "reason",
+    [
+        GoodbyeReason.ANOTHER_SERVER,
+        GoodbyeReason.UNPAIRED,
+        GoodbyeReason.PAIRING_REQUIRED,
+        GoodbyeReason.UNAUTHORIZED,
+    ],
+)
+async def test_retained_disconnect_ungroups_client(
+    mock_server: _MockServer, client: SendspinClient, reason: GoodbyeReason
 ) -> None:
-    """Takeover disconnect ungroups the client out of its shared group."""
+    """A retained goodbye other than CONCURRENT_ATTEMPT ungroups the client."""
     other = SendspinClient(mock_server, client_id="player-2")
     SendspinGroup(mock_server, other)
     await client.group.add_client(other)
@@ -190,7 +208,7 @@ async def test_another_server_disconnect_ungroups_client(
 
     client.ungroup = _record_ungroup  # type: ignore[method-assign]
 
-    client.detach_connection(GoodbyeReason.ANOTHER_SERVER)
+    client.detach_connection(reason)
     await asyncio.sleep(0)
 
     assert ungroup_calls == ["ungroup"]

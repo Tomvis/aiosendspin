@@ -28,7 +28,7 @@ from aiosendspin.models.types import (
     has_role_family,
 )
 from aiosendspin.noise.trust_store import PskCategory
-from aiosendspin.util import create_task
+from aiosendspin.util import PrefixLoggerAdapter, create_task
 
 from .compliance import ClientComplianceError, describe_client, noncompliance_subject
 from .events import ClientEvent, ClientGroupChangedEvent
@@ -53,7 +53,8 @@ _T = TypeVar("_T")
 CLIENT_CLEANUP_DELAY = 180.0
 
 # Reasons that trigger immediate client cleanup from the registry.
-# Note: ANOTHER_SERVER and CONCURRENT_ATTEMPT are intentionally excluded and never auto-cleaned up.
+# Note: ANOTHER_SERVER, CONCURRENT_ATTEMPT and UNPAIRED are intentionally excluded and never
+# auto-cleaned up.
 IMMEDIATE_CLEANUP_REASONS: frozenset[GoodbyeReason] = frozenset(
     {
         GoodbyeReason.SHUTDOWN,
@@ -66,6 +67,7 @@ _RETAINED_GOODBYE_REASONS: frozenset[GoodbyeReason] = frozenset(
     {
         GoodbyeReason.ANOTHER_SERVER,
         GoodbyeReason.CONCURRENT_ATTEMPT,
+        GoodbyeReason.UNPAIRED,
     }
 )
 
@@ -125,7 +127,7 @@ class SendspinClient:
         self.disconnect_behaviour = DisconnectBehaviour.UNGROUP
 
         self._event_cbs: list[Callable[[SendspinClient, ClientEvent], None]] = []
-        self._logger = logger.getChild(client_id)
+        self._logger = PrefixLoggerAdapter(logger, client_id)
 
         # Client-level availability (reported by client/state). Persists across reconnects.
         self._available: bool = True
@@ -514,7 +516,7 @@ class SendspinClient:
         self._server._signal_client_connected(self._client_id)  # noqa: SLF001
         if previous_info is not None and previous_info != client_info:
             self._server._signal_client_updated(self._client_id)  # noqa: SLF001
-        self._logger = logger.getChild(self._client_id)
+        self._logger = PrefixLoggerAdapter(logger, self._client_id)
         if not self._roles_warm_disconnected and not self._roles_cold_preinitialized:
             # First attach for this device: clear stale state, then reconcile from empty.
             self._hard_detach_roles()
@@ -717,7 +719,7 @@ class SendspinClient:
             self._client_id, goodbye_reason
         )
 
-        if goodbye_reason == GoodbyeReason.ANOTHER_SERVER:
+        if goodbye_reason in {GoodbyeReason.ANOTHER_SERVER, GoodbyeReason.UNPAIRED}:
             create_task(self._handle_takeover_disconnect())
         elif goodbye_reason == GoodbyeReason.CONCURRENT_ATTEMPT:
             # Another server holds the device, so a group start here must not dial it back.
@@ -736,7 +738,7 @@ class SendspinClient:
         self._roles_attached = False
 
     async def _handle_takeover_disconnect(self) -> None:
-        """Handle ANOTHER_SERVER disconnect by ungrouping the client from its group."""
+        """Handle ANOTHER_SERVER or UNPAIRED disconnect by ungrouping the client from its group."""
         old_group_id = self.group.group_id
         try:
             # ungroup() already leaves the client in a fresh stopped solo group.
